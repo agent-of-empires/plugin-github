@@ -1,0 +1,57 @@
+# Agent of Empires GitHub plugin.
+#
+# Template scaffold: a valid, installable, discoverable plugin that wires up
+# every common contribution kind (a CLI command, a palette action, a setting,
+# a UI slot, and a Tier 1 worker) so the real GitHub integration can grow into
+# it. The worker currently returns placeholder text; replace the handlers in
+# worker.py with real GitHub API calls.
+
+id = "agent-of-empires.github"
+name = "GitHub"
+version = "0.1.0"
+# Manifest schema / host API version. Host supports 1..=1.
+api_version = 1
+description = "GitHub integration for Agent of Empires: surface PR and issue state for your sessions. Scaffold release; handlers return placeholders."
+
+# Capability grants are prompted at install and pinned to the manifest hash.
+# Declare only what the worker actually uses so the prompt stays honest. The
+# scaffold worker only answers method calls, so it needs none. Add:
+#   net-fetch     once the worker makes real GitHub API calls
+#   sessions-read to correlate PRs/issues with active sessions
+#   cli-top-level only if you move the command to a top-level verb (`aoe gh`)
+capabilities = []
+
+# A setting, rendered generically on the TUI and web settings surfaces and
+# stored under [plugins."agent-of-empires.github".settings].
+[[settings]]
+key = "show_in_status_bar"
+label = "Show GitHub status in the status bar"
+description = "Publish a short GitHub summary to the status bar segment this plugin contributes."
+default = true
+
+[settings.widget]
+kind = "toggle"
+
+# A top-level CLI command: `aoe github status`. Dispatched to the worker.
+[[commands]]
+path = ["github", "status"]
+about = "Show the GitHub status summary for this checkout."
+rpc_method = "github.status"
+
+# A palette / keybindable action, canonically plugin.agent-of-empires.github.refresh.
+[[actions]]
+name = "refresh"
+label = "GitHub: refresh"
+rpc_method = "github.refresh"
+
+# A UI extension point. The host renders the slot; the worker pushes display
+# state through the `ui.state.set` host RPC (not yet wired in this scaffold).
+[[ui]]
+id = "github_status"
+slot = "status-bar-segment"
+title = "GitHub"
+
+# Tier 1 worker: the executable the host spawns and supervises, speaking
+# ndjson JSON-RPC over stdio. Path is relative to the plugin root.
+[runtime]
+entrypoint = "worker.py"
