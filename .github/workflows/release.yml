@@ -1,0 +1,79 @@
+name: Release
+
+# Triggered by the tag that Prepare Release pushes. Runs the checks, builds the
+# distributable, and publishes a GitHub Release whose notes are the git-cliff
+# section for this tag. The release archive sha256 is the interim integrity pin
+# for the featured index until the host's tree_hash lands (#2364).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.10
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Mypy
+        run: uv run mypy src
+
+      - name: Pytest
+        run: uv run pytest
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Build distributable + release notes
+        id: build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          uv build
+          git cliff --config cliff.toml --current --output RELEASE_NOTES.md
+          archive="aoe-github-plugin-${tag}.tar.gz"
+          git archive --format=tar.gz --prefix="aoe-github-plugin-${tag}/" -o "$archive" HEAD
+          sha="$(sha256sum "$archive" | cut -d' ' -f1)"
+          {
+            echo ""
+            echo "---"
+            echo "Featured-index pin (issue #2364):"
+            echo "- commit: ${GITHUB_SHA}"
+            echo "- archive sha256: ${sha}"
+          } >> RELEASE_NOTES.md
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          gh release create "$tag" \
+            "${{ steps.build.outputs.archive }}" dist/* \
+            --title "$tag" \
+            --notes-file RELEASE_NOTES.md

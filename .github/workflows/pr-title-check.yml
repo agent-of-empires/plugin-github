@@ -1,0 +1,42 @@
+name: PR Title Check
+
+# Enforce Conventional Commits on the PR title. PRs are squash-merged, so the
+# title becomes the commit subject git-cliff consumes when generating
+# CHANGELOG.md and the release body. Mirrors the AoE core check.
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  lint:
+    name: Lint PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Keep this set in sync with cliff.toml's commit_parsers so accepted
+          # PR titles match what renders into the changelog.
+          types: |
+            feat
+            fix
+            perf
+            security
+            revert
+            chore
+            build
+            ci
+            docs
+            style
+            refactor
+            test
+          requireScope: false
+          subjectPattern: ^[^A-Z].+$
+          subjectPatternError: |
+            The subject "{subject}" found in the pull request title "{title}"
+            should start with a lowercase character (Conventional Commits style).

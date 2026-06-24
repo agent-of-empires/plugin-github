@@ -15,11 +15,11 @@ description = "GitHub integration for Agent of Empires: surface PR and issue sta
 
 # Capability grants are prompted at install and pinned to the manifest hash.
 # Declare only what the worker actually uses so the prompt stays honest. The
-# scaffold worker only answers method calls, so it needs none. Add:
-#   net-fetch     once the worker makes real GitHub API calls
+# worker makes real GitHub API calls (api.github.com) and shells out to `git`
+# and `gh`, so it needs outbound network. Add later as the surface grows:
 #   sessions-read to correlate PRs/issues with active sessions
 #   cli-top-level only if you move the command to a top-level verb (`aoe gh`)
-capabilities = []
+capabilities = ["net-fetch"]
 
 # A setting, rendered generically on the TUI and web settings surfaces and
 # stored under [plugins."agent-of-empires.github".settings].
@@ -52,6 +52,9 @@ slot = "status-bar-segment"
 title = "GitHub"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking
-# ndjson JSON-RPC over stdio. Path is relative to the plugin root.
+# ndjson JSON-RPC over stdio. `aoe-github-worker` is the console script defined
+# in pyproject.toml ([project.scripts]); equivalently
+# `python -m aoe_github_plugin.main`. The exact host spawn contract (interpreter
+# resolution, working dir, args) is finalized with the Tier 1 host (#2095).
 [runtime]
-entrypoint = "worker.py"
+entrypoint = "aoe-github-worker"

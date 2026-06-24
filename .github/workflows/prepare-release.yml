@@ -1,0 +1,78 @@
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 0.2.0) - without the "v" prefix'
+        required: true
+        type: string
+
+jobs:
+  prepare:
+    name: Bump Version & Tag
+    runs-on: ubuntu-latest
+    # Required-reviewer gate: the `release` environment pauses the run until a
+    # maintainer approves in the Actions UI, mirroring AoE core.
+    environment: release
+    permissions:
+      contents: write
+    # Hoist the input out of the shell bodies so it lands via $VERSION rather
+    # than expanding inline (template-injection foot-gun).
+    env:
+      VERSION: ${{ github.event.inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_TOKEN }}
+          # git-cliff walks tag history, so fetch everything.
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Validate version format
+        run: |
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "::error::Invalid version format: '$VERSION'. Expected semver like 0.2.0"
+            exit 1
+          fi
+
+      - name: Check tag does not already exist
+        run: |
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag v$VERSION already exists"
+            exit 1
+          fi
+
+      - name: Bump package version
+        run: |
+          # Single source of truth: __version__ in the package __init__.
+          init="src/aoe_github_plugin/__init__.py"
+          sed -i -E "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" "$init"
+          grep '^__version__' "$init"
+
+      - name: Update CHANGELOG.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git cliff --config cliff.toml --tag "v$VERSION" --output CHANGELOG.md 2> cliff-stderr.log
+          echo "=== CHANGELOG.md head ===" && head -40 CHANGELOG.md
+          echo "=== cliff stderr ===" && cat cliff-stderr.log
+          if grep -q "skipped due to parse error" cliff-stderr.log; then
+            echo "::error::git-cliff skipped commits due to parse errors. Fix the offending commit messages or extend cliff.toml's catch-all parser."
+            exit 1
+          fi
+
+      - name: Commit, tag, push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add src/aoe_github_plugin/__init__.py CHANGELOG.md
+          git commit -m "chore: bump version to $VERSION"
+          git tag "v$VERSION"
+          git push origin main "v$VERSION"
+          echo "Pushed commit and tag v$VERSION; the release workflow will trigger."
