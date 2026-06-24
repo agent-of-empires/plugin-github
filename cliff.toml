@@ -1,0 +1,83 @@
+# git-cliff configuration for the Agent of Empires GitHub plugin.
+#
+# Generates CHANGELOG.md and the GitHub Release body from conventional-commit
+# messages on `main`. Driven by `git cliff` in
+# .github/workflows/{prepare-release,release}.yml. Mirrors the AoE core setup.
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to the Agent of Empires GitHub plugin will be documented in this file.
+
+The format follows [Conventional Commits](https://www.conventionalcommits.org/).
+
+"""
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}](https://github.com/agent-of-empires/plugin-github/releases/tag/{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}
+
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+
+{% for commit in commits %}\
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | split(pat="\n") | first | upper_first }}\
+{% if commit.remote.pr_number %} in [#{{ commit.remote.pr_number }}](https://github.com/agent-of-empires/plugin-github/pull/{{ commit.remote.pr_number }}){% endif %}\
+{% if commit.remote.username %} by [@{{ commit.remote.username }}](https://github.com/{{ commit.remote.username }}){% endif %} ([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/agent-of-empires/plugin-github/commit/{{ commit.id }}))
+{% endfor %}
+{% endfor %}
+{% if previous and previous.version and version -%}
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/{{ previous.version }}...{{ version }}
+{% endif %}
+"""
+trim = true
+footer = ""
+
+[remote.github]
+owner = "agent-of-empires"
+repo = "plugin-github"
+
+[git]
+conventional_commits = true
+# Don't drop commits that fail conventional-commit parsing; surface them under
+# "Other" via the catch-all parser, and the release workflow fails when
+# git-cliff still emits a parse-error warning. No commit is silently lost.
+filter_unconventional = false
+filter_commits = true
+tag_pattern = "v[0-9]*"
+sort_commits = "oldest"
+protect_breaking_commits = true
+
+commit_preprocessors = [
+  # Strip the trailing " (#1234)" GitHub appends to squash-merge subjects;
+  # git-cliff's remote integration resolves the same PR number as a link, so
+  # leaving the literal duplicates the reference on every line.
+  { pattern = '(?m) \(#\d+\)$', replace = "" },
+]
+
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^security", group = "Security" },
+  { message = "^revert", group = "Reverts" },
+
+  { message = "^chore: bump version", skip = true },
+  { message = "^chore\\(deps\\)", skip = true },
+
+  { message = "^chore", skip = true },
+  { message = "^build", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^docs", skip = true },
+  { message = "^style", skip = true },
+  { message = "^refactor", skip = true },
+  { message = "^test", skip = true },
+
+  # Catch-all so a non-conventional commit lands in "Other" instead of being
+  # dropped from the changelog.
+  { message = ".*", group = "Other" },
+]
