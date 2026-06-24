@@ -28,8 +28,8 @@ def test_notification_produces_no_output():
     assert out == []
 
 
-def test_status_is_failsoft_string_outside_a_repo():
-    # path "/" is not a git checkout; status must always return a string
+def test_status_is_failsoft_outside_a_repo():
+    # path "/" is not a git checkout; status must always return a structured
     # result, never an error (issue #1667 fail-soft requirement).
     out = _run(
         json.dumps(
@@ -42,4 +42,23 @@ def test_status_is_failsoft_string_outside_a_repo():
         )
     )
     assert len(out) == 1
-    assert isinstance(out[0]["result"], str)
+    result = out[0]["result"]
+    assert isinstance(result, dict)
+    assert isinstance(result["summary"], str)
+    assert result["pulls"] == []
+
+
+def test_open_outside_a_repo_returns_error():
+    # "/" has no github.com remote; github.open surfaces a typed error.
+    out = _run(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "github.open",
+                "params": {"args": {"path": "/"}},
+            }
+        )
+    )
+    assert len(out) == 1
+    assert out[0]["error"]["code"] == -32000
