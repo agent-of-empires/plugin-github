@@ -108,7 +108,7 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 # Tests: asserts are the point, fixtures need no annotations/docstrings, and
 # the package dir is an implicit namespace under pytest's rootdir.
 # ARG001: httpx MockTransport handlers must take `request` even when unused.
-"tests/**" = ["S101", "S106", "ANN", "INP001", "D", "PLR2004", "FBT002", "ARG001"]
+"tests/**" = ["S101", "S106", "ANN", "INP001", "D", "PLR2004", "FBT002", "ARG001", "ARG002"]
 
 [tool.ruff.format]
 quote-style = "double"

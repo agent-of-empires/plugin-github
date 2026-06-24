@@ -33,6 +33,8 @@ def dispatch(method: str, params: dict[str, Any]) -> Any:
     unknown method; ``errors.GitHubError`` carries an actionable hint."""
     if method in ("github.status", "github.refresh"):
         return handlers.github_status(_checkout_path(params))
+    if method == "github.open":
+        return handlers.github_open(_checkout_path(params))
     raise LookupError(method)
 
 

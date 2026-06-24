@@ -4,10 +4,11 @@ GitHub integration for [Agent of Empires](https://github.com/agent-of-empires/ag
 Surface pull request state alongside your agent sessions, and (later) drive the
 common git/GitHub operations from #658 without dropping into a terminal.
 
-> Status: **foundation**. This release ports the GitHub client + token-auth
+> Status: **read operations**. This release ports the GitHub client + token-auth
 > layer from AoE core (PR #1681 / issue #1667) into a Tier 1 plugin worker, with
-> a real `github.status`. The write operations (create/merge PR, push, pull,
-> fix-CI) land in follow-ups.
+> structured `github.status` (open PRs for the branch, each with its URL) and
+> `github.open` (open-in-GitHub). The write operations (create/merge PR, push,
+> pull, fix-CI) land in follow-ups.
 
 ## Layout
 
@@ -39,9 +40,39 @@ anything is written.
 | ------- | ------------------------------------------------------------------ |
 | Command | `aoe github status` -> worker method `github.status`               |
 | Action  | `refresh` (palette / keybindable) -> `github.refresh`              |
+| Action  | `open` (open-in-GitHub) -> `github.open`                          |
 | Setting | `show_in_status_bar` (toggle)                                      |
 | UI      | a `status-bar-segment` slot titled "GitHub"                        |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
+
+### Methods
+
+`github.status` (and its alias `github.refresh`) is fail-soft: it always returns
+a structured result, never a JSON-RPC error, so a status poll always has
+something to render.
+
+```jsonc
+{
+  "summary": "owner/repo: PR #12 open for my-branch",  // one line for a status bar
+  "repo": "owner/repo",      // null outside a github.com checkout
+  "branch": "my-branch",     // null outside a github.com checkout
+  "pulls": [                 // open PRs whose head is the current branch
+    { "number": 12, "url": "https://github.com/owner/repo/pull/12",
+      "title": "...", "state": "open", "draft": false }
+  ],
+  "error": null              // else { "kind": "...", "hint": "..." } (still fail-soft)
+}
+```
+
+`github.open` resolves the URL to open in a browser and returns
+`{ "url", "kind" }`: `kind: "pull"` (an open PR exists for the branch) or
+`kind: "compare"` (the create-PR page). Finding an existing PR is best-effort:
+any API failure falls back to the compare URL so it still works offline. It
+raises a typed error only when the checkout has no github.com remote.
+
+> Rendering these in the TUI / web UI is host-side and lands with the core
+> plugin UI slots (`agent-of-empires#2366`) over the worker protocol
+> (`agent-of-empires#2095`); this repo ships the data those slots consume.
 
 ## Developing
 
@@ -62,6 +93,8 @@ out. Drive a handler without aoe:
 
 ```sh
 echo '{"jsonrpc":"2.0","id":1,"method":"github.status","params":{"args":{"path":"."}}}' \
+  | uv run aoe-github-worker
+echo '{"jsonrpc":"2.0","id":2,"method":"github.open","params":{"args":{"path":"."}}}' \
   | uv run aoe-github-worker
 ```
 
