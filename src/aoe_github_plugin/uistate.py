@@ -113,12 +113,15 @@ def _global_payload(sessions: list[dict[str, Any]]) -> dict[str, Any]:
     base = _text(all_repos)  # "N PRs" / "N drafts" / "no PRs" / "no repos" / "GitHub !"
     text = base if base == "GitHub !" else f"GitHub: {base}"
     summary = f"{opened} open PRs across {len(sessions)} sessions / {len(all_repos)} repos"
-    lines = [summary]
+    session_lines = []
     for session in sessions:
         repos = session.get("repos") or []
         name = session.get("title") or session.get("session_id") or "session"
-        lines.append(f"{name}: {_text(repos)}")
-    tooltip = "\n".join(lines[: _MAX_TOOLTIP_LINES + 1])
+        session_lines.append(f"{name}: {_text(repos)}")
+    shown = session_lines[:_MAX_TOOLTIP_LINES]
+    if len(session_lines) > len(shown):
+        shown.append(f"... +{len(session_lines) - len(shown)} more")
+    tooltip = "\n".join([summary, *shown])
     return _payload(text, _tone(all_repos), tooltip)
 
 

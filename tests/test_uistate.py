@@ -142,6 +142,12 @@ def test_global_text_for_no_repos():
     assert bar["payload"]["text"] == "GitHub: no repos"
 
 
+def test_global_tooltip_marks_truncated_sessions():
+    sessions = [_session(session_id=f"s{i}") for i in range(uistate._MAX_TOOLTIP_LINES + 5)]
+    bar = _statusbar(uistate.snapshot_ui_state_params(_snapshot(*sessions)))
+    assert "... +5 more" in bar["payload"]["tooltip"]
+
+
 def test_detached_head_tooltip_does_not_claim_no_pr():
     # repo present, branch None => detached; the line must not lie about PRs.
     session = _session(repos=[_repo(name="d", branch=None)])
