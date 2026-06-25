@@ -17,12 +17,20 @@ api_version = 1
 description = "GitHub integration for Agent of Empires: surface PR and issue state for your sessions."
 
 # Capability grants are prompted at install and pinned to the manifest hash.
-# Declare only what the worker actually uses so the prompt stays honest. The
-# worker makes real GitHub API calls (api.github.com) and shells out to `git`
-# and `gh`, so it needs outbound network. Add later as the surface grows:
-#   sessions-read to correlate PRs/issues with active sessions
-#   cli-top-level only if you move the command to a top-level verb (`aoe gh`)
-capabilities = ["net"]
+# Declare only what the worker actually uses so the prompt stays honest.
+#   net           - real GitHub API calls (api.github.com); also shells out to
+#                   `git` and `gh`.
+#   runtime.worker - host RPCs the worker initiates: it pushes PR state to the
+#                   rendered UI slots via `ui.state.set` (#2366) and reads its
+#                   own `ui_refresh_secs` setting via `config.get` (#2399, gated
+#                   on runtime.worker, not config.read). D9 is unmerged, so the
+#                   exact gating capability for the ui.state.* RPCs is not
+#                   published; runtime.worker is the closest mapping (events.*
+#                   and config.get use it). Re-pin on rebase if D9 names a
+#                   dedicated capability.
+# Both are in aoe_plugin_api::KNOWN_CAPABILITIES. Add later as the surface grows:
+#   session.read  to correlate PRs/issues with active sessions
+capabilities = ["net", "runtime.worker"]
 
 # Commands the plugin contributes (palette / CLI), namespaced by the host as
 # plugin.agent-of-empires.github.<id>. The command-id -> worker RPC mapping
@@ -42,20 +50,36 @@ id = "open"
 title = "GitHub: open"
 description = "Open this checkout's PR (or the create-PR page) in a browser."
 
-# A setting, rendered generically on the TUI and web settings surfaces and
-# stored under [plugins."agent-of-empires.github".settings]. Only key/label/
-# description here; the typed widget schema (toggle, default value) arrives
-# with the settings registry (#2094).
+# Settings, rendered generically on the TUI and web settings surfaces and
+# stored under [plugins."agent-of-empires.github".settings]. The worker reads
+# them back at runtime via the `config.get` host RPC (#2399).
 [[settings]]
 key = "show_in_status_bar"
 label = "Show GitHub status in the status bar"
 description = "Publish a short GitHub summary to the status bar segment this plugin contributes."
 
-# A UI extension point. The host renders the slot; the worker pushes display
-# state through the `ui.state.set` host RPC (wired by #2366).
+[[settings]]
+key = "ui_refresh_secs"
+label = "GitHub UI refresh interval (seconds)"
+description = "How often the worker re-pushes PR status to its UI slots. 0 disables the background poll (it still pushes on startup and on refresh)."
+type = "integer"
+default = 300
+min = 0
+max = 86400
+advanced = true
+
+# UI extension points. The host renders each slot; the worker pushes display
+# state through the `ui.state.set` host RPC (wired by #2366). The status-bar
+# segment shows a one-line summary; the session-row badge shows per-session PR
+# state. Slot strings are free-form (UiContribution validates non-empty only);
+# they match the kebab slot names in #2366's D9 design.
 [[ui]]
 slot = "status-bar-segment"
 id = "github_status"
+
+[[ui]]
+slot = "session-row-badge"
+id = "github_pr_badge"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking
 # ndjson JSON-RPC over stdio. `aoe-github-worker` is the console script defined

@@ -42,7 +42,7 @@ anything is written.
 | Command | `refresh` -> worker method `github.refresh`                        |
 | Command | `open` (open-in-GitHub) -> worker method `github.open`             |
 | Setting | `show_in_status_bar`                                               |
-| UI      | a `status-bar-segment` slot (`github_status`)                      |
+| UI      | a `status-bar-segment` (`github_status`) and `session-row-badge` (`github_pr_badge`) slot |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
 ### Methods
@@ -70,9 +70,27 @@ something to render.
 any API failure falls back to the compare URL so it still works offline. It
 raises a typed error only when the checkout has no github.com remote.
 
+The worker does not only answer requests: it proactively pushes this status to
+its UI slots via the `ui.state.set` host RPC, on startup and on every
+`github.status` / `github.refresh`, plus a background poll. Each push is one
+`ui.state.set` request per slot with `params: { slot, id, state }`, where
+`state` is `{ text, tone, tooltip, url? }`. The host replies on stdin; the
+worker ignores the reply (a push is best-effort).
+
+The poll interval comes from the `ui_refresh_secs` setting, which the worker
+reads at startup via the `config.get` host RPC (`agent-of-empires#2399`).
+Precedence: the setting, else the `AOE_GITHUB_UI_REFRESH_SECS` env override,
+else 300s; `0` disables the background poll (startup and refresh pushes still
+happen). Unlike a push, the startup `config.get` blocks for its reply, which is
+safe: the host always answers a worker call (an unknown method comes back as an
+error, not silence).
+
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol
-> (`agent-of-empires#2095`); this repo ships the data those slots consume.
+> (`agent-of-empires#2095`); this repo ships the data those slots consume. The
+> `ui.state.set` params shape and the slot strings above track #2366's D9
+> design; that section is not merged yet, so expect a rebase if the contract
+> shifts.
 
 ## Developing
 
