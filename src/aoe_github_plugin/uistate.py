@@ -72,18 +72,20 @@ def _text(repos: list[dict[str, Any]]) -> str:
 
 
 def _repo_line(repo: dict[str, Any]) -> str:
-    name = repo["name"]
+    name = repo.get("name") or repo.get("path") or "repo"
     error = repo.get("error")
     if error:
-        return f"{name}: {error.get('hint', 'error').splitlines()[0]}"
+        return f"{name}: {str(error.get('hint', 'error')).splitlines()[0]}"
     if not repo.get("repo"):
         return f"{name}: not on GitHub"
+    if repo.get("branch") is None:
+        return f"{name}: detached HEAD"  # no branch was looked up; do not claim "no PR"
     pulls = repo.get("pulls") or []
     if not pulls:
         return f"{name}: no PR"
     pull = pulls[0]
     kind = "draft PR" if pull.get("draft") else "PR"
-    return f"{name}: {kind} #{pull['number']} {pull['title']}"
+    return f"{name}: {kind} #{pull.get('number', '?')} {pull.get('title', '')}".rstrip()
 
 
 def _tooltip(header: str, repos: list[dict[str, Any]]) -> str:
@@ -108,7 +110,8 @@ def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
 def _global_payload(sessions: list[dict[str, Any]]) -> dict[str, Any]:
     all_repos = [r for s in sessions for r in (s.get("repos") or [])]
     opened = _count_open(all_repos)
-    text = "GitHub !" if _has_hard_error(all_repos) else f"GitHub: {_plural(opened, 'PR')}"
+    base = _text(all_repos)  # "N PRs" / "N drafts" / "no PRs" / "no repos" / "GitHub !"
+    text = base if base == "GitHub !" else f"GitHub: {base}"
     summary = f"{opened} open PRs across {len(sessions)} sessions / {len(all_repos)} repos"
     lines = [summary]
     for session in sessions:

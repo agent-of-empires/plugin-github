@@ -49,6 +49,9 @@ SESSIONS_LIST = "sessions.list"
 CONFIG_GET = "config.get"
 REFRESH_SETTING_KEY = "ui_refresh_secs"
 DEFAULT_REFRESH_SECS = 300
+# A wedged host must never freeze the worker: outbound host RPCs time out and
+# the caller falls back (default interval, empty session list).
+HOST_RPC_TIMEOUT = 10.0
 
 # End-of-stdin sentinel placed on the queue by the reader thread.
 _EOF = object()
@@ -126,15 +129,23 @@ class Runtime:
             self.inbox.put(msg)
         self.inbox.put(_EOF)
 
-    def call_host(self, method: str, params: dict[str, Any]) -> Any:
+    def call_host(self, method: str, params: dict[str, Any], timeout: float = HOST_RPC_TIMEOUT) -> Any:
         """Blocking worker->host RPC: send the request, then drain the queue
         until its reply arrives, servicing any inbound host requests meanwhile.
-        Returns the result, ``None`` on an error reply, or ``None`` on EOF (the
-        stream closed before a reply -- the runtime is then stopping)."""
+        Returns the result, ``None`` on an error reply, on EOF (the stream
+        closed -- the runtime is then stopping), or on ``timeout`` (a wedged
+        host must never freeze the worker; the caller falls back)."""
         req_id = next(_outbound_ids)
         self.send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
         while True:
-            item = self.inbox.get()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                item = self.inbox.get(timeout=remaining)
+            except queue.Empty:
+                return None
             if item is _EOF:
                 self.stopped = True
                 self.inbox.put(_EOF)  # re-arm so the main loop also sees EOF
@@ -167,7 +178,7 @@ class Runtime:
         Fail-soft: a host error, a bad workspace, or a closed pipe never raises."""
         with contextlib.suppress(Exception):
             sessions_result = self.call_host(SESSIONS_LIST, {})
-            sessions = (sessions_result or {}).get("sessions") or []
+            sessions = sessions_result.get("sessions") or [] if isinstance(sessions_result, dict) else []
             snapshot = refresh.build_snapshot(sessions)
             for params in uistate.snapshot_ui_state_params(snapshot):
                 self.send(

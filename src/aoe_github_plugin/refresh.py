@@ -120,16 +120,18 @@ def _identify(path: str) -> tuple[str | None, RepoKey | None]:
 
 
 def _trim(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Open PRs trimmed to the fields the UI renders."""
+    """Open PRs trimmed to the fields the UI renders. Defensive: a malformed
+    entry from a drifting API shape is skipped/defaulted, never raised."""
     return [
         {
-            "number": pr["number"],
-            "url": pr["html_url"],
-            "title": pr["title"],
-            "state": pr["state"],
+            "number": pr.get("number"),
+            "url": pr.get("html_url"),
+            "title": pr.get("title") or "",
+            "state": pr.get("state"),
             "draft": bool(pr.get("draft", False)),
         }
         for pr in raw
+        if isinstance(pr, dict)
     ]
 
 
@@ -185,6 +187,8 @@ def _fetch_all(
                 return key, {"pulls": _fetch_key(client, key)}
             except GitHubError as exc:
                 return key, {"error": {"kind": exc.kind, "hint": str(exc)}}
+            except Exception as exc:  # noqa: BLE001 - fail-soft per repo, never abort the refresh
+                return key, {"error": {"kind": "internal", "hint": f"refresh failed: {exc}"}}
 
         with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(keys))) as ex:
             return dict(ex.map(one, keys))

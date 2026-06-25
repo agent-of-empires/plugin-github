@@ -128,3 +128,23 @@ def test_empty_snapshot_still_pushes_a_global_status_bar():
 def test_session_without_id_is_skipped_for_badges():
     params = uistate.snapshot_ui_state_params(_snapshot(_session(session_id=None)))
     assert _badges(params) == []
+
+
+def test_global_text_reflects_drafts_not_just_pr_count():
+    session = _session(repos=[_repo(pulls=[_pull(draft=True)])])
+    bar = _statusbar(uistate.snapshot_ui_state_params(_snapshot(session)))
+    assert bar["payload"]["text"] == "GitHub: 1 draft"
+    assert bar["payload"]["tone"] == "warn"
+
+
+def test_global_text_for_no_repos():
+    bar = _statusbar(uistate.snapshot_ui_state_params(_snapshot(_session(repos=[]))))
+    assert bar["payload"]["text"] == "GitHub: no repos"
+
+
+def test_detached_head_tooltip_does_not_claim_no_pr():
+    # repo present, branch None => detached; the line must not lie about PRs.
+    session = _session(repos=[_repo(name="d", branch=None)])
+    badge = _badges(uistate.snapshot_ui_state_params(_snapshot(session)))[0]
+    assert "detached HEAD" in badge["payload"]["tooltip"]
+    assert "no PR" not in badge["payload"]["tooltip"]
