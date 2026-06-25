@@ -42,7 +42,7 @@ anything is written.
 | Command | `refresh` -> worker method `github.refresh`                        |
 | Command | `open` (open-in-GitHub) -> worker method `github.open`             |
 | Setting | `show_in_status_bar`                                               |
-| UI      | a `status-bar-segment` (`github_status`) and `session-row-badge` (`github_pr_badge`) slot |
+| UI      | a `status-bar` (`github_status`) and `row-badge` (`github_pr_badge`) slot |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
 ### Methods

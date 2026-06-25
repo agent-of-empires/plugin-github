@@ -81,7 +81,7 @@ def test_startup_pushes_ui_state_to_every_slot():
     # No input: the worker still proactively pushes the UI slots on startup.
     _, pushes = _run()
     slots = {p["params"]["slot"] for p in pushes}
-    assert slots == {"status-bar-segment", "session-row-badge"}
+    assert slots == {"status-bar", "row-badge"}
     for p in pushes:
         assert p["method"] == "ui.state.set"
         assert isinstance(p["id"], int)

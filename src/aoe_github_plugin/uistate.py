@@ -17,11 +17,11 @@ from __future__ import annotations
 from typing import Any
 
 # (slot, contribution id) pairs this plugin fills, matching the [[ui]] entries
-# in aoe-plugin.toml. Same derived state goes to both: a long status-bar
-# segment and a per-session-row badge.
+# in aoe-plugin.toml and the host's UiSlot enum. Same derived state goes to
+# both: a status-bar segment and a per-session-row badge.
 SLOTS: list[tuple[str, str]] = [
-    ("status-bar-segment", "github_status"),
-    ("session-row-badge", "github_pr_badge"),
+    ("status-bar", "github_status"),
+    ("row-badge", "github_pr_badge"),
 ]
 
 
