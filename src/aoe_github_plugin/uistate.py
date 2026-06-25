@@ -6,32 +6,36 @@ code never runs in the dashboard. This module is the pure half: it turns the
 fail-soft ``github.status`` dict into one ``ui.state.set`` ``params`` object per
 declared slot. No id, no IO, so the mapping is unit-testable on its own.
 
-The params shape ``{slot, id, state}`` mirrors the ``[[ui]]`` manifest keys
-(``slot`` + ``id``); ``state`` carries the renderable fields a badge / status
-segment needs. D9 is not merged yet, so this shape is an informed guess pinned
-to the issue; expect to remap ``state`` when the contract lands.
+The params shape ``{slot, id, payload[, session_id]}`` mirrors the ``[[ui]]``
+manifest keys (``slot`` + ``id``); ``payload`` is the host's ``TextPayload``
+(``text`` + optional ``tone``/``tooltip``, no extra fields: the host parses it
+``deny_unknown_fields``). ``tone`` is one of the host's closed ``Tone`` set.
+
+Slot scope follows the host: ``status-bar`` is global (one summary, no
+``session_id``); ``row-badge`` is per session (the host keys it by
+``session_id``, so a push without one is rejected). The caller passes the
+session being described, or ``None`` for the global push.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-# (slot, contribution id) pairs this plugin fills, matching the [[ui]] entries
-# in aoe-plugin.toml and the host's UiSlot enum. Same derived state goes to
-# both: a status-bar segment and a per-session-row badge.
-SLOTS: list[tuple[str, str]] = [
-    ("status-bar", "github_status"),
-    ("row-badge", "github_pr_badge"),
-]
+# Contribution ids per slot, matching the [[ui]] entries in aoe-plugin.toml.
+GLOBAL_SLOTS: list[tuple[str, str]] = [("status-bar", "github_status")]
+SESSION_SLOTS: list[tuple[str, str]] = [("row-badge", "github_pr_badge")]
+
+# github.status tone -> host Tone variant (neutral/info/success/warn/danger).
+_TONES = {"error": "danger", "none": "neutral", "draft": "warn", "open": "success"}
 
 
 def _tone(pull: dict[str, Any] | None, error: Any) -> str:
-    """A coarse state string the host maps to a colour."""
+    """A host ``Tone`` variant for the PR's state."""
     if error:
-        return "error"
+        return _TONES["error"]
     if pull is None:
-        return "none"
-    return "draft" if pull.get("draft") else "open"
+        return _TONES["none"]
+    return _TONES["draft"] if pull.get("draft") else _TONES["open"]
 
 
 def _text(pull: dict[str, Any] | None, error: Any) -> str:
@@ -43,19 +47,25 @@ def _text(pull: dict[str, Any] | None, error: Any) -> str:
     return f"PR #{pull['number']}"
 
 
-def ui_state_params(status: dict[str, Any]) -> list[dict[str, Any]]:
-    """One ``ui.state.set`` ``params`` dict per slot, from a ``github.status``
-    result. Pure and total: a malformed/partial status still yields valid
-    params (missing keys read as empty), so the caller stays fail-soft.
+def ui_state_params(status: dict[str, Any], session_id: str | None = None) -> list[dict[str, Any]]:
+    """``ui.state.set`` ``params`` dicts derived from a ``github.status`` result.
+
+    With ``session_id`` ``None`` the global slots are produced (no
+    ``session_id`` key); with a ``session_id`` the per-session slots are
+    produced (each carrying it). Pure and total: a malformed/partial status
+    still yields valid params, so the caller stays fail-soft.
     """
     pulls = status.get("pulls") or []
     pull = pulls[0] if pulls else None
     error = status.get("error")
-    state: dict[str, Any] = {
+    payload: dict[str, Any] = {
         "text": _text(pull, error),
         "tone": _tone(pull, error),
         "tooltip": status.get("summary") or "",
     }
-    if pull is not None and pull.get("url"):
-        state["url"] = pull["url"]
-    return [{"slot": slot, "id": cid, "payload": state} for slot, cid in SLOTS]
+    slots = SESSION_SLOTS if session_id is not None else GLOBAL_SLOTS
+    out = [{"slot": slot, "id": cid, "payload": payload} for slot, cid in slots]
+    if session_id is not None:
+        for params in out:
+            params["session_id"] = session_id
+    return out

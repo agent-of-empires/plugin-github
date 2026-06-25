@@ -77,12 +77,15 @@ def test_open_outside_a_repo_returns_error():
     assert responses[0]["error"]["code"] == -32000
 
 
-def test_startup_pushes_ui_state_to_every_slot():
-    # No input: the worker still proactively pushes the UI slots on startup.
+def test_startup_pushes_global_status_bar():
+    # No input, no session context: the startup push fills the global
+    # status-bar only (the per-session row badge needs a session_id, which
+    # arrives with an inbound github.status call).
     _, pushes = _run()
     slots = {p["params"]["slot"] for p in pushes}
-    assert slots == {"status-bar", "row-badge"}
+    assert slots == {"status-bar"}
     for p in pushes:
         assert p["method"] == "ui.state.set"
         assert isinstance(p["id"], int)
+        assert "session_id" not in p["params"]
         assert "tone" in p["params"]["payload"]

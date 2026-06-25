@@ -73,9 +73,13 @@ raises a typed error only when the checkout has no github.com remote.
 The worker does not only answer requests: it proactively pushes this status to
 its UI slots via the `ui.state.set` host RPC, on startup and on every
 `github.status` / `github.refresh`, plus a background poll. Each push is one
-`ui.state.set` request per slot with `params: { slot, id, state }`, where
-`state` is `{ text, tone, tooltip, url? }`. The host replies on stdin; the
-worker ignores the reply (a push is best-effort).
+`ui.state.set` request per slot with `params: { slot, id, payload }`, where
+`payload` is the host's `TextPayload`: `{ text, tone?, tooltip? }`. `tone` is
+one of the host's `Tone` set (`neutral`, `info`, `success`, `warn`, `danger`).
+The global `status-bar` slot carries no `session_id`; the per-session
+`row-badge` slot adds `session_id` (supplied with the inbound `github.status`
+call). The host replies on stdin; the worker ignores the reply (a push is
+best-effort).
 
 The poll interval comes from the `ui_refresh_secs` setting, which the worker
 reads at startup via the `config.get` host RPC (`agent-of-empires#2399`).

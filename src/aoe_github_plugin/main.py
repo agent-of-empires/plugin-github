@@ -72,15 +72,17 @@ def dispatch(method: str, params: dict[str, Any]) -> Any:
     raise LookupError(method)
 
 
-def push_ui_state(status: dict[str, Any], send: Sink = _send) -> None:
-    """Push the PR status to every UI slot via ``ui.state.set``. Fail-soft:
-    never raises, so a bad status or a closed pipe cannot take down the worker.
-    Fire-and-forget; the host's reply is ignored by the read loop.
+def push_ui_state(status: dict[str, Any], send: Sink = _send, session_id: str | None = None) -> None:
+    """Push the PR status to the UI slots via ``ui.state.set``. With no
+    ``session_id`` this fills the global status-bar; with one it fills that
+    session's row badge (the host keys the per-session slot by ``session_id``).
+    Fail-soft: never raises, so a bad status or a closed pipe cannot take down
+    the worker. Fire-and-forget; the host's reply is ignored by the read loop.
     """
     # A UI push is best-effort: a bad status, a closed pipe, or a host that
     # rejects the call must never take down the worker.
     with contextlib.suppress(Exception):
-        for params in uistate.ui_state_params(status):
+        for params in uistate.ui_state_params(status, session_id):
             send(
                 {
                     "jsonrpc": "2.0",
@@ -109,7 +111,9 @@ def _handle_inbound(msg: dict[str, Any], send: Sink = _send) -> None:
     if isinstance(msg_id, int):
         send(result_response(msg_id, result))
     if method in ("github.status", "github.refresh"):
-        push_ui_state(result, send)
+        # A per-session call (host supplies session_id) updates that session's
+        # row badge; a call without one updates the global status-bar.
+        push_ui_state(result, send, session_id=params.get("session_id"))
 
 
 def _call_host(method: str, params: dict[str, Any], send: Sink, lines: Lines) -> Any:
