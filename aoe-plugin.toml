@@ -1,17 +1,20 @@
 # Agent of Empires GitHub plugin.
 #
-# Template scaffold: a valid, installable, discoverable plugin that wires up
-# every common contribution kind (a CLI command, a palette action, a setting,
-# a UI slot, and a Tier 1 worker) so the real GitHub integration can grow into
-# it. The worker currently returns placeholder text; replace the handlers in
-# worker.py with real GitHub API calls.
+# A valid, installable, discoverable plugin that wires up the common
+# contribution kinds (commands, a setting, a UI slot, and a Tier 1 worker).
+# The worker is real: it answers github.status / github.refresh / github.open
+# with live GitHub API calls (see worker code under src/aoe_github_plugin/).
+#
+# Schema: aoe-plugin-api/src/manifest.rs in agent-of-empires (landed in #2093).
+# The host parses this strictly (deny_unknown_fields), so every key below must
+# match a field in that schema.
 
 id = "agent-of-empires.github"
 name = "GitHub"
 version = "0.1.0"
 # Manifest schema / host API version. Host supports 1..=1.
 api_version = 1
-description = "GitHub integration for Agent of Empires: surface PR and issue state for your sessions. Scaffold release; handlers return placeholders."
+description = "GitHub integration for Agent of Empires: surface PR and issue state for your sessions."
 
 # Capability grants are prompted at install and pinned to the manifest hash.
 # Declare only what the worker actually uses so the prompt stays honest. The
@@ -21,35 +24,38 @@ description = "GitHub integration for Agent of Empires: surface PR and issue sta
 #   cli-top-level only if you move the command to a top-level verb (`aoe gh`)
 capabilities = ["net-fetch"]
 
+# Commands the plugin contributes (palette / CLI), namespaced by the host as
+# plugin.agent-of-empires.github.<id>. The command-id -> worker RPC mapping
+# (status -> github.status, etc.) is host convention (#2094), not declared here.
+[[commands]]
+id = "status"
+title = "GitHub: status"
+description = "Show the GitHub status summary for this checkout."
+
+[[commands]]
+id = "refresh"
+title = "GitHub: refresh"
+description = "Re-fetch the GitHub status for this checkout."
+
+[[commands]]
+id = "open"
+title = "GitHub: open"
+description = "Open this checkout's PR (or the create-PR page) in a browser."
+
 # A setting, rendered generically on the TUI and web settings surfaces and
-# stored under [plugins."agent-of-empires.github".settings].
+# stored under [plugins."agent-of-empires.github".settings]. Only key/label/
+# description here; the typed widget schema (toggle, default value) arrives
+# with the settings registry (#2094).
 [[settings]]
 key = "show_in_status_bar"
 label = "Show GitHub status in the status bar"
 description = "Publish a short GitHub summary to the status bar segment this plugin contributes."
-default = true
-
-[settings.widget]
-kind = "toggle"
-
-# A top-level CLI command: `aoe github status`. Dispatched to the worker.
-[[commands]]
-path = ["github", "status"]
-about = "Show the GitHub status summary for this checkout."
-rpc_method = "github.status"
-
-# A palette / keybindable action, canonically plugin.agent-of-empires.github.refresh.
-[[actions]]
-name = "refresh"
-label = "GitHub: refresh"
-rpc_method = "github.refresh"
 
 # A UI extension point. The host renders the slot; the worker pushes display
-# state through the `ui.state.set` host RPC (not yet wired in this scaffold).
+# state through the `ui.state.set` host RPC (wired by #2366).
 [[ui]]
-id = "github_status"
 slot = "status-bar-segment"
-title = "GitHub"
+id = "github_status"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking
 # ndjson JSON-RPC over stdio. `aoe-github-worker` is the console script defined
@@ -57,4 +63,5 @@ title = "GitHub"
 # `python -m aoe_github_plugin.main`. The exact host spawn contract (interpreter
 # resolution, working dir, args) is finalized with the Tier 1 host (#2095).
 [runtime]
-entrypoint = "aoe-github-worker"
+kind = "command"
+command = ["aoe-github-worker"]

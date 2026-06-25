@@ -38,11 +38,11 @@ anything is written.
 
 | Kind    | Detail                                                             |
 | ------- | ------------------------------------------------------------------ |
-| Command | `aoe github status` -> worker method `github.status`               |
-| Action  | `refresh` (palette / keybindable) -> `github.refresh`              |
-| Action  | `open` (open-in-GitHub) -> `github.open`                          |
-| Setting | `show_in_status_bar` (toggle)                                      |
-| UI      | a `status-bar-segment` slot titled "GitHub"                        |
+| Command | `status` -> worker method `github.status`                          |
+| Command | `refresh` -> worker method `github.refresh`                        |
+| Command | `open` (open-in-GitHub) -> worker method `github.open`             |
+| Setting | `show_in_status_bar`                                               |
+| UI      | a `status-bar-segment` slot (`github_status`)                      |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
 ### Methods
