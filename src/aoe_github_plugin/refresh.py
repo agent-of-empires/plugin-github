@@ -212,12 +212,17 @@ def build_snapshot(
         checkouts = discover_checkouts(path) if isinstance(path, str) and path else []
         per_session.append((session, checkouts))
 
+    # Identity (two git calls) is keyed by real path so a checkout shared across
+    # sessions is resolved once, not once per occurrence.
     ident: dict[str, tuple[str | None, RepoKey | None]] = {}
     keys: set[RepoKey] = set()
     for _, checkouts in per_session:
         for checkout in checkouts:
+            checkout_id = os.path.realpath(checkout)
+            if checkout_id in ident:
+                continue
             repo_str, key = _identify(checkout)
-            ident[checkout] = (repo_str, key)
+            ident[checkout_id] = (repo_str, key)
             if key is not None:
                 keys.add(key)
 
@@ -227,7 +232,7 @@ def build_snapshot(
     for session, checkouts in per_session:
         repos: list[dict[str, Any]] = []
         for checkout in checkouts:
-            repo_str, key = ident[checkout]
+            repo_str, key = ident[os.path.realpath(checkout)]
             entry: dict[str, Any] = {
                 "path": checkout,
                 "name": Path(checkout).name or checkout,
