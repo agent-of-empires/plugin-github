@@ -22,7 +22,7 @@ description = "GitHub integration for Agent of Empires: surface PR and issue sta
 # and `gh`, so it needs outbound network. Add later as the surface grows:
 #   sessions-read to correlate PRs/issues with active sessions
 #   cli-top-level only if you move the command to a top-level verb (`aoe gh`)
-capabilities = ["net-fetch"]
+capabilities = ["net"]
 
 # Commands the plugin contributes (palette / CLI), namespaced by the host as
 # plugin.agent-of-empires.github.<id>. The command-id -> worker RPC mapping
