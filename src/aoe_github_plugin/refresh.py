@@ -209,7 +209,7 @@ def build_snapshot(
     per_session: list[tuple[dict[str, Any], list[str]]] = []
     for session in sessions:
         path = session.get("project_path")
-        checkouts = discover_checkouts(path) if path else []
+        checkouts = discover_checkouts(path) if isinstance(path, str) and path else []
         per_session.append((session, checkouts))
 
     ident: dict[str, tuple[str | None, RepoKey | None]] = {}
