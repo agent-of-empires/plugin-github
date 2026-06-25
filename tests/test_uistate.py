@@ -27,12 +27,12 @@ def _pull(number=7, draft=False):
 def test_params_cover_every_declared_slot():
     params = uistate.ui_state_params(_status())
     assert [p["slot"] for p in params] == [s for s, _ in uistate.SLOTS]
-    assert all(set(p) == {"slot", "id", "state"} for p in params)
+    assert all(set(p) == {"slot", "id", "payload"} for p in params)
 
 
 def test_open_pr_state():
     state = uistate.ui_state_params(_status(pulls=[_pull(number=12)], summary="o/r: PR #12 open for feature"))[0][
-        "state"
+        "payload"
     ]
     assert state["tone"] == "open"
     assert state["text"] == "PR #12"
@@ -41,12 +41,12 @@ def test_open_pr_state():
 
 
 def test_draft_pr_tone():
-    state = uistate.ui_state_params(_status(pulls=[_pull(draft=True)]))[0]["state"]
+    state = uistate.ui_state_params(_status(pulls=[_pull(draft=True)]))[0]["payload"]
     assert state["tone"] == "draft"
 
 
 def test_no_pr_state_has_no_url():
-    state = uistate.ui_state_params(_status(summary="o/r: no open PR"))[0]["state"]
+    state = uistate.ui_state_params(_status(summary="o/r: no open PR"))[0]["payload"]
     assert state["tone"] == "none"
     assert state["text"] == "no PR"
     assert "url" not in state
@@ -54,7 +54,7 @@ def test_no_pr_state_has_no_url():
 
 def test_error_state():
     state = uistate.ui_state_params(_status(error={"kind": "unauthorized", "hint": "x"}, summary="GitHub: ..."))[0][
-        "state"
+        "payload"
     ]
     assert state["tone"] == "error"
     assert state["text"] == "GitHub !"
@@ -65,7 +65,7 @@ def test_partial_status_still_yields_valid_params():
     # fail-soft even if a future status shape drifts.
     params = uistate.ui_state_params({})
     assert len(params) == len(uistate.SLOTS)
-    assert params[0]["state"]["tooltip"] == ""
+    assert params[0]["payload"]["tooltip"] == ""
 
 
 def test_push_emits_one_request_per_slot_through_the_sink():

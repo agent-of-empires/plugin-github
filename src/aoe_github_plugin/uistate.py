@@ -58,4 +58,4 @@ def ui_state_params(status: dict[str, Any]) -> list[dict[str, Any]]:
     }
     if pull is not None and pull.get("url"):
         state["url"] = pull["url"]
-    return [{"slot": slot, "id": cid, "state": state} for slot, cid in SLOTS]
+    return [{"slot": slot, "id": cid, "payload": state} for slot, cid in SLOTS]

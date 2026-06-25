@@ -85,4 +85,4 @@ def test_startup_pushes_ui_state_to_every_slot():
     for p in pushes:
         assert p["method"] == "ui.state.set"
         assert isinstance(p["id"], int)
-        assert "tone" in p["params"]["state"]
+        assert "tone" in p["params"]["payload"]
