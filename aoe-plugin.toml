@@ -57,6 +57,8 @@ description = "Open this checkout's PR (or the create-PR page) in a browser."
 key = "show_in_status_bar"
 label = "Show GitHub status in the status bar"
 description = "Publish a short GitHub summary to the status bar segment this plugin contributes."
+type = "bool"
+default = true
 
 [[settings]]
 key = "ui_refresh_secs"
@@ -70,15 +72,16 @@ advanced = true
 
 # UI extension points. The host renders each slot; the worker pushes display
 # state through the `ui.state.set` host RPC (wired by #2366). The status-bar
-# segment shows a one-line summary; the session-row badge shows per-session PR
-# state. Slot strings are free-form (UiContribution validates non-empty only);
-# they match the kebab slot names in #2366's D9 design.
+# segment shows a one-line summary; the row badge shows per-session PR state.
+# Slot must be one of the host's known UiSlot variants (status-bar, row-badge,
+# row-column, sort-key, filter-facet, card, detail-panel, detail-badge,
+# notification).
 [[ui]]
-slot = "status-bar-segment"
+slot = "status-bar"
 id = "github_status"
 
 [[ui]]
-slot = "session-row-badge"
+slot = "row-badge"
 id = "github_pr_badge"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking
