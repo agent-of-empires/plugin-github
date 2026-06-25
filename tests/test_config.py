@@ -1,71 +1,94 @@
-"""Worker-side config.get round-trip and poll-interval resolution (#2399)."""
+"""Worker-side config.get round-trip and poll-interval resolution (#2399).
 
-import json
+`resolve_interval` is a `Runtime` method that sends config.get then drains the
+inbound queue for its reply (servicing host requests meanwhile). These tests
+run it on a thread and feed the queue replies from the test thread, mirroring
+how the reader thread would deliver them in production.
+"""
+
+import time
+import threading
 
 from aoe_github_plugin import main
 
 
-def _reply(sent, **fields):
-    """A JSON line replying to the config.get request the worker just sent.
-    ``sent[0]`` is that request (the first thing _resolve_interval emits); its
-    id is captured so an interleaved host request cannot shift it."""
-    return json.dumps({"jsonrpc": "2.0", "id": sent[0]["id"], **fields})
+def _wait_request(sent):
+    for _ in range(2000):
+        if sent:
+            return
+        time.sleep(0.001)
+    raise AssertionError("no request was sent")
+
+
+def _resolve_with(feed):
+    """Run `resolve_interval` on a thread; `feed(rt, sent)` delivers replies."""
+    sent = []
+    rt = main.Runtime(send=sent.append, stdin=iter(()))
+    box = {}
+    t = threading.Thread(target=lambda: box.__setitem__("v", rt.resolve_interval()))
+    t.start()
+    feed(rt, sent)
+    t.join(timeout=5)
+    assert not t.is_alive()
+    return box["v"], sent
 
 
 def test_setting_value_drives_the_interval():
-    sent = []
-
-    def lines():
-        # The config.get request has been sent by the time we are iterated.
+    def feed(rt, sent):
+        _wait_request(sent)
         assert sent[0]["method"] == "config.get"
         assert sent[0]["params"] == {"key": "ui_refresh_secs"}
-        yield _reply(sent, result={"value": 42})
+        rt.inbox.put({"jsonrpc": "2.0", "id": sent[0]["id"], "result": {"value": 42}})
 
-    assert main._resolve_interval(sent.append, lines()) == 42
+    assert _resolve_with(feed)[0] == 42
 
 
 def test_unset_setting_falls_back_to_env(monkeypatch):
     monkeypatch.setenv("AOE_GITHUB_UI_REFRESH_SECS", "0")
-    sent = []
 
-    def lines():
-        yield _reply(sent, result={"value": None})
+    def feed(rt, sent):
+        _wait_request(sent)
+        rt.inbox.put({"jsonrpc": "2.0", "id": sent[0]["id"], "result": {"value": None}})
 
-    assert main._resolve_interval(sent.append, lines()) == 0
+    assert _resolve_with(feed)[0] == 0
 
 
 def test_missing_setting_falls_back_to_default(monkeypatch):
     monkeypatch.delenv("AOE_GITHUB_UI_REFRESH_SECS", raising=False)
-    sent = []
 
-    def lines():
-        yield _reply(sent, error={"code": -32601, "message": "nope"})
+    def feed(rt, sent):
+        _wait_request(sent)
+        rt.inbox.put({"jsonrpc": "2.0", "id": sent[0]["id"], "error": {"code": -32601, "message": "nope"}})
 
-    assert main._resolve_interval(sent.append, lines()) == main.DEFAULT_REFRESH_SECS
+    assert _resolve_with(feed)[0] == main.DEFAULT_REFRESH_SECS
 
 
 def test_bool_value_is_not_a_valid_interval(monkeypatch):
     monkeypatch.setenv("AOE_GITHUB_UI_REFRESH_SECS", "120")
-    sent = []
 
-    def lines():
-        yield _reply(sent, result={"value": True})
+    def feed(rt, sent):
+        _wait_request(sent)
+        rt.inbox.put({"jsonrpc": "2.0", "id": sent[0]["id"], "result": {"value": True}})
 
-    assert main._resolve_interval(sent.append, lines()) == 120
+    assert _resolve_with(feed)[0] == 120
 
 
 def test_closed_stream_before_reply_falls_back(monkeypatch):
     monkeypatch.delenv("AOE_GITHUB_UI_REFRESH_SECS", raising=False)
-    assert main._resolve_interval([].append, iter(())) == main.DEFAULT_REFRESH_SECS
+
+    def feed(rt, sent):
+        _wait_request(sent)
+        rt.inbox.put(main._EOF)
+
+    assert _resolve_with(feed)[0] == main.DEFAULT_REFRESH_SECS
 
 
 def test_host_request_during_the_wait_is_serviced():
     # A github.status request arriving before the config.get reply must be
-    # answered (and its UI pushed), not dropped.
-    sent = []
-
-    def lines():
-        yield json.dumps(
+    # answered, not dropped. (Single-path status no longer pushes UI state;
+    # only the scheduled refresh does.)
+    def feed(rt, sent):
+        rt.inbox.put(
             {
                 "jsonrpc": "2.0",
                 "id": 99,
@@ -73,11 +96,11 @@ def test_host_request_during_the_wait_is_serviced():
                 "params": {"args": {"path": "/"}},
             }
         )
-        yield _reply(sent, result={"value": 5})
+        _wait_request(sent)
+        rt.inbox.put({"jsonrpc": "2.0", "id": sent[0]["id"], "result": {"value": 5}})
 
-    assert main._resolve_interval(sent.append, lines()) == 5
+    value, sent = _resolve_with(feed)
+    assert value == 5
     answered = [m for m in sent if m.get("id") == 99 and "result" in m]
     assert len(answered) == 1
     assert answered[0]["result"]["pulls"] == []
-    pushes = [m for m in sent if m.get("method") == "ui.state.set"]
-    assert pushes  # the serviced status also pushed UI state

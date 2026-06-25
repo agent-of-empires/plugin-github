@@ -47,9 +47,10 @@ anything is written.
 
 ### Methods
 
-`github.status` (and its alias `github.refresh`) is fail-soft: it always returns
-a structured result, never a JSON-RPC error, so a status poll always has
-something to render.
+`github.status` is a live, single-checkout lookup, fail-soft: it always returns
+a structured result, never a JSON-RPC error, so a caller always has something to
+render. `github.refresh` returns `{ "accepted": true }` immediately and triggers
+a full multi-session UI refresh (below).
 
 ```jsonc
 {
@@ -70,16 +71,34 @@ something to render.
 any API failure falls back to the compare URL so it still works offline. It
 raises a typed error only when the checkout has no github.com remote.
 
-The worker does not only answer requests: it proactively pushes this status to
-its UI slots via the `ui.state.set` host RPC, on startup and on every
-`github.status` / `github.refresh`, plus a background poll. Each push is one
-`ui.state.set` request per slot with `params: { slot, id, payload }`, where
-`payload` is the host's `TextPayload`: `{ text, tone?, tooltip? }`. `tone` is
-one of the host's `Tone` set (`neutral`, `info`, `success`, `warn`, `danger`).
-The global `status-bar` slot carries no `session_id`; the per-session
-`row-badge` slot adds `session_id` (supplied with the inbound `github.status`
-call). The host replies on stdin; the worker ignores the reply (a push is
-best-effort).
+### Multi-session refresh
+
+Beyond answering requests, the worker proactively drives the UI. On startup, on
+`github.refresh`, and on a background poll it runs one refresh:
+
+1. `sessions.list` (host RPC) -> every session and its workspace `project_path`.
+2. For each workspace, discover the git checkouts: the workspace root plus each
+   immediate child directory that is its own checkout (worktree-safe -- a
+   worktree's `.git` is a file, so discovery asks `git rev-parse --show-toplevel`
+   rather than looking for a `.git` directory).
+3. Resolve each checkout to `(owner, repo, branch)`, deduplicate (a branch shared
+   across workspaces is fetched once), and look up the open PRs concurrently.
+4. Push one `ui.state.set` per slot: a `row-badge` per session (summarizing that
+   session's repos) and one global `status-bar`.
+
+GitHub lookups are conditional (ETag / `If-None-Match`; a `304` does not count
+against the rate limit) and a `403`/`429` trips a short backoff that serves
+cached values, so a many-repo, many-session setup stays well under GitHub's
+60 req/hr unauthenticated ceiling.
+
+Each push is `params: { slot, id, payload }` (the per-session `row-badge` adds
+`session_id`; the global `status-bar` omits it). `payload` is the host's
+`TextPayload`: `{ text, tone?, tooltip? }`, where `tone` is one of the host's
+`Tone` set (`neutral`, `info`, `success`, `warn`, `danger`). Per session the
+tone is a severity cascade: `danger` (a hard error -- auth/rate-limit/network)
+> `success` (an open non-draft PR) > `warn` (only drafts) > `neutral` (no PRs,
+or only non-github checkouts). The host replies on stdin; the worker ignores the
+reply (a push is best-effort).
 
 The poll interval comes from the `ui_refresh_secs` setting, which the worker
 reads at startup via the `config.get` host RPC (`agent-of-empires#2399`).

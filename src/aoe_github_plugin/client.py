@@ -98,17 +98,46 @@ class GitHubClient:
     def close(self) -> None:
         self._client.close()
 
-    def get_json(self, path: str) -> Any:
+    def get_json(self, path: str, params: dict[str, str] | None = None) -> Any:
         """GET ``path`` (relative to the API base, or an absolute URL), return
         parsed JSON. Raises a typed ``GitHubError`` subclass on any failure.
         """
         try:
-            resp = self._client.get(path)
+            resp = self._client.get(path, params=params)
         except httpx.RequestError as exc:
             raise NetworkError(exc) from exc
         if not resp.is_success:
             raise classify_status(resp.status_code, resp.headers, resp.text)
         try:
             return resp.json()
+        except ValueError as exc:
+            raise ApiError(200, f"could not decode response: {exc}") from exc
+
+    def get_json_conditional(
+        self,
+        path: str,
+        params: dict[str, str] | None = None,
+        etag: str | None = None,
+    ) -> tuple[int, str | None, Any]:
+        """Conditional GET for cache-friendly polling. Returns
+        ``(status, etag, json)``: a ``304`` (the resource is unchanged) yields
+        ``(304, etag, None)`` and does NOT count against GitHub's primary rate
+        limit; a ``200`` yields ``(200, <new etag>, <parsed json>)``. Raises a
+        typed ``GitHubError`` on any real failure (4xx/5xx other than 304).
+
+        ``params`` is passed to httpx so query values (e.g. a branch with ``/``)
+        are encoded correctly, not string-interpolated.
+        """
+        headers = {"If-None-Match": etag} if etag else None
+        try:
+            resp = self._client.get(path, params=params, headers=headers)
+        except httpx.RequestError as exc:
+            raise NetworkError(exc) from exc
+        if resp.status_code == 304:
+            return 304, etag, None
+        if not resp.is_success:
+            raise classify_status(resp.status_code, resp.headers, resp.text)
+        try:
+            return 200, resp.headers.get("ETag"), resp.json()
         except ValueError as exc:
             raise ApiError(200, f"could not decode response: {exc}") from exc

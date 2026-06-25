@@ -1,71 +1,148 @@
-"""Derive host UI state from a ``github.status`` result.
+"""Turn a refresh snapshot into host ``ui.state.set`` params (pure, no IO).
 
-The host renders UI slots itself; the worker only pushes typed display state
-through the ``ui.state.set`` host RPC (issue #2366, design section D9). Plugin
-code never runs in the dashboard. This module is the pure half: it turns the
-fail-soft ``github.status`` dict into one ``ui.state.set`` ``params`` object per
-declared slot. No id, no IO, so the mapping is unit-testable on its own.
+The host renders the slots; the worker only pushes typed display state. From one
+aggregate snapshot (see ``refresh.build_snapshot``) this produces one
+``status-bar`` push (global, no ``session_id``) plus one ``row-badge`` push per
+session (per-session, carrying ``session_id``). Each ``payload`` is the host's
+``TextPayload`` -- ``{text, tone, tooltip}`` only, parsed ``deny_unknown_fields``
+-- and ``tone`` is one of the host's ``Tone`` set.
 
-The params shape ``{slot, id, payload[, session_id]}`` mirrors the ``[[ui]]``
-manifest keys (``slot`` + ``id``); ``payload`` is the host's ``TextPayload``
-(``text`` + optional ``tone``/``tooltip``, no extra fields: the host parses it
-``deny_unknown_fields``). ``tone`` is one of the host's closed ``Tone`` set.
+Tone is a severity cascade ``danger > success > warn > neutral``:
+- ``danger``  a hard error is present (auth failure, rate limit, network/API
+  error) -- something the user must act on;
+- ``success`` at least one open non-draft PR and no hard error;
+- ``warn``    only draft PRs;
+- ``neutral`` no PRs (or only benign non-github checkouts / detached HEADs).
 
-Slot scope follows the host: ``status-bar`` is global (one summary, no
-``session_id``); ``row-badge`` is per session (the host keys it by
-``session_id``, so a push without one is rejected). The caller passes the
-session being described, or ``None`` for the global push.
+Benign states (a workspace subdir with no github.com remote, a detached HEAD, a
+branch with no PR) are NOT errors and never raise the tone above neutral.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-# Contribution ids per slot, matching the [[ui]] entries in aoe-plugin.toml.
-GLOBAL_SLOTS: list[tuple[str, str]] = [("status-bar", "github_status")]
-SESSION_SLOTS: list[tuple[str, str]] = [("row-badge", "github_pr_badge")]
+GLOBAL_SLOT = ("status-bar", "github_status")
+SESSION_SLOT = ("row-badge", "github_pr_badge")
 
-# github.status tone -> host Tone variant (neutral/info/success/warn/danger).
-_TONES = {"error": "danger", "none": "neutral", "draft": "warn", "open": "success"}
-
-
-def _tone(pull: dict[str, Any] | None, error: Any) -> str:
-    """A host ``Tone`` variant for the PR's state."""
-    if error:
-        return _TONES["error"]
-    if pull is None:
-        return _TONES["none"]
-    return _TONES["draft"] if pull.get("draft") else _TONES["open"]
+# Tooltip detail is bounded so a many-repo workspace cannot push a huge string.
+_MAX_TOOLTIP_LINES = 12
 
 
-def _text(pull: dict[str, Any] | None, error: Any) -> str:
-    """Short badge label (the status-bar segment shows ``tooltip`` instead)."""
-    if error:
+def _has_hard_error(repos: list[dict[str, Any]]) -> bool:
+    return any(r.get("error") for r in repos)
+
+
+def _count_open(repos: list[dict[str, Any]]) -> int:
+    return sum(1 for r in repos for p in (r.get("pulls") or []) if not p.get("draft"))
+
+
+def _count_drafts(repos: list[dict[str, Any]]) -> int:
+    return sum(1 for r in repos for p in (r.get("pulls") or []) if p.get("draft"))
+
+
+def _tone(repos: list[dict[str, Any]]) -> str:
+    if _has_hard_error(repos):
+        return "danger"
+    if _count_open(repos):
+        return "success"
+    if _count_drafts(repos):
+        return "warn"
+    return "neutral"
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def _text(repos: list[dict[str, Any]]) -> str:
+    if _has_hard_error(repos):
         return "GitHub !"
-    if pull is None:
-        return "no PR"
-    return f"PR #{pull['number']}"
+    opened = _count_open(repos)
+    if opened:
+        return _plural(opened, "PR")
+    drafts = _count_drafts(repos)
+    if drafts:
+        return _plural(drafts, "draft")
+    if not repos:
+        return "no repos"
+    if not any(r.get("repo") for r in repos):
+        return "no GitHub"
+    return "no PRs"
 
 
-def ui_state_params(status: dict[str, Any], session_id: str | None = None) -> list[dict[str, Any]]:
-    """``ui.state.set`` ``params`` dicts derived from a ``github.status`` result.
+def _repo_line(repo: dict[str, Any]) -> str:
+    name = repo["name"]
+    error = repo.get("error")
+    if error:
+        return f"{name}: {error.get('hint', 'error').splitlines()[0]}"
+    if not repo.get("repo"):
+        return f"{name}: not on GitHub"
+    pulls = repo.get("pulls") or []
+    if not pulls:
+        return f"{name}: no PR"
+    pull = pulls[0]
+    kind = "draft PR" if pull.get("draft") else "PR"
+    return f"{name}: {kind} #{pull['number']} {pull['title']}"
 
-    With ``session_id`` ``None`` the global slots are produced (no
-    ``session_id`` key); with a ``session_id`` the per-session slots are
-    produced (each carrying it). Pure and total: a malformed/partial status
-    still yields valid params, so the caller stays fail-soft.
+
+def _tooltip(header: str, repos: list[dict[str, Any]]) -> str:
+    lines = [header]
+    shown = repos[:_MAX_TOOLTIP_LINES]
+    lines += [_repo_line(r) for r in shown]
+    if len(repos) > len(shown):
+        lines.append(f"... +{len(repos) - len(shown)} more")
+    return "\n".join(lines)
+
+
+def _payload(text: str, tone: str, tooltip: str) -> dict[str, Any]:
+    return {"text": text, "tone": tone, "tooltip": tooltip}
+
+
+def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
+    repos = session.get("repos") or []
+    header = session.get("title") or session.get("session_id") or "session"
+    return _payload(_text(repos), _tone(repos), _tooltip(header, repos))
+
+
+def _global_payload(sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    all_repos = [r for s in sessions for r in (s.get("repos") or [])]
+    opened = _count_open(all_repos)
+    text = "GitHub !" if _has_hard_error(all_repos) else f"GitHub: {_plural(opened, 'PR')}"
+    summary = f"{opened} open PRs across {len(sessions)} sessions / {len(all_repos)} repos"
+    lines = [summary]
+    for session in sessions:
+        repos = session.get("repos") or []
+        name = session.get("title") or session.get("session_id") or "session"
+        lines.append(f"{name}: {_text(repos)}")
+    tooltip = "\n".join(lines[: _MAX_TOOLTIP_LINES + 1])
+    return _payload(text, _tone(all_repos), tooltip)
+
+
+def snapshot_ui_state_params(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """``ui.state.set`` params for a whole refresh snapshot: one ``row-badge``
+    per session (with ``session_id``) plus one global ``status-bar`` (without).
+    Pure and total: a missing/partial snapshot still yields a valid global push.
     """
-    pulls = status.get("pulls") or []
-    pull = pulls[0] if pulls else None
-    error = status.get("error")
-    payload: dict[str, Any] = {
-        "text": _text(pull, error),
-        "tone": _tone(pull, error),
-        "tooltip": status.get("summary") or "",
-    }
-    slots = SESSION_SLOTS if session_id is not None else GLOBAL_SLOTS
-    out = [{"slot": slot, "id": cid, "payload": payload} for slot, cid in slots]
-    if session_id is not None:
-        for params in out:
-            params["session_id"] = session_id
-    return out
+    sessions = snapshot.get("sessions") or []
+    params: list[dict[str, Any]] = []
+    for session in sessions:
+        sid = session.get("session_id")
+        if sid is None:
+            continue
+        params.append(
+            {
+                "slot": SESSION_SLOT[0],
+                "id": SESSION_SLOT[1],
+                "session_id": sid,
+                "payload": _session_payload(session),
+            }
+        )
+    params.append(
+        {
+            "slot": GLOBAL_SLOT[0],
+            "id": GLOBAL_SLOT[1],
+            "payload": _global_payload(sessions),
+        }
+    )
+    return params

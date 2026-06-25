@@ -1,12 +1,22 @@
-"""ui.state.set payload mapping (pure) and the fail-soft push path."""
+"""Aggregate snapshot -> ui.state.set params mapping (pure)."""
 
-from aoe_github_plugin import main
 from aoe_github_plugin import uistate
 
 
-def _status(pulls=(), error=None, summary="", repo="o/r", branch="feature"):
+def _pull(number=7, draft=False, title="t"):
     return {
-        "summary": summary,
+        "number": number,
+        "url": f"https://github.com/o/r/pull/{number}",
+        "title": title,
+        "state": "open",
+        "draft": draft,
+    }
+
+
+def _repo(name="r", repo="o/r", branch="feature", pulls=(), error=None):
+    return {
+        "path": f"/ws/{name}",
+        "name": name,
         "repo": repo,
         "branch": branch,
         "pulls": list(pulls),
@@ -14,94 +24,107 @@ def _status(pulls=(), error=None, summary="", repo="o/r", branch="feature"):
     }
 
 
-def _pull(number=7, draft=False):
+def _session(session_id="s1", title="sess", repos=()):
     return {
-        "number": number,
-        "url": f"https://github.com/o/r/pull/{number}",
-        "title": "t",
-        "state": "open",
-        "draft": draft,
+        "session_id": session_id,
+        "title": title,
+        "project_path": "/ws",
+        "repos": list(repos),
     }
 
 
-def test_global_push_fills_the_status_bar_without_a_session_id():
-    params = uistate.ui_state_params(_status())
-    assert [p["slot"] for p in params] == [s for s, _ in uistate.GLOBAL_SLOTS]
-    assert all(set(p) == {"slot", "id", "payload"} for p in params)
+def _snapshot(*sessions):
+    return {"sessions": list(sessions)}
 
 
-def test_per_session_push_fills_the_row_badge_with_a_session_id():
-    params = uistate.ui_state_params(_status(), session_id="s1")
-    assert [p["slot"] for p in params] == [s for s, _ in uistate.SESSION_SLOTS]
-    assert all(p["session_id"] == "s1" for p in params)
-    assert all(set(p) == {"slot", "id", "payload", "session_id"} for p in params)
+def _badges(params):
+    return [p for p in params if p["slot"] == "row-badge"]
 
 
-def test_payload_carries_only_text_payload_fields():
-    # The host parses TextPayload deny_unknown_fields: text + optional
-    # tone/tooltip, nothing else (no url).
-    payload = uistate.ui_state_params(_status(pulls=[_pull(number=12)]))[0]["payload"]
-    assert set(payload) <= {"text", "tone", "tooltip"}
+def _statusbar(params):
+    return next(p for p in params if p["slot"] == "status-bar")
 
 
-def test_open_pr_state():
-    payload = uistate.ui_state_params(_status(pulls=[_pull(number=12)], summary="o/r: PR #12 open for feature"))[0][
-        "payload"
-    ]
-    assert payload["tone"] == "success"
-    assert payload["text"] == "PR #12"
-    assert payload["tooltip"] == "o/r: PR #12 open for feature"
+def test_shape_one_badge_per_session_plus_one_status_bar():
+    params = uistate.snapshot_ui_state_params(_snapshot(_session("s1"), _session("s2")))
+    badges = _badges(params)
+    assert {b["session_id"] for b in badges} == {"s1", "s2"}
+    assert all(b["id"] == "github_pr_badge" for b in badges)
+    bar = _statusbar(params)
+    assert "session_id" not in bar
+    assert bar["id"] == "github_status"
 
 
-def test_draft_pr_tone():
-    payload = uistate.ui_state_params(_status(pulls=[_pull(draft=True)]))[0]["payload"]
-    assert payload["tone"] == "warn"
+def test_payload_is_text_payload_only():
+    params = uistate.snapshot_ui_state_params(_snapshot(_session(repos=[_repo(pulls=[_pull()])])))
+    for p in params:
+        assert set(p["payload"]) == {"text", "tone", "tooltip"}
 
 
-def test_no_pr_state():
-    payload = uistate.ui_state_params(_status(summary="o/r: no open PR"))[0]["payload"]
-    assert payload["tone"] == "neutral"
-    assert payload["text"] == "no PR"
+def test_tone_open_pr_is_success():
+    session = _session(repos=[_repo(pulls=[_pull()])])
+    badge = _badges(uistate.snapshot_ui_state_params(_snapshot(session)))[0]
+    assert badge["payload"]["tone"] == "success"
+    assert badge["payload"]["text"] == "1 PR"
 
 
-def test_error_state():
-    payload = uistate.ui_state_params(_status(error={"kind": "unauthorized", "hint": "x"}, summary="GitHub: ..."))[0][
-        "payload"
-    ]
-    assert payload["tone"] == "danger"
-    assert payload["text"] == "GitHub !"
+def test_tone_draft_only_is_warn():
+    session = _session(repos=[_repo(pulls=[_pull(draft=True)])])
+    badge = _badges(uistate.snapshot_ui_state_params(_snapshot(session)))[0]
+    assert badge["payload"]["tone"] == "warn"
+    assert badge["payload"]["text"] == "1 draft"
 
 
-def test_partial_status_still_yields_valid_params():
-    # A malformed status (missing keys) must not raise; the worker stays
-    # fail-soft even if a future status shape drifts.
-    params = uistate.ui_state_params({})
-    assert len(params) == len(uistate.GLOBAL_SLOTS)
-    assert params[0]["payload"]["tooltip"] == ""
+def test_hard_error_is_danger_and_beats_an_open_pr():
+    # A session with a real open PR in one repo AND a hard error in another must
+    # surface danger, not a misleading green.
+    session = _session(
+        repos=[
+            _repo(name="a", pulls=[_pull()]),
+            _repo(name="b", error={"kind": "rate_limited", "hint": "rate limited"}),
+        ]
+    )
+    badge = _badges(uistate.snapshot_ui_state_params(_snapshot(session)))[0]
+    assert badge["payload"]["tone"] == "danger"
+    assert badge["payload"]["text"] == "GitHub !"
 
 
-def test_push_emits_one_request_per_slot_through_the_sink():
-    sent = []
-    main.push_ui_state(_status(pulls=[_pull()]), send=sent.append)
-    assert len(sent) == len(uistate.GLOBAL_SLOTS)
-    methods = {m["method"] for m in sent}
-    assert methods == {"ui.state.set"}
-    ids = [m["id"] for m in sent]
-    assert all(isinstance(i, int) for i in ids)
-    assert len(set(ids)) == len(ids)  # distinct ids per request
-    assert all(m["jsonrpc"] == "2.0" for m in sent)
+def test_benign_non_github_never_warns():
+    # A workspace of non-github checkouts is neutral, not an error.
+    session = _session(repos=[_repo(name="x", repo=None, branch=None)])
+    badge = _badges(uistate.snapshot_ui_state_params(_snapshot(session)))[0]
+    assert badge["payload"]["tone"] == "neutral"
+    assert badge["payload"]["text"] == "no GitHub"
 
 
-def test_per_session_push_carries_the_session_id_through_the_sink():
-    sent = []
-    main.push_ui_state(_status(pulls=[_pull()]), send=sent.append, session_id="s1")
-    assert len(sent) == len(uistate.SESSION_SLOTS)
-    assert all(m["params"]["session_id"] == "s1" for m in sent)
+def test_no_prs_is_neutral():
+    session = _session(repos=[_repo()])
+    badge = _badges(uistate.snapshot_ui_state_params(_snapshot(session)))[0]
+    assert badge["payload"]["tone"] == "neutral"
+    assert badge["payload"]["text"] == "no PRs"
 
 
-def test_push_is_failsoft_when_the_sink_raises():
-    def boom(_message):
-        raise BrokenPipeError("host went away")
+def test_multi_repo_counts_open_prs():
+    session = _session(
+        repos=[
+            _repo(name="a", pulls=[_pull(number=1)]),
+            _repo(name="b", pulls=[_pull(number=2)]),
+            _repo(name="c", pulls=[_pull(number=3, draft=True)]),
+            _repo(name="d"),
+        ]
+    )
+    badge = _badges(uistate.snapshot_ui_state_params(_snapshot(session)))[0]
+    assert badge["payload"]["text"] == "2 PRs"
+    assert badge["payload"]["tone"] == "success"
 
-    # Must not propagate: a dead host pipe cannot crash the worker.
-    main.push_ui_state(_status(pulls=[_pull()]), send=boom)
+
+def test_empty_snapshot_still_pushes_a_global_status_bar():
+    params = uistate.snapshot_ui_state_params({})
+    assert _badges(params) == []
+    bar = _statusbar(params)
+    assert "tone" in bar["payload"]
+
+
+def test_session_without_id_is_skipped_for_badges():
+    params = uistate.snapshot_ui_state_params(_snapshot(_session(session_id=None)))
+    assert _badges(params) == []
