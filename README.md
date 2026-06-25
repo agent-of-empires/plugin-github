@@ -72,11 +72,18 @@ raises a typed error only when the checkout has no github.com remote.
 
 The worker does not only answer requests: it proactively pushes this status to
 its UI slots via the `ui.state.set` host RPC, on startup and on every
-`github.status` / `github.refresh`, plus a fail-soft poll
-(`AOE_GITHUB_UI_REFRESH_SECS`, default 300s, 0 disables). Each push is one
+`github.status` / `github.refresh`, plus a background poll. Each push is one
 `ui.state.set` request per slot with `params: { slot, id, state }`, where
 `state` is `{ text, tone, tooltip, url? }`. The host replies on stdin; the
 worker ignores the reply (a push is best-effort).
+
+The poll interval comes from the `ui_refresh_secs` setting, which the worker
+reads at startup via the `config.get` host RPC (`agent-of-empires#2399`).
+Precedence: the setting, else the `AOE_GITHUB_UI_REFRESH_SECS` env override,
+else 300s; `0` disables the background poll (startup and refresh pushes still
+happen). Unlike a push, the startup `config.get` blocks for its reply, which is
+safe: the host always answers a worker call (an unknown method comes back as an
+error, not silence).
 
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol
