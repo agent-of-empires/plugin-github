@@ -8,7 +8,8 @@ two pushes:
   clickable PR icon per repo that has an open/draft PR (or an error marker).
   A multi-repo workspace shows several icons on its row; clicking one opens that
   PR. Repos with no PR are omitted from the row (the pane carries the detail).
-- a ``detail-panel`` (the in-session GitHub pane) whose payload is a flexible
+- a ``pane`` (the in-session GitHub tool-window, opened in the right dock by
+  default via ``default_location``) whose payload is a flexible
   ``{"title", "blocks": [...]}`` block list. Blocks are a small, extensible
   vocabulary (``heading``, ``row``, ``note``, ``divider``); the host renders the
   kinds it knows and ignores the rest, so this plugin can grow the pane (review
@@ -24,7 +25,12 @@ from __future__ import annotations
 from typing import Any
 
 ROW_BADGE_SLOT = ("row-badge", "github_pr_badge")
-PANE_SLOT = ("detail-panel", "github_pane")
+PANE_SLOT = ("pane", "github_pane")
+# Dock the GitHub pane opens in by default; the user can move it after.
+PANE_DEFAULT_LOCATION = "right"
+# Lucide icon for the pane's activity-bar button (host resolves against its
+# allowlist, else a generic plugin icon). Lucide dropped its GitHub brand mark.
+PANE_ICON = "message-square-diff"
 
 # PR state -> (lucide icon name, host Tone). Hard errors get an alert icon.
 _ICON_OPEN = "git-pull-request-arrow"
@@ -107,18 +113,31 @@ def _pane_row(repo: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+# A button the host renders in the pane; clicking it forwards github.refresh to
+# this worker (host POST /api/plugins/{id}/action -> stdin notification), which
+# re-fetches and re-pushes. The worker already handles github.refresh.
+_REFRESH_ACTION = {
+    "kind": "action",
+    "label": "Refresh",
+    "icon": "refresh-cw",
+    "method": "github.refresh",
+}
+
+
 def _pane_blocks(repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = [{"kind": "heading", "text": "GitHub"}]
     if not repos:
         blocks.append({"kind": "note", "text": "no repos in this workspace", "tone": "neutral"})
-        return blocks
-    blocks.extend(_pane_row(repo) for repo in repos)
+    else:
+        blocks.extend(_pane_row(repo) for repo in repos)
+    blocks.append({"kind": "divider"})
+    blocks.append(dict(_REFRESH_ACTION))
     return blocks
 
 
 def snapshot_ui_state_params(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     """``ui.state.set`` params for a refresh snapshot: per session, a ``row-badge``
-    (one icon per PR) and a ``detail-panel`` (the GitHub pane). No global slot.
+    (one icon per PR) and a ``pane`` (the GitHub tool-window). No global slot.
     Pure and total: a missing/partial snapshot yields no pushes rather than raising.
     """
     sessions = snapshot.get("sessions") or []
@@ -141,7 +160,12 @@ def snapshot_ui_state_params(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 "slot": PANE_SLOT[0],
                 "id": PANE_SLOT[1],
                 "session_id": sid,
-                "payload": {"title": "GitHub", "blocks": _pane_blocks(repos)},
+                "payload": {
+                    "title": "GitHub",
+                    "default_location": PANE_DEFAULT_LOCATION,
+                    "icon": PANE_ICON,
+                    "blocks": _pane_blocks(repos),
+                },
             }
         )
     return params

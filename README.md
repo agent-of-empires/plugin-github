@@ -41,7 +41,7 @@ anything is written.
 | Command | `status` -> worker method `github.status`                          |
 | Command | `refresh` -> worker method `github.refresh`                        |
 | Command | `open` (open-in-GitHub) -> worker method `github.open`             |
-| UI      | a `row-badge` (`github_pr_badge`) and a `detail-panel` pane (`github_pane`) |
+| UI      | a `row-badge` (`github_pr_badge`) and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
 At install/update the host runs the manifest's `[[runtime.build]]` steps in the
@@ -89,9 +89,12 @@ Beyond answering requests, the worker proactively drives the UI. On startup, on
 3. Resolve each checkout to `(owner, repo, branch)`, deduplicate (a branch shared
    across workspaces is fetched once), and look up the open PRs concurrently.
 4. Push two `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- one
-   colored, clickable PR icon per repo with a PR) and a `detail-panel`
-   (`{title, blocks: [...]}` -- the in-session GitHub pane listing each repo's
-   PR / review / CI state).
+   colored, clickable PR icon per repo with a PR) and a `pane`
+   (`{title, default_location, icon, blocks: [...]}` -- the in-session GitHub
+   tool-window listing each repo's PR / review / CI state; `icon` is a lucide
+   name for its activity-bar button). The pane ends with an `action` block
+   ("Refresh") whose click POSTs back to the host, which forwards `github.refresh`
+   to this worker.
 
 GitHub lookups are conditional (ETag / `If-None-Match`; a `304` does not count
 against the rate limit) and a `403`/`429` trips a short backoff that serves
@@ -101,8 +104,10 @@ cached values, so a many-repo, many-session setup stays well under GitHub's
 Each push is `params: { slot, id, session_id, payload }`. A badge item is
 `{ icon, tone?, href?, tooltip? }` (`icon` is a lucide name, e.g.
 `git-pull-request-arrow`; `tone` colors it; `href` opens the PR). A pane block
-is one of a small, extensible set (`heading`, `row`, `note`, `divider`) -- a
-`row` is `{ label, value?, sublabel?, icon?, tone?, href? }`. The host renders
+is one of a small, extensible set (`heading`, `row`, `note`, `divider`,
+`action`) -- a `row` is `{ label, value?, sublabel?, icon?, tone?, href? }` and
+an `action` is `{ label, method, icon? }` (a button that forwards `method` to
+this worker). The host renders
 the block kinds it knows and ignores the rest, so the pane can grow (review, CI,
 checks) without a lockstep host change. `tone` is one of the host's `Tone` set
 (`neutral`, `info`, `success`, `warn`, `danger`): a non-draft open PR is
@@ -112,7 +117,7 @@ The host replies on stdin; the worker ignores the reply (a push is best-effort).
 The poll interval comes from the `ui_refresh_secs` setting, which the worker
 reads at startup via the `config.get` host RPC (`agent-of-empires#2399`).
 Precedence: the setting, else the `AOE_GITHUB_UI_REFRESH_SECS` env override,
-else 300s; `0` disables the background poll (startup and refresh pushes still
+else 30s; `0` disables the background poll (startup and refresh pushes still
 happen). Unlike a push, the startup `config.get` blocks for its reply, which is
 safe: the host always answers a worker call (an unknown method comes back as an
 error, not silence).
