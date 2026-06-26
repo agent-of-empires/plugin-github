@@ -194,9 +194,15 @@ class Runtime:
         list: a transient failure must never be read as "no sessions", which
         would prune every session's UI."""
         result = self.call_host(SESSIONS_LIST, {}, timeout=timeout)
-        if not isinstance(result, dict) or not isinstance(result.get("sessions"), list):
+        sessions = result.get("sessions") if isinstance(result, dict) else None
+        if not isinstance(sessions, list):
             return None
-        return result["sessions"]
+        # Each entry must carry a string id. A malformed entry (e.g. `{}`) would
+        # otherwise drop out of the snapshot and be read as a vanished session,
+        # pruning live UI; treat a garbage list as "no answer" instead.
+        if not all(isinstance(s, dict) and isinstance(s.get("id"), str) for s in sessions):
+            return None
+        return sessions
 
     def run_refresh(self, sessions: list[dict[str, Any]] | None = None) -> None:
         """Build the aggregate snapshot from the session list and reconcile UI

@@ -66,5 +66,10 @@ def test_list_sessions_rejects_bad_shapes(monkeypatch):
     for bad in (None, {}, {"sessions": "nope"}, "garbage", 42):
         monkeypatch.setattr(rt, "call_host", _const(bad))
         assert rt.list_sessions() is None
+    # A list whose entries lack a string id is garbage, not "no sessions":
+    # reading it as empty would prune live UI.
+    for bad in ({"sessions": [{}]}, {"sessions": [{"id": 1}]}, {"sessions": [{"id": "s1"}, "x"]}):
+        monkeypatch.setattr(rt, "call_host", _const(bad))
+        assert rt.list_sessions() is None
     monkeypatch.setattr(rt, "call_host", _const({"sessions": [{"id": "s1"}]}))
     assert rt.list_sessions() == [{"id": "s1"}]
