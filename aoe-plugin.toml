@@ -13,7 +13,7 @@ id = "agent-of-empires.github"
 name = "GitHub"
 version = "0.1.0"
 # Manifest schema / host API version. Host supports 1..=1.
-api_version = 1
+api_version = 3
 description = "GitHub integration for Agent of Empires: surface PR and issue state for your sessions."
 
 # Capability grants are prompted at install and pinned to the manifest hash.
@@ -66,16 +66,16 @@ advanced = true
 # UI extension points. The host renders each slot; the worker pushes display
 # state through the `ui.state.set` host RPC (wired by #2366). Two per-session
 # surfaces: a `row-badge` that shows one colored PR icon per repo with an open
-# PR (click opens it), and a `detail-panel` GitHub pane in the session detail
-# view listing each repo's PR / review / CI state. Both are driven by one push
-# each per session (a list payload), so a multi-repo workspace needs no
+# PR (click opens it), and a `pane` GitHub tool-window (in the right dock by
+# default) listing each repo's PR / review / CI state. Both are driven by one
+# push each per session (a list payload), so a multi-repo workspace needs no
 # per-repo slot ids. Slot must be one of the host's known UiSlot variants.
 [[ui]]
 slot = "row-badge"
 id = "github_pr_badge"
 
 [[ui]]
-slot = "detail-panel"
+slot = "pane"
 id = "github_pane"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking

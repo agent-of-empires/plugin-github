@@ -8,7 +8,8 @@ two pushes:
   clickable PR icon per repo that has an open/draft PR (or an error marker).
   A multi-repo workspace shows several icons on its row; clicking one opens that
   PR. Repos with no PR are omitted from the row (the pane carries the detail).
-- a ``detail-panel`` (the in-session GitHub pane) whose payload is a flexible
+- a ``pane`` (the in-session GitHub tool-window, opened in the right dock by
+  default via ``default_location``) whose payload is a flexible
   ``{"title", "blocks": [...]}`` block list. Blocks are a small, extensible
   vocabulary (``heading``, ``row``, ``note``, ``divider``); the host renders the
   kinds it knows and ignores the rest, so this plugin can grow the pane (review
@@ -24,7 +25,9 @@ from __future__ import annotations
 from typing import Any
 
 ROW_BADGE_SLOT = ("row-badge", "github_pr_badge")
-PANE_SLOT = ("detail-panel", "github_pane")
+PANE_SLOT = ("pane", "github_pane")
+# Dock the GitHub pane opens in by default; the user can move it after.
+PANE_DEFAULT_LOCATION = "right"
 
 # PR state -> (lucide icon name, host Tone). Hard errors get an alert icon.
 _ICON_OPEN = "git-pull-request-arrow"
@@ -118,7 +121,7 @@ def _pane_blocks(repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def snapshot_ui_state_params(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     """``ui.state.set`` params for a refresh snapshot: per session, a ``row-badge``
-    (one icon per PR) and a ``detail-panel`` (the GitHub pane). No global slot.
+    (one icon per PR) and a ``pane`` (the GitHub tool-window). No global slot.
     Pure and total: a missing/partial snapshot yields no pushes rather than raising.
     """
     sessions = snapshot.get("sessions") or []
@@ -141,7 +144,11 @@ def snapshot_ui_state_params(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 "slot": PANE_SLOT[0],
                 "id": PANE_SLOT[1],
                 "session_id": sid,
-                "payload": {"title": "GitHub", "blocks": _pane_blocks(repos)},
+                "payload": {
+                    "title": "GitHub",
+                    "default_location": PANE_DEFAULT_LOCATION,
+                    "blocks": _pane_blocks(repos),
+                },
             }
         )
     return params

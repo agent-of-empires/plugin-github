@@ -37,13 +37,13 @@ def _badge(params, sid="s1"):
 
 
 def _pane(params, sid="s1"):
-    return next(p for p in params if p["slot"] == "detail-panel" and p["session_id"] == sid)
+    return next(p for p in params if p["slot"] == "pane" and p["session_id"] == sid)
 
 
 def test_each_session_gets_a_badge_and_a_pane_with_session_id():
     params = uistate.snapshot_ui_state_params(_snapshot(_session("s1"), _session("s2")))
     badges = {p["session_id"] for p in params if p["slot"] == "row-badge"}
-    panes = {p["session_id"] for p in params if p["slot"] == "detail-panel"}
+    panes = {p["session_id"] for p in params if p["slot"] == "pane"}
     assert badges == {"s1", "s2"}
     assert panes == {"s1", "s2"}
     assert all("session_id" in p for p in params)
@@ -95,9 +95,10 @@ def test_pane_has_heading_and_a_row_per_repo():
     assert rows[1]["value"] == "no open PR"
 
 
-def test_pane_payload_carries_title():
+def test_pane_payload_carries_title_and_default_location():
     pane = _pane(uistate.snapshot_ui_state_params(_snapshot(_session())))
     assert pane["payload"]["title"] == "GitHub"
+    assert pane["payload"]["default_location"] == "right"
 
 
 def test_empty_snapshot_yields_no_pushes():

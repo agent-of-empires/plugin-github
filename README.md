@@ -41,7 +41,7 @@ anything is written.
 | Command | `status` -> worker method `github.status`                          |
 | Command | `refresh` -> worker method `github.refresh`                        |
 | Command | `open` (open-in-GitHub) -> worker method `github.open`             |
-| UI      | a `row-badge` (`github_pr_badge`) and a `detail-panel` pane (`github_pane`) |
+| UI      | a `row-badge` (`github_pr_badge`) and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
 At install/update the host runs the manifest's `[[runtime.build]]` steps in the
@@ -89,9 +89,9 @@ Beyond answering requests, the worker proactively drives the UI. On startup, on
 3. Resolve each checkout to `(owner, repo, branch)`, deduplicate (a branch shared
    across workspaces is fetched once), and look up the open PRs concurrently.
 4. Push two `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- one
-   colored, clickable PR icon per repo with a PR) and a `detail-panel`
-   (`{title, blocks: [...]}` -- the in-session GitHub pane listing each repo's
-   PR / review / CI state).
+   colored, clickable PR icon per repo with a PR) and a `pane`
+   (`{title, default_location, blocks: [...]}` -- the in-session GitHub
+   tool-window listing each repo's PR / review / CI state).
 
 GitHub lookups are conditional (ETag / `If-None-Match`; a `304` does not count
 against the rate limit) and a `403`/`429` trips a short backoff that serves
