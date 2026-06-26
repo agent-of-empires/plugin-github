@@ -1,5 +1,7 @@
 """Aggregate snapshot -> ui.state.set params mapping (pure)."""
 
+import json
+
 from aoe_github_plugin import uistate
 
 
@@ -116,3 +118,87 @@ def test_empty_snapshot_yields_no_pushes():
 
 def test_session_without_id_is_skipped():
     assert uistate.snapshot_ui_state_params(_snapshot(_session(session_id=None))) == []
+
+
+# --- rich (token) rendering ---
+
+
+def _rich_pull(state="OPEN", merged=False, review="approved", checks=None, comments=None):
+    number = 5
+    return {
+        "number": number,
+        "url": f"https://github.com/o/r/pull/{number}",
+        "title": "T",
+        "state": state,
+        "draft": False,
+        "merged": merged,
+        "review_state": review,
+        "checks": checks,
+        "comments": comments or {"unresolved": 0, "items": []},
+    }
+
+
+def _auth_snapshot(*sessions, present=True):
+    return {"sessions": list(sessions), "auth": {"present": present}}
+
+
+def test_merged_pr_uses_purple_color_and_is_omitted_from_badge():
+    session = _session(repos=[_repo(name="a", pulls=[_rich_pull(state="MERGED", merged=True)])])
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(session))
+    # Badge: merged-only repo contributes no actionable badge.
+    assert _badge(params)["payload"]["items"] == []
+    # Pane: headline row is purple with the merge icon.
+    head = next(b for b in _pane(params)["payload"]["blocks"] if b.get("kind") == "row")
+    assert head["icon"] == "git-merge"
+    assert head["color"] == uistate.MERGED_COLOR
+    assert head["value"].startswith("MERGED #5")
+
+
+def test_pane_renders_review_checks_and_comments():
+    checks = {"state": "failing", "runs": [{"name": "test", "state": "failing", "url": "https://ci/1"}]}
+    comments = {
+        "unresolved": 1,
+        "items": [{"author": "al", "body": "fix", "path": "a.py", "line": 2, "url": "https://c/1", "resolved": False}],
+    }
+    pull = _rich_pull(review="changes-requested", checks=checks, comments=comments)
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
+        "blocks"
+    ]
+    review_row = next(b for b in blocks if b.get("kind") == "row" and b.get("label") == "Review")
+    assert review_row["value"] == "changes requested"
+    assert review_row["tone"] == "danger"
+    sections = [b for b in blocks if b.get("kind") == "section"]
+    checks_section = next(s for s in sections if s["title"].startswith("Checks"))
+    assert checks_section["children"][0]["label"] == "test"
+    assert checks_section["children"][0]["tone"] == "danger"
+    comments_section = next(s for s in sections if s["title"].startswith("Unresolved comments"))
+    comment = comments_section["children"][0]
+    assert comment["kind"] == "comment"
+    assert comment["author"] == "al"
+    assert comment["href"] == "https://c/1"
+
+
+def test_pane_payload_stays_under_host_size_cap():
+    # A many-repo workspace with long comments would blow the 8KB/entry host cap;
+    # the pane must trim to fit (and keep the heading + refresh action).
+    big_comment = {
+        "unresolved": 1,
+        "items": [{"author": "a", "body": "x" * 300, "path": "p.py", "line": 1, "resolved": False}],
+    }
+    repos = [_repo(name=f"r{i}", repo=f"o/r{i}", pulls=[_rich_pull(comments=big_comment)]) for i in range(40)]
+    pane = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos))))
+    blocks = pane["payload"]["blocks"]
+    assert len(json.dumps(blocks)) <= uistate._PANE_BUDGET + 200  # under cap (+ truncation note slack)
+    assert blocks[0] == {"kind": "heading", "text": "GitHub"}
+    assert blocks[-1]["method"] == "github.refresh"
+    assert any(b.get("text", "").startswith("more not shown") for b in blocks)
+
+
+def test_no_token_note_shown_only_when_a_github_repo_exists():
+    # github repo + no token -> a warn note banner.
+    with_repo = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo()]), present=False))
+    notes = [b for b in _pane(with_repo)["payload"]["blocks"] if b.get("kind") == "note" and b.get("tone") == "warn"]
+    assert len(notes) == 1
+    # no github repo -> no nag.
+    no_repo = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(repo=None)]), present=False))
+    assert not [b for b in _pane(no_repo)["payload"]["blocks"] if b.get("kind") == "note" and b.get("tone") == "warn"]

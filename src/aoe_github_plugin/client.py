@@ -113,6 +113,28 @@ class GitHubClient:
         except ValueError as exc:
             raise ApiError(200, f"could not decode response: {exc}") from exc
 
+    def post_graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        """POST a GraphQL query to ``/graphql`` and return the parsed envelope
+        (``{"data": ..., "errors": ...}``). Raises a typed ``GitHubError`` on a
+        transport/HTTP failure (4xx/5xx, including the 401 a missing/invalid
+        token yields). Partial GraphQL errors (a 200 carrying both ``data`` and
+        ``errors``) are NOT raised here: the caller decides per field, so one
+        unresolvable sub-resource never blanks the whole PR.
+        """
+        try:
+            resp = self._client.post("/graphql", json={"query": query, "variables": variables})
+        except httpx.RequestError as exc:
+            raise NetworkError(exc) from exc
+        if not resp.is_success:
+            raise classify_status(resp.status_code, resp.headers, resp.text)
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise ApiError(200, f"could not decode response: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ApiError(200, "unexpected GraphQL response shape")
+        return data
+
     def get_json_conditional(
         self,
         path: str,
