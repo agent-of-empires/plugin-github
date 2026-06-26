@@ -1,12 +1,22 @@
-"""ui.state.set payload mapping (pure) and the fail-soft push path."""
+"""Aggregate snapshot -> ui.state.set params mapping (pure)."""
 
-from aoe_github_plugin import main
 from aoe_github_plugin import uistate
 
 
-def _status(pulls=(), error=None, summary="", repo="o/r", branch="feature"):
+def _pull(number=7, draft=False, title="t"):
     return {
-        "summary": summary,
+        "number": number,
+        "url": f"https://github.com/o/r/pull/{number}",
+        "title": title,
+        "state": "open",
+        "draft": draft,
+    }
+
+
+def _repo(name="r", repo="o/r", branch="feature", pulls=(), error=None):
+    return {
+        "path": f"/ws/{name}",
+        "name": name,
         "repo": repo,
         "branch": branch,
         "pulls": list(pulls),
@@ -14,75 +24,85 @@ def _status(pulls=(), error=None, summary="", repo="o/r", branch="feature"):
     }
 
 
-def _pull(number=7, draft=False):
-    return {
-        "number": number,
-        "url": f"https://github.com/o/r/pull/{number}",
-        "title": "t",
-        "state": "open",
-        "draft": draft,
-    }
+def _session(session_id="s1", title="sess", repos=()):
+    return {"session_id": session_id, "title": title, "project_path": "/ws", "repos": list(repos)}
 
 
-def test_params_cover_every_declared_slot():
-    params = uistate.ui_state_params(_status())
-    assert [p["slot"] for p in params] == [s for s, _ in uistate.SLOTS]
-    assert all(set(p) == {"slot", "id", "state"} for p in params)
+def _snapshot(*sessions):
+    return {"sessions": list(sessions)}
 
 
-def test_open_pr_state():
-    state = uistate.ui_state_params(_status(pulls=[_pull(number=12)], summary="o/r: PR #12 open for feature"))[0][
-        "state"
-    ]
-    assert state["tone"] == "open"
-    assert state["text"] == "PR #12"
-    assert state["url"] == "https://github.com/o/r/pull/12"
-    assert state["tooltip"] == "o/r: PR #12 open for feature"
+def _badge(params, sid="s1"):
+    return next(p for p in params if p["slot"] == "row-badge" and p["session_id"] == sid)
 
 
-def test_draft_pr_tone():
-    state = uistate.ui_state_params(_status(pulls=[_pull(draft=True)]))[0]["state"]
-    assert state["tone"] == "draft"
+def _pane(params, sid="s1"):
+    return next(p for p in params if p["slot"] == "detail-panel" and p["session_id"] == sid)
 
 
-def test_no_pr_state_has_no_url():
-    state = uistate.ui_state_params(_status(summary="o/r: no open PR"))[0]["state"]
-    assert state["tone"] == "none"
-    assert state["text"] == "no PR"
-    assert "url" not in state
+def test_each_session_gets_a_badge_and_a_pane_with_session_id():
+    params = uistate.snapshot_ui_state_params(_snapshot(_session("s1"), _session("s2")))
+    badges = {p["session_id"] for p in params if p["slot"] == "row-badge"}
+    panes = {p["session_id"] for p in params if p["slot"] == "detail-panel"}
+    assert badges == {"s1", "s2"}
+    assert panes == {"s1", "s2"}
+    assert all("session_id" in p for p in params)
 
 
-def test_error_state():
-    state = uistate.ui_state_params(_status(error={"kind": "unauthorized", "hint": "x"}, summary="GitHub: ..."))[0][
-        "state"
-    ]
-    assert state["tone"] == "error"
-    assert state["text"] == "GitHub !"
+def test_no_global_status_bar():
+    params = uistate.snapshot_ui_state_params(_snapshot(_session()))
+    assert all(p["slot"] != "status-bar" for p in params)
 
 
-def test_partial_status_still_yields_valid_params():
-    # A malformed status (missing keys) must not raise; the worker stays
-    # fail-soft even if a future status shape drifts.
-    params = uistate.ui_state_params({})
-    assert len(params) == len(uistate.SLOTS)
-    assert params[0]["state"]["tooltip"] == ""
+def test_badge_item_per_pr_with_icon_tone_href():
+    session = _session(
+        repos=[
+            _repo(name="a", pulls=[_pull(number=1)]),
+            _repo(name="b", pulls=[_pull(number=2, draft=True)]),
+            _repo(name="c"),  # no PR -> no badge
+        ]
+    )
+    items = _badge(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["items"]
+    assert len(items) == 2  # the no-PR repo is omitted from the row
+    assert items[0]["icon"] == "git-pull-request-arrow"
+    assert items[0]["tone"] == "success"
+    assert items[0]["href"] == "https://github.com/o/r/pull/1"
+    assert items[1]["icon"] == "git-pull-request-draft"
+    assert items[1]["tone"] == "warn"
 
 
-def test_push_emits_one_request_per_slot_through_the_sink():
-    sent = []
-    main.push_ui_state(_status(pulls=[_pull()]), send=sent.append)
-    assert len(sent) == len(uistate.SLOTS)
-    methods = {m["method"] for m in sent}
-    assert methods == {"ui.state.set"}
-    ids = [m["id"] for m in sent]
-    assert all(isinstance(i, int) for i in ids)
-    assert len(set(ids)) == len(ids)  # distinct ids per request
-    assert all(m["jsonrpc"] == "2.0" for m in sent)
+def test_error_repo_gets_alert_badge_no_href():
+    session = _session(repos=[_repo(error={"kind": "rate_limited", "hint": "rate limited"})])
+    items = _badge(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["items"]
+    assert items[0]["icon"] == "circle-alert"
+    assert items[0]["tone"] == "danger"
+    assert "href" not in items[0]
 
 
-def test_push_is_failsoft_when_the_sink_raises():
-    def boom(_message):
-        raise BrokenPipeError("host went away")
+def test_badge_items_empty_when_no_prs():
+    items = _badge(uistate.snapshot_ui_state_params(_snapshot(_session(repos=[_repo()]))))["payload"]["items"]
+    assert items == []
 
-    # Must not propagate: a dead host pipe cannot crash the worker.
-    main.push_ui_state(_status(pulls=[_pull()]), send=boom)
+
+def test_pane_has_heading_and_a_row_per_repo():
+    session = _session(repos=[_repo(name="a", pulls=[_pull(number=9, title="Add x")]), _repo(name="b")])
+    blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["blocks"]
+    assert blocks[0] == {"kind": "heading", "text": "GitHub"}
+    rows = [b for b in blocks if b["kind"] == "row"]
+    assert [r["label"] for r in rows] == ["a", "b"]
+    assert rows[0]["value"] == "PR #9 Add x"
+    assert rows[0]["href"] == "https://github.com/o/r/pull/9"
+    assert rows[1]["value"] == "no open PR"
+
+
+def test_pane_payload_carries_title():
+    pane = _pane(uistate.snapshot_ui_state_params(_snapshot(_session())))
+    assert pane["payload"]["title"] == "GitHub"
+
+
+def test_empty_snapshot_yields_no_pushes():
+    assert uistate.snapshot_ui_state_params({}) == []
+
+
+def test_session_without_id_is_skipped():
+    assert uistate.snapshot_ui_state_params(_snapshot(_session(session_id=None))) == []

@@ -77,12 +77,9 @@ def test_open_outside_a_repo_returns_error():
     assert responses[0]["error"]["code"] == -32000
 
 
-def test_startup_pushes_ui_state_to_every_slot():
-    # No input: the worker still proactively pushes the UI slots on startup.
+def test_startup_without_a_host_pushes_nothing():
+    # No input: sessions.list gets no reply (EOF), so there are no sessions and
+    # thus no per-session badges/panes to push. The UI is push-only per session;
+    # there is no global slot.
     _, pushes = _run()
-    slots = {p["params"]["slot"] for p in pushes}
-    assert slots == {"status-bar-segment", "session-row-badge"}
-    for p in pushes:
-        assert p["method"] == "ui.state.set"
-        assert isinstance(p["id"], int)
-        assert "tone" in p["params"]["state"]
+    assert pushes == []

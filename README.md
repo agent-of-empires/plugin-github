@@ -41,15 +41,21 @@ anything is written.
 | Command | `status` -> worker method `github.status`                          |
 | Command | `refresh` -> worker method `github.refresh`                        |
 | Command | `open` (open-in-GitHub) -> worker method `github.open`             |
-| Setting | `show_in_status_bar`                                               |
-| UI      | a `status-bar-segment` (`github_status`) and `session-row-badge` (`github_pr_badge`) slot |
+| UI      | a `row-badge` (`github_pr_badge`) and a `detail-panel` pane (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
+
+At install/update the host runs the manifest's `[[runtime.build]]` steps in the
+plugin directory: create an in-tree `.venv` and `pip install .` into it. The
+worker then launches from the plugin-relative `.venv/bin/aoe-github-worker`, so
+the daemon's PATH never decides whether it starts (#2406). Build steps are
+scoped to macOS/Linux.
 
 ### Methods
 
-`github.status` (and its alias `github.refresh`) is fail-soft: it always returns
-a structured result, never a JSON-RPC error, so a status poll always has
-something to render.
+`github.status` is a live, single-checkout lookup, fail-soft: it always returns
+a structured result, never a JSON-RPC error, so a caller always has something to
+render. `github.refresh` returns `{ "accepted": true }` immediately and triggers
+a full multi-session UI refresh (below).
 
 ```jsonc
 {
@@ -70,12 +76,38 @@ something to render.
 any API failure falls back to the compare URL so it still works offline. It
 raises a typed error only when the checkout has no github.com remote.
 
-The worker does not only answer requests: it proactively pushes this status to
-its UI slots via the `ui.state.set` host RPC, on startup and on every
-`github.status` / `github.refresh`, plus a background poll. Each push is one
-`ui.state.set` request per slot with `params: { slot, id, state }`, where
-`state` is `{ text, tone, tooltip, url? }`. The host replies on stdin; the
-worker ignores the reply (a push is best-effort).
+### Multi-session refresh
+
+Beyond answering requests, the worker proactively drives the UI. On startup, on
+`github.refresh`, and on a background poll it runs one refresh:
+
+1. `sessions.list` (host RPC) -> every session and its workspace `project_path`.
+2. For each workspace, discover the git checkouts: the workspace root plus each
+   immediate child directory that is its own checkout (worktree-safe -- a
+   worktree's `.git` is a file, so discovery asks `git rev-parse --show-toplevel`
+   rather than looking for a `.git` directory).
+3. Resolve each checkout to `(owner, repo, branch)`, deduplicate (a branch shared
+   across workspaces is fetched once), and look up the open PRs concurrently.
+4. Push two `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- one
+   colored, clickable PR icon per repo with a PR) and a `detail-panel`
+   (`{title, blocks: [...]}` -- the in-session GitHub pane listing each repo's
+   PR / review / CI state).
+
+GitHub lookups are conditional (ETag / `If-None-Match`; a `304` does not count
+against the rate limit) and a `403`/`429` trips a short backoff that serves
+cached values, so a many-repo, many-session setup stays well under GitHub's
+60 req/hr unauthenticated ceiling.
+
+Each push is `params: { slot, id, session_id, payload }`. A badge item is
+`{ icon, tone?, href?, tooltip? }` (`icon` is a lucide name, e.g.
+`git-pull-request-arrow`; `tone` colors it; `href` opens the PR). A pane block
+is one of a small, extensible set (`heading`, `row`, `note`, `divider`) -- a
+`row` is `{ label, value?, sublabel?, icon?, tone?, href? }`. The host renders
+the block kinds it knows and ignores the rest, so the pane can grow (review, CI,
+checks) without a lockstep host change. `tone` is one of the host's `Tone` set
+(`neutral`, `info`, `success`, `warn`, `danger`): a non-draft open PR is
+`success`, a draft `warn`, a hard error (auth/rate-limit/network) `danger`.
+The host replies on stdin; the worker ignores the reply (a push is best-effort).
 
 The poll interval comes from the `ui_refresh_secs` setting, which the worker
 reads at startup via the `config.get` host RPC (`agent-of-empires#2399`).

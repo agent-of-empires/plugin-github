@@ -1,7 +1,7 @@
 """The plugin's actual GitHub features, one function per JSON-RPC method.
 
 ``github.status`` is fail-soft: it always returns a structured result (never
-raises), so a status-bar poll always has something to show (issue #1667).
+raises), so a status poll always has something to show (issue #1667).
 ``github.open`` is an explicit user action: it resolves the URL to open and may
 raise a typed ``GitHubError`` carrying an actionable hint when the checkout has
 no github.com remote.
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -43,7 +44,10 @@ def _open_pulls_for_branch(
     branch: str,
 ) -> list[dict[str, Any]]:
     """Open PRs whose head is ``branch``, trimmed to the fields a UI renders."""
-    raw = client.get_json(f"/repos/{owner}/{repo}/pulls?state=open&head={owner}:{branch}&per_page=10")
+    raw = client.get_json(
+        f"/repos/{owner}/{repo}/pulls",
+        params={"state": "open", "head": f"{owner}:{branch}", "per_page": "10"},
+    )
     return [
         {
             "number": pr["number"],
@@ -123,4 +127,5 @@ def github_open(
             pulls = _open_pulls_for_branch(client, owner, repo, branch)
         if pulls:
             return {"url": pulls[0]["url"], "kind": "pull"}
-    return {"url": f"https://github.com/{owner}/{repo}/compare/{branch}?expand=1", "kind": "compare"}
+    quoted = quote(branch, safe="")
+    return {"url": f"https://github.com/{owner}/{repo}/compare/{quoted}?expand=1", "kind": "compare"}

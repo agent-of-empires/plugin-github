@@ -37,7 +37,8 @@ def test_status_returns_structured_pull(monkeypatch):
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
 
     def handler(request):
-        assert "head=o:feature" in str(request.url)
+        # head is passed as a query param now (httpx encodes the colon).
+        assert request.url.params["head"] == "o:feature"
         return httpx.Response(200, json=[_pr()])
 
     result = handlers.github_status(env=_NoTokenEnv(), transport=_transport(handler))

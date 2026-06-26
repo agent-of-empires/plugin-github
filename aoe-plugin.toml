@@ -30,7 +30,7 @@ description = "GitHub integration for Agent of Empires: surface PR and issue sta
 #                   dedicated capability.
 # Both are in aoe_plugin_api::KNOWN_CAPABILITIES. Add later as the surface grows:
 #   session.read  to correlate PRs/issues with active sessions
-capabilities = ["net", "runtime.worker"]
+capabilities = ["net", "runtime.worker", "session.read"]
 
 # Commands the plugin contributes (palette / CLI), namespaced by the host as
 # plugin.agent-of-empires.github.<id>. The command-id -> worker RPC mapping
@@ -54,11 +54,6 @@ description = "Open this checkout's PR (or the create-PR page) in a browser."
 # stored under [plugins."agent-of-empires.github".settings]. The worker reads
 # them back at runtime via the `config.get` host RPC (#2399).
 [[settings]]
-key = "show_in_status_bar"
-label = "Show GitHub status in the status bar"
-description = "Publish a short GitHub summary to the status bar segment this plugin contributes."
-
-[[settings]]
 key = "ui_refresh_secs"
 label = "GitHub UI refresh interval (seconds)"
 description = "How often the worker re-pushes PR status to its UI slots. 0 disables the background poll (it still pushes on startup and on refresh)."
@@ -69,23 +64,37 @@ max = 86400
 advanced = true
 
 # UI extension points. The host renders each slot; the worker pushes display
-# state through the `ui.state.set` host RPC (wired by #2366). The status-bar
-# segment shows a one-line summary; the session-row badge shows per-session PR
-# state. Slot strings are free-form (UiContribution validates non-empty only);
-# they match the kebab slot names in #2366's D9 design.
+# state through the `ui.state.set` host RPC (wired by #2366). Two per-session
+# surfaces: a `row-badge` that shows one colored PR icon per repo with an open
+# PR (click opens it), and a `detail-panel` GitHub pane in the session detail
+# view listing each repo's PR / review / CI state. Both are driven by one push
+# each per session (a list payload), so a multi-repo workspace needs no
+# per-repo slot ids. Slot must be one of the host's known UiSlot variants.
 [[ui]]
-slot = "status-bar-segment"
-id = "github_status"
-
-[[ui]]
-slot = "session-row-badge"
+slot = "row-badge"
 id = "github_pr_badge"
 
+[[ui]]
+slot = "detail-panel"
+id = "github_pane"
+
 # Tier 1 worker: the executable the host spawns and supervises, speaking
-# ndjson JSON-RPC over stdio. `aoe-github-worker` is the console script defined
-# in pyproject.toml ([project.scripts]); equivalently
-# `python -m aoe_github_plugin.main`. The exact host spawn contract (interpreter
-# resolution, working dir, args) is finalized with the Tier 1 host (#2095).
+# ndjson JSON-RPC over stdio. The host requires the entrypoint to be
+# plugin-relative so the daemon's PATH never decides whether the worker
+# launches (#2406): the build steps create an in-tree venv and install this
+# package into it (defining the `aoe-github-worker` console script from
+# pyproject.toml [project.scripts]), then `command` launches it from `.venv`.
+# Build steps run in the user's interactive shell at install/update, where
+# PATH is reliable, so `python3` resolves there. Scoped to posix: the
+# `.venv/bin` layout (and this plugin's testing) is macOS/Linux.
 [runtime]
 kind = "command"
-command = ["aoe-github-worker"]
+command = [".venv/bin/aoe-github-worker"]
+
+[[runtime.build]]
+command = ["python3", "-m", "venv", ".venv"]
+platforms = ["linux", "macos"]
+
+[[runtime.build]]
+command = [".venv/bin/pip", "install", "."]
+platforms = ["linux", "macos"]
