@@ -95,6 +95,14 @@ def test_pane_has_heading_and_a_row_per_repo():
     assert rows[1]["value"] == "no open PR"
 
 
+def test_pane_ends_with_a_refresh_action():
+    blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(_session())))["payload"]["blocks"]
+    action = blocks[-1]
+    assert action["kind"] == "action"
+    assert action["method"] == "github.refresh"
+    assert action["label"] == "Refresh"
+
+
 def test_pane_payload_carries_title_and_default_location():
     pane = _pane(uistate.snapshot_ui_state_params(_snapshot(_session())))
     assert pane["payload"]["title"] == "GitHub"

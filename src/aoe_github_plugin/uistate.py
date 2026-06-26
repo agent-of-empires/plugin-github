@@ -113,12 +113,25 @@ def _pane_row(repo: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+# A button the host renders in the pane; clicking it forwards github.refresh to
+# this worker (host POST /api/plugins/{id}/action -> stdin notification), which
+# re-fetches and re-pushes. The worker already handles github.refresh.
+_REFRESH_ACTION = {
+    "kind": "action",
+    "label": "Refresh",
+    "icon": "refresh-cw",
+    "method": "github.refresh",
+}
+
+
 def _pane_blocks(repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = [{"kind": "heading", "text": "GitHub"}]
     if not repos:
         blocks.append({"kind": "note", "text": "no repos in this workspace", "tone": "neutral"})
-        return blocks
-    blocks.extend(_pane_row(repo) for repo in repos)
+    else:
+        blocks.extend(_pane_row(repo) for repo in repos)
+    blocks.append({"kind": "divider"})
+    blocks.append(dict(_REFRESH_ACTION))
     return blocks
 
 

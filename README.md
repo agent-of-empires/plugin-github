@@ -92,7 +92,9 @@ Beyond answering requests, the worker proactively drives the UI. On startup, on
    colored, clickable PR icon per repo with a PR) and a `pane`
    (`{title, default_location, icon, blocks: [...]}` -- the in-session GitHub
    tool-window listing each repo's PR / review / CI state; `icon` is a lucide
-   name for its activity-bar button).
+   name for its activity-bar button). The pane ends with an `action` block
+   ("Refresh") whose click POSTs back to the host, which forwards `github.refresh`
+   to this worker.
 
 GitHub lookups are conditional (ETag / `If-None-Match`; a `304` does not count
 against the rate limit) and a `403`/`429` trips a short backoff that serves
