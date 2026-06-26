@@ -99,6 +99,7 @@ def test_pane_payload_carries_title_and_default_location():
     pane = _pane(uistate.snapshot_ui_state_params(_snapshot(_session())))
     assert pane["payload"]["title"] == "GitHub"
     assert pane["payload"]["default_location"] == "right"
+    assert pane["payload"]["icon"] == "git-pull-request"
 
 
 def test_empty_snapshot_yields_no_pushes():

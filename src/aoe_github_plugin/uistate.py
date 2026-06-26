@@ -28,6 +28,9 @@ ROW_BADGE_SLOT = ("row-badge", "github_pr_badge")
 PANE_SLOT = ("pane", "github_pane")
 # Dock the GitHub pane opens in by default; the user can move it after.
 PANE_DEFAULT_LOCATION = "right"
+# Lucide icon for the pane's activity-bar button (host resolves against its
+# allowlist, else a generic plugin icon). Lucide dropped its GitHub brand mark.
+PANE_ICON = "message-square-diff"
 
 # PR state -> (lucide icon name, host Tone). Hard errors get an alert icon.
 _ICON_OPEN = "git-pull-request-arrow"
@@ -147,6 +150,7 @@ def snapshot_ui_state_params(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 "payload": {
                     "title": "GitHub",
                     "default_location": PANE_DEFAULT_LOCATION,
+                    "icon": PANE_ICON,
                     "blocks": _pane_blocks(repos),
                 },
             }
