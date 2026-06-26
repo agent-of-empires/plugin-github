@@ -9,7 +9,7 @@
 # The host parses this strictly (deny_unknown_fields), so every key below must
 # match a field in that schema.
 
-id = "agent-of-empires.github"
+id = "seluj78.agent-of-empires.github"
 name = "GitHub"
 version = "0.1.0"
 # Manifest schema / host API version. Host supports 1..=1.
@@ -58,7 +58,7 @@ key = "ui_refresh_secs"
 label = "GitHub UI refresh interval (seconds)"
 description = "How often the worker re-pushes PR status to its UI slots. 0 disables the background poll (it still pushes on startup and on refresh)."
 type = "integer"
-default = 300
+default = 30
 min = 0
 max = 86400
 advanced = true
