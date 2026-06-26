@@ -45,6 +45,12 @@ anything is written.
 | UI      | a `status-bar` (`github_status`) and `row-badge` (`github_pr_badge`) slot |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
+At install/update the host runs the manifest's `[[runtime.build]]` steps in the
+plugin directory: create an in-tree `.venv` and `pip install .` into it. The
+worker then launches from the plugin-relative `.venv/bin/aoe-github-worker`, so
+the daemon's PATH never decides whether it starts (#2406). Build steps are
+scoped to macOS/Linux.
+
 ### Methods
 
 `github.status` is a live, single-checkout lookup, fail-soft: it always returns

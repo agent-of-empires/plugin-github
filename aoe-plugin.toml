@@ -85,10 +85,22 @@ slot = "row-badge"
 id = "github_pr_badge"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking
-# ndjson JSON-RPC over stdio. `aoe-github-worker` is the console script defined
-# in pyproject.toml ([project.scripts]); equivalently
-# `python -m aoe_github_plugin.main`. The exact host spawn contract (interpreter
-# resolution, working dir, args) is finalized with the Tier 1 host (#2095).
+# ndjson JSON-RPC over stdio. The host requires the entrypoint to be
+# plugin-relative so the daemon's PATH never decides whether the worker
+# launches (#2406): the build steps create an in-tree venv and install this
+# package into it (defining the `aoe-github-worker` console script from
+# pyproject.toml [project.scripts]), then `command` launches it from `.venv`.
+# Build steps run in the user's interactive shell at install/update, where
+# PATH is reliable, so `python3` resolves there. Scoped to posix: the
+# `.venv/bin` layout (and this plugin's testing) is macOS/Linux.
 [runtime]
 kind = "command"
-command = ["aoe-github-worker"]
+command = [".venv/bin/aoe-github-worker"]
+
+[[runtime.build]]
+command = ["python3", "-m", "venv", ".venv"]
+platforms = ["linux", "macos"]
+
+[[runtime.build]]
+command = [".venv/bin/pip", "install", "."]
+platforms = ["linux", "macos"]
