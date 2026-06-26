@@ -54,13 +54,6 @@ description = "Open this checkout's PR (or the create-PR page) in a browser."
 # stored under [plugins."agent-of-empires.github".settings]. The worker reads
 # them back at runtime via the `config.get` host RPC (#2399).
 [[settings]]
-key = "show_in_status_bar"
-label = "Show GitHub status in the status bar"
-description = "Publish a short GitHub summary to the status bar segment this plugin contributes."
-type = "bool"
-default = true
-
-[[settings]]
 key = "ui_refresh_secs"
 label = "GitHub UI refresh interval (seconds)"
 description = "How often the worker re-pushes PR status to its UI slots. 0 disables the background poll (it still pushes on startup and on refresh)."
@@ -71,18 +64,19 @@ max = 86400
 advanced = true
 
 # UI extension points. The host renders each slot; the worker pushes display
-# state through the `ui.state.set` host RPC (wired by #2366). The status-bar
-# segment shows a one-line summary; the row badge shows per-session PR state.
-# Slot must be one of the host's known UiSlot variants (status-bar, row-badge,
-# row-column, sort-key, filter-facet, card, detail-panel, detail-badge,
-# notification).
-[[ui]]
-slot = "status-bar"
-id = "github_status"
-
+# state through the `ui.state.set` host RPC (wired by #2366). Two per-session
+# surfaces: a `row-badge` that shows one colored PR icon per repo with an open
+# PR (click opens it), and a `detail-panel` GitHub pane in the session detail
+# view listing each repo's PR / review / CI state. Both are driven by one push
+# each per session (a list payload), so a multi-repo workspace needs no
+# per-repo slot ids. Slot must be one of the host's known UiSlot variants.
 [[ui]]
 slot = "row-badge"
 id = "github_pr_badge"
+
+[[ui]]
+slot = "detail-panel"
+id = "github_pane"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking
 # ndjson JSON-RPC over stdio. The host requires the entrypoint to be

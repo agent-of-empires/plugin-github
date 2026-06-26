@@ -1,7 +1,7 @@
 """The plugin's actual GitHub features, one function per JSON-RPC method.
 
 ``github.status`` is fail-soft: it always returns a structured result (never
-raises), so a status-bar poll always has something to show (issue #1667).
+raises), so a status poll always has something to show (issue #1667).
 ``github.open`` is an explicit user action: it resolves the URL to open and may
 raise a typed ``GitHubError`` carrying an actionable hint when the checkout has
 no github.com remote.
