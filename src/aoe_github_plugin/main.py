@@ -45,13 +45,19 @@ from aoe_github_plugin.utils.rpc import result_response
 Sink = Callable[[dict[str, Any]], None]
 
 UI_STATE_SET = "ui.state.set"
+UI_STATE_REMOVE = "ui.state.remove"
 SESSIONS_LIST = "sessions.list"
 CONFIG_GET = "config.get"
 REFRESH_SETTING_KEY = "ui_refresh_secs"
-DEFAULT_REFRESH_SECS = 300
+DEFAULT_REFRESH_SECS = 30
 # A wedged host must never freeze the worker: outbound host RPCs time out and
 # the caller falls back (default interval, empty session list).
 HOST_RPC_TIMEOUT = 10.0
+# Fast tick: a cheap local `sessions.list` to notice a created/removed session
+# within a couple seconds, decoupled from the (network) GitHub refresh. A short
+# timeout so a wedged host stalls one tick, not the loop.
+SESSION_POLL_SECS = 2.0
+SESSION_LIST_TIMEOUT = 0.5
 
 # End-of-stdin sentinel placed on the queue by the reader thread.
 _EOF = object()
@@ -115,6 +121,15 @@ class Runtime:
         self.inbox: queue.Queue[Any] = queue.Queue()
         self.stopped = False
         self.refresh_due = False
+        # Session ids we last pushed UI state for, so a vanished session's
+        # row-badge + pane can be removed (ui.state.remove) rather than linger.
+        self.pushed_session_ids: set[str] = set()
+        # Loop state, initialized in run(): the session-id set seen by the fast
+        # tick, the resolved poll interval, and the next-fire monotonic deadlines.
+        self._seen_ids: set[str] = set()
+        self._interval = 0
+        self._next_network: float | None = None
+        self._next_poll: float | None = None
 
     def _read_stdin(self) -> None:
         """Reader thread: drain stdin into the queue, then post ``_EOF``."""
@@ -173,14 +188,34 @@ class Runtime:
         if method == "github.refresh":
             self.refresh_due = True
 
-    def run_refresh(self) -> None:
-        """Enumerate sessions, build the aggregate snapshot, and push UI state.
-        Fail-soft: a host error, a bad workspace, or a closed pipe never raises."""
+    def list_sessions(self, timeout: float = HOST_RPC_TIMEOUT) -> list[dict[str, Any]] | None:
+        """Authoritative session list, or ``None`` if the host did not answer
+        with one. ``None`` (timeout/error/garbage) is distinct from an empty
+        list: a transient failure must never be read as "no sessions", which
+        would prune every session's UI."""
+        result = self.call_host(SESSIONS_LIST, {}, timeout=timeout)
+        if not isinstance(result, dict) or not isinstance(result.get("sessions"), list):
+            return None
+        return result["sessions"]
+
+    def run_refresh(self, sessions: list[dict[str, Any]] | None = None) -> None:
+        """Build the aggregate snapshot from the session list and reconcile UI
+        state: push each current session's row-badge + pane, then remove the
+        slots of any session that has since vanished. Fail-soft: a host error, a
+        bad workspace, or a closed pipe never raises. Skips entirely (no prune)
+        when the session list is unavailable, so a transient failure cannot wipe
+        live UI."""
+        if sessions is None:
+            sessions = self.list_sessions()
+        if sessions is None:
+            return
         with contextlib.suppress(Exception):
-            sessions_result = self.call_host(SESSIONS_LIST, {})
-            sessions = sessions_result.get("sessions") or [] if isinstance(sessions_result, dict) else []
             snapshot = refresh.build_snapshot(sessions)
+            current_ids: set[str] = set()
             for params in uistate.snapshot_ui_state_params(snapshot):
+                sid = params.get("session_id")
+                if isinstance(sid, str):
+                    current_ids.add(sid)
                 self.send(
                     {
                         "jsonrpc": "2.0",
@@ -189,6 +224,17 @@ class Runtime:
                         "params": params,
                     }
                 )
+            for sid in self.pushed_session_ids - current_ids:
+                for slot, slot_id in (uistate.ROW_BADGE_SLOT, uistate.PANE_SLOT):
+                    self.send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": next(_outbound_ids),
+                            "method": UI_STATE_REMOVE,
+                            "params": {"slot": slot, "id": slot_id, "session_id": sid},
+                        }
+                    )
+            self.pushed_session_ids = current_ids
 
     def resolve_interval(self) -> int:
         """Poll period in seconds. Precedence: the host-persisted
@@ -203,28 +249,54 @@ class Runtime:
                 return value
         return _env_interval()
 
+    def _refresh_and_reset(self, sessions: list[dict[str, Any]] | None = None) -> None:
+        """Refresh, re-baseline the seen-id set, and push the network tick out."""
+        self.run_refresh(sessions)
+        self._seen_ids = set(self.pushed_session_ids)
+        if self._next_network is not None:
+            self._next_network = time.monotonic() + self._interval
+
+    def _service_ticks(self) -> None:
+        """Run whichever refresh is due: an inbound github.refresh, a fast local
+        tick that noticed a session change, or the slower network tick."""
+        now = time.monotonic()
+        if self.refresh_due:
+            self.refresh_due = False
+            self._refresh_and_reset()
+        if self._next_poll is not None and now >= self._next_poll:
+            sessions = self.list_sessions(SESSION_LIST_TIMEOUT)
+            if sessions is not None:
+                ids = {s["id"] for s in sessions if isinstance(s, dict) and isinstance(s.get("id"), str)}
+                if ids != self._seen_ids:
+                    self._refresh_and_reset(sessions)
+            self._next_poll = now + SESSION_POLL_SECS
+        if self._next_network is not None and now >= self._next_network:
+            self._refresh_and_reset()
+
     def run(self) -> None:
         threading.Thread(target=self._read_stdin, daemon=True).start()
         # Proactive refresh on startup so slots populate before any user action.
         self.run_refresh()
-        interval = self.resolve_interval()
-        next_refresh = time.monotonic() + interval if interval > 0 else None
+        self._seen_ids = set(self.pushed_session_ids)
+        self._interval = self.resolve_interval()
+        # interval 0 disables all background polling (startup + on github.refresh
+        # still push); otherwise a fast local tick notices session changes and a
+        # slower network tick catches external PR/state changes.
+        now = time.monotonic()
+        self._next_network = now + self._interval if self._interval > 0 else None
+        self._next_poll = now + SESSION_POLL_SECS if self._interval > 0 else None
         while not self.stopped:
-            timeout = None if next_refresh is None else max(0.0, next_refresh - time.monotonic())
+            wakes = [t for t in (self._next_network, self._next_poll) if t is not None]
+            timeout = max(0.0, min(wakes) - time.monotonic()) if wakes else None
             try:
                 item = self.inbox.get(timeout=timeout)
             except queue.Empty:
-                self.run_refresh()
-                next_refresh = time.monotonic() + interval
-                continue
+                item = None
             if item is _EOF:
                 break
-            self.handle_inbound(item)
-            if self.refresh_due:
-                self.refresh_due = False
-                self.run_refresh()
-                if interval > 0:
-                    next_refresh = time.monotonic() + interval
+            if item is not None:
+                self.handle_inbound(item)
+            self._service_ticks()
 
 
 def main() -> None:
