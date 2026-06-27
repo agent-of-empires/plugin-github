@@ -251,9 +251,9 @@ def test_no_token_note_shown_only_when_a_github_repo_exists():
 # --- attention status in session rows (#36): badge + row-column ---
 
 
-def _badge_item(repos, sid="s1"):
+def _badge_items_for(repos, sid="s1"):
     params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(session_id=sid, repos=repos)))
-    return _badge(params, sid)["payload"]["items"][0]
+    return _badge(params, sid)["payload"]["items"]
 
 
 def _column_payload(repos, sid="s1"):
@@ -267,48 +267,57 @@ def test_each_session_gets_a_row_column():
     assert cols == {"s1", "s2"}
 
 
-def test_badge_reflects_changes_requested_as_danger():
-    item = _badge_item([_repo(pulls=[_rich_pull(review="changes-requested")])])
-    assert item["icon"] == "circle-x"
-    assert item["tone"] == "danger"
-
-
-def test_badge_reflects_failing_ci_even_when_approved():
+def test_badge_emits_pr_review_ci_comment_chip_sequence():
     checks = {"state": "failing", "runs": [{"name": "t", "state": "failing"}]}
-    item = _badge_item([_repo(pulls=[_rich_pull(review="approved", checks=checks)])])
-    assert item["icon"] == "circle-x"
-    assert item["tone"] == "danger"
+    comments = {"unresolved": 3, "items": [{"author": "a", "body": "x", "resolved": False}]}
+    items = _badge_items_for([_repo(pulls=[_rich_pull(review="changes-requested", checks=checks, comments=comments)])])
+    # PR affordance, then review (changes-requested), CI (failing), comments.
+    assert [i["icon"] for i in items] == ["git-pull-request-arrow", "circle-x", "circle-x", "message-square"]
+    assert [i["tone"] for i in items] == ["success", "danger", "danger", "warn"]
+    assert all(i["href"] == "https://github.com/o/r/pull/5" for i in items)
 
 
-def test_badge_reflects_unresolved_comments_as_warn():
-    comments = {"unresolved": 2, "items": [{"author": "a", "body": "x", "resolved": False}]}
-    item = _badge_item([_repo(pulls=[_rich_pull(review="approved", comments=comments)])])
-    assert item["icon"] == "message-square"
-    assert item["tone"] == "warn"
+def test_badge_healthy_pr_has_no_comment_chip():
+    checks = {"state": "succeeded", "runs": [{"name": "t", "state": "succeeded"}]}
+    items = _badge_items_for([_repo(pulls=[_rich_pull(review="approved", checks=checks)])])
+    # PR + approved review + passing CI; no comment chip when nothing unresolved.
+    assert [i["icon"] for i in items] == ["git-pull-request-arrow", "badge-check", "circle-check"]
+    assert "message-square" not in [i["icon"] for i in items]
 
 
-def test_badge_healthy_pr_is_success_and_distinct_from_plain_open():
-    healthy = _badge_item([_repo(pulls=[_rich_pull(review="approved")])])
-    assert healthy["tone"] == "success"
-    assert healthy["icon"] == "badge-check"
-    # The no-token / no-rich "open" PR is also success but a different glyph,
-    # so a healthy reviewed PR does not look identical to an unreviewed one.
-    plain = uistate.snapshot_ui_state_params(_snapshot(_session(repos=[_repo(pulls=[_pull()])])))
-    plain_item = _badge(plain)["payload"]["items"][0]
-    assert plain_item["tone"] == "success"
-    assert plain_item["icon"] == "git-pull-request-arrow"
+def test_badge_no_token_pr_is_chip_only():
+    # No rich fields -> the PR chip alone, no review/CI/comment noise.
+    items = _badge_items_for([_repo(pulls=[_pull()])])
+    assert [i["icon"] for i in items] == ["git-pull-request-arrow"]
 
 
-def test_badge_picks_highest_attention_pr_in_a_repo():
-    checks = {"state": "failing", "runs": [{"name": "t", "state": "failing"}]}
-    repo = _repo(pulls=[_rich_pull(review="approved"), _rich_pull(review="approved", checks=checks)])
-    item = _badge_item([repo])
-    assert item["tone"] == "danger"  # the failing PR wins over the healthy one
+def test_badge_draft_is_chip_only_no_rich_chips():
+    checks = {"state": "failing", "runs": []}
+    pull = _rich_pull(review="changes-requested", checks=checks)
+    pull["draft"] = True
+    items = _badge_items_for([_repo(pulls=[pull])])
+    assert [i["icon"] for i in items] == ["git-pull-request-draft"]
+    assert items[0]["tone"] == "warn"
 
 
-def test_badge_tooltip_names_the_attention_state():
-    item = _badge_item([_repo(name="a", pulls=[_rich_pull(review="changes-requested")])])
-    assert "changes requested" in item["tooltip"]
+def test_badge_concatenates_chips_across_repos():
+    checks = {"state": "failing", "runs": []}
+    repos = [
+        _repo(name="a", repo="o/a", pulls=[_rich_pull(review="approved")]),
+        _repo(name="b", repo="o/b", pulls=[_rich_pull(review="approved", checks=checks)]),
+    ]
+    icons = [i["icon"] for i in _badge_items_for(repos)]
+    # a: PR + approved ; b: PR + approved + failing CI.
+    assert icons == ["git-pull-request-arrow", "badge-check", "git-pull-request-arrow", "badge-check", "circle-x"]
+
+
+def test_badge_chip_tooltips_name_repo_and_state():
+    checks = {"state": "failing", "runs": []}
+    items = _badge_items_for([_repo(name="a", pulls=[_rich_pull(review="changes-requested", checks=checks)])])
+    tips = [i["tooltip"] for i in items]
+    assert tips[0].startswith("a: PR #5")
+    assert "changes requested" in tips[1]
+    assert "CI failing" in tips[2]
 
 
 def test_column_summarizes_top_attention_with_text_and_tone():

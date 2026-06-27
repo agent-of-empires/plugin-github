@@ -4,15 +4,15 @@ The host renders the slots; the worker only pushes typed display state. From one
 aggregate snapshot (see ``refresh.build_snapshot``) this produces, per session,
 three pushes:
 
-- a ``row-badge`` whose payload is ``{"items": [...]}`` -- one compact, colored,
-  clickable PR icon per repo that has an open/draft PR (or an error marker). The
-  icon and tone reflect that repo's highest-attention PR state (failing CI /
-  changes requested are danger, unresolved comments warn, healthy success), so
-  the row distinguishes a broken PR from a healthy one at a glance (#36).
-  Merged-only repos are omitted: the badge is an actionable indicator, and a
-  merged PR (often on a branch left around after merge) is noise there. A
-  multi-repo workspace shows several icons on its row; clicking one opens that
-  PR. The pane carries the full detail.
+- a ``row-badge`` whose payload is ``{"items": [...]}`` -- a chip sequence per
+  open PR (a PR affordance, then review-state, CI-rollup, and unresolved-comment
+  chips, each shown only when a token supplies that field), concatenated across a
+  workspace's repos, plus an error marker per failed repo. Each chip is colored by
+  tone (failing CI / changes requested danger, unresolved comments warn, healthy
+  success), so the row distinguishes a broken PR from a healthy one at a glance
+  (#36). A draft shows the PR chip alone; merged-only repos are omitted, since the
+  badge is an actionable indicator. Every chip's href opens that PR; the pane
+  carries the full detail.
 - a ``row-column`` whose payload is ``{"text", "tone", "icon", "tooltip",
   "href"?}`` (or ``{}`` to clear) -- one deterministic words summary of the
   session's most-urgent PR signal, so the list is scannable without hovering the
@@ -157,33 +157,9 @@ def _open_pulls(repo: dict[str, Any]) -> list[dict[str, Any]]:
     return [p for p in (repo.get("pulls") or []) if not _is_merged(p)]
 
 
-def _status(repo: dict[str, Any]) -> tuple[str, str] | None:
-    """``(lucide_icon, tone)`` for a repo's badge, reflecting its highest-attention
-    open PR (issue #36): a failing/changes-requested PR is danger, unresolved is
-    warn, healthy is success, etc. ``None`` when there is nothing worth a badge
-    (no OPEN PR, or a benign non-github checkout). Merged-only repos return
-    ``None`` so they stay out of the actionable row."""
-    if repo.get("error"):
-        return _ICON_ERROR, "danger"
-    top = _top_attention_pull(repo)
-    if top is None:
-        return None
-    _, icon, tone, _label = _ATTENTION_VISUAL[top[1]]
-    return icon, tone
-
-
-def _first_pull(repo: dict[str, Any]) -> dict[str, Any] | None:
-    """The PR a badge clicks through to: prefer a real (non-draft) open PR, then
-    any open PR, then whatever exists (so a merged-only repo still has a target
-    in the pane)."""
-    open_pulls = _open_pulls(repo)
-    if open_pulls:
-        return next((p for p in open_pulls if not p.get("draft")), open_pulls[0])
-    pulls = repo.get("pulls") or []
-    return pulls[0] if pulls else None
-
-
 def _badge_tooltip(repo: dict[str, Any]) -> str:
+    """The row-column tooltip for a repo: its highest-attention open PR with the
+    state in parens, the error hint, or a no-PR note."""
     name = repo.get("name") or repo.get("repo") or "repo"
     if repo.get("error"):
         return f"{name}: {str(repo['error'].get('hint', 'error')).splitlines()[0]}"
@@ -196,21 +172,58 @@ def _badge_tooltip(repo: dict[str, Any]) -> str:
     return f"{head} ({label})"
 
 
+def _chip(icon: str, tone: str, tooltip: str, href: str | None) -> dict[str, Any]:
+    chip: dict[str, Any] = {"icon": icon, "tone": tone, "tooltip": tooltip}
+    if href:
+        chip["href"] = href
+    return chip
+
+
+def _pr_badge_chips(repo_name: str, pull: dict[str, Any]) -> list[dict[str, Any]]:
+    """The chip sequence for one non-merged PR (#36): a PR affordance, then review,
+    CI, and unresolved-comment indicators, each present only when a token supplies
+    that field. A no-token PR is the PR chip alone, so the row stays uncluttered.
+    Every chip's href opens the PR; its tooltip carries the words."""
+    href = pull.get("url")
+    head = f"{repo_name}: PR #{pull.get('number', '?')} {pull.get('title', '')}".rstrip()
+
+    if pull.get("draft"):
+        # a draft is WIP: skip review/CI/comment noise until it opens.
+        return [_chip(_ICON_DRAFT, "warn", f"{head} (draft)", href)]
+    chips = [_chip(_ICON_OPEN, "success", head, href)]
+
+    review_state = pull.get("review_state")
+    review = _REVIEW_VISUAL.get(review_state) if isinstance(review_state, str) else None
+    if review:
+        icon, tone, label = review
+        chips.append(_chip(icon, tone, f"{head} ({label})", href))
+
+    checks = pull.get("checks")
+    cstate = checks.get("state") if isinstance(checks, dict) else None
+    if isinstance(cstate, str):
+        icon, tone, label = _CHECK_VISUAL.get(cstate, _CHECK_VISUAL["unknown"])
+        chips.append(_chip(icon, tone, f"{head} (CI {label})", href))
+
+    comments = pull.get("comments")
+    unresolved = comments.get("unresolved") if isinstance(comments, dict) else 0
+    if unresolved:
+        chips.append(_chip("message-square", "warn", f"{head} ({unresolved} unresolved)", href))
+
+    return chips
+
+
 def _badge_items(repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One compact badge per repo with an OPEN/draft PR or an error; others
-    (including merged-only repos) are omitted."""
+    """Per session: a chip sequence per open PR (PR + review + CI + comments), an
+    error marker per failed repo, concatenated across repos. Merged-only repos and
+    non-github checkouts contribute nothing, keeping the badge actionable."""
     items: list[dict[str, Any]] = []
     for repo in repos:
-        status = _status(repo)
-        if status is None:
+        if repo.get("error"):
+            items.append(_chip(_ICON_ERROR, "danger", _badge_tooltip(repo), None))
             continue
-        icon, tone = status
-        item: dict[str, Any] = {"icon": icon, "tone": tone, "tooltip": _badge_tooltip(repo)}
-        top = _top_attention_pull(repo)
-        pull = top[0] if top else _first_pull(repo)
-        if pull and pull.get("url"):
-            item["href"] = pull["url"]
-        items.append(item)
+        name = repo.get("name") or repo.get("repo") or "repo"
+        for pull in _open_pulls(repo):
+            items.extend(_pr_badge_chips(name, pull))
     return items
 
 

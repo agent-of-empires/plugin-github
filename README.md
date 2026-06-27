@@ -104,12 +104,15 @@ Beyond answering requests, the worker proactively drives the UI. On startup, on
    a workspace of many worktrees of one repo costs a single query (split into a
    few once it exceeds the per-query alias cap). Without a token it is the basic
    REST open-PR lookup only.
-4. Push three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- one
-   colored, clickable PR icon per repo with an OPEN/draft PR; the icon and tone
-   reflect that repo's highest-attention PR state, so failing CI / changes
-   requested read as danger, unresolved comments as warn, and a healthy PR as
-   success, distinguishing a broken PR from a healthy one at a glance; merged-only
-   repos are omitted, since the badge is an actionable indicator), a `row-column`
+4. Push three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
+   chip sequence per open PR: a clickable PR icon, then review-state, CI-rollup,
+   and unresolved-comment chips, each shown only when a token supplies that field,
+   concatenated across the workspace's repos, plus an error marker per failed
+   repo. Each chip is colored by tone, so failing CI / changes requested read as
+   danger, unresolved comments as warn, and a healthy PR as success,
+   distinguishing a broken PR from a healthy one at a glance; a draft shows the PR
+   chip alone and merged-only repos are omitted, since the badge is an actionable
+   indicator), a `row-column`
    (`{text, tone, icon, tooltip, href?}`, or `{}` to clear -- one deterministic
    words summary of the session's most-urgent PR signal so the list is scannable
    without hovering the badge; a multi-repo workspace collapses to its single
