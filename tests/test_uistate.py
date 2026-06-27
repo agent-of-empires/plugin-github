@@ -42,6 +42,10 @@ def _pane(params, sid="s1"):
     return next(p for p in params if p["slot"] == "pane" and p["session_id"] == sid)
 
 
+def _column(params, sid="s1"):
+    return next(p for p in params if p["slot"] == "row-column" and p["session_id"] == sid)
+
+
 def test_each_session_gets_a_badge_and_a_pane_with_session_id():
     params = uistate.snapshot_ui_state_params(_snapshot(_session("s1"), _session("s2")))
     badges = {p["session_id"] for p in params if p["slot"] == "row-badge"}
@@ -242,3 +246,112 @@ def test_no_token_note_shown_only_when_a_github_repo_exists():
     # no github repo -> no nag.
     no_repo = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(repo=None)]), present=False))
     assert not [b for b in _pane(no_repo)["payload"]["blocks"] if b.get("kind") == "note" and b.get("tone") == "warn"]
+
+
+# --- attention status in session rows (#36): badge + row-column ---
+
+
+def _badge_item(repos, sid="s1"):
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(session_id=sid, repos=repos)))
+    return _badge(params, sid)["payload"]["items"][0]
+
+
+def _column_payload(repos, sid="s1"):
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(session_id=sid, repos=repos)))
+    return _column(params, sid)["payload"]
+
+
+def test_each_session_gets_a_row_column():
+    params = uistate.snapshot_ui_state_params(_snapshot(_session("s1"), _session("s2")))
+    cols = {p["session_id"] for p in params if p["slot"] == "row-column"}
+    assert cols == {"s1", "s2"}
+
+
+def test_badge_reflects_changes_requested_as_danger():
+    item = _badge_item([_repo(pulls=[_rich_pull(review="changes-requested")])])
+    assert item["icon"] == "circle-x"
+    assert item["tone"] == "danger"
+
+
+def test_badge_reflects_failing_ci_even_when_approved():
+    checks = {"state": "failing", "runs": [{"name": "t", "state": "failing"}]}
+    item = _badge_item([_repo(pulls=[_rich_pull(review="approved", checks=checks)])])
+    assert item["icon"] == "circle-x"
+    assert item["tone"] == "danger"
+
+
+def test_badge_reflects_unresolved_comments_as_warn():
+    comments = {"unresolved": 2, "items": [{"author": "a", "body": "x", "resolved": False}]}
+    item = _badge_item([_repo(pulls=[_rich_pull(review="approved", comments=comments)])])
+    assert item["icon"] == "message-square"
+    assert item["tone"] == "warn"
+
+
+def test_badge_healthy_pr_is_success_and_distinct_from_plain_open():
+    healthy = _badge_item([_repo(pulls=[_rich_pull(review="approved")])])
+    assert healthy["tone"] == "success"
+    assert healthy["icon"] == "badge-check"
+    # The no-token / no-rich "open" PR is also success but a different glyph,
+    # so a healthy reviewed PR does not look identical to an unreviewed one.
+    plain = uistate.snapshot_ui_state_params(_snapshot(_session(repos=[_repo(pulls=[_pull()])])))
+    plain_item = _badge(plain)["payload"]["items"][0]
+    assert plain_item["tone"] == "success"
+    assert plain_item["icon"] == "git-pull-request-arrow"
+
+
+def test_badge_picks_highest_attention_pr_in_a_repo():
+    checks = {"state": "failing", "runs": [{"name": "t", "state": "failing"}]}
+    repo = _repo(pulls=[_rich_pull(review="approved"), _rich_pull(review="approved", checks=checks)])
+    item = _badge_item([repo])
+    assert item["tone"] == "danger"  # the failing PR wins over the healthy one
+
+
+def test_badge_tooltip_names_the_attention_state():
+    item = _badge_item([_repo(name="a", pulls=[_rich_pull(review="changes-requested")])])
+    assert "changes requested" in item["tooltip"]
+
+
+def test_column_summarizes_top_attention_with_text_and_tone():
+    payload = _column_payload([_repo(pulls=[_rich_pull(review="changes-requested")])])
+    assert payload["text"] == "changes requested"
+    assert payload["tone"] == "danger"
+    assert payload["icon"] == "circle-x"
+    assert payload["href"] == "https://github.com/o/r/pull/5"
+
+
+def test_column_picks_most_urgent_repo_across_workspace():
+    comments = {"unresolved": 1, "items": [{"author": "a", "body": "x", "resolved": False}]}
+    repos = [
+        _repo(name="a", repo="o/a", pulls=[_rich_pull(review="approved", comments=comments)]),  # unresolved
+        _repo(name="b", repo="o/b", pulls=[_rich_pull(review="changes-requested")]),  # outranks
+    ]
+    assert _column_payload(repos)["text"] == "changes requested"
+
+
+def test_column_shows_healthy_state_not_empty():
+    payload = _column_payload([_repo(pulls=[_rich_pull(review="approved")])])
+    assert payload["text"] == "approved"
+    assert payload["tone"] == "success"
+
+
+def test_column_is_empty_when_no_prs_to_clear_stale_state():
+    assert _column_payload([_repo()]) == {}
+
+
+def test_column_is_empty_for_merged_only_repo():
+    assert _column_payload([_repo(pulls=[_rich_pull(state="MERGED", merged=True)])]) == {}
+
+
+def test_column_surfaces_repo_error():
+    payload = _column_payload([_repo(error={"kind": "rate_limited", "hint": "rate limited"})])
+    assert payload["text"] == "error"
+    assert payload["tone"] == "danger"
+    assert payload["icon"] == "circle-alert"
+
+
+def test_row_degrades_without_token():
+    # No rich fields (no-token shape): badge + column fall back to plain open,
+    # never inventing a reviewed/healthy state they cannot see.
+    params = uistate.snapshot_ui_state_params(_snapshot(_session(repos=[_repo(pulls=[_pull()])])))
+    assert _badge(params)["payload"]["items"][0]["icon"] == "git-pull-request-arrow"
+    assert _column(params)["payload"]["text"] == "open PR"

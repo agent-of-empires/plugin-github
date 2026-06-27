@@ -2,14 +2,22 @@
 
 The host renders the slots; the worker only pushes typed display state. From one
 aggregate snapshot (see ``refresh.build_snapshot``) this produces, per session,
-two pushes:
+three pushes:
 
 - a ``row-badge`` whose payload is ``{"items": [...]}`` -- one compact, colored,
-  clickable PR icon per repo that has an open/draft PR (or an error marker).
+  clickable PR icon per repo that has an open/draft PR (or an error marker). The
+  icon and tone reflect that repo's highest-attention PR state (failing CI /
+  changes requested are danger, unresolved comments warn, healthy success), so
+  the row distinguishes a broken PR from a healthy one at a glance (#36).
   Merged-only repos are omitted: the badge is an actionable indicator, and a
   merged PR (often on a branch left around after merge) is noise there. A
   multi-repo workspace shows several icons on its row; clicking one opens that
   PR. The pane carries the full detail.
+- a ``row-column`` whose payload is ``{"text", "tone", "icon", "tooltip",
+  "href"?}`` (or ``{}`` to clear) -- one deterministic words summary of the
+  session's most-urgent PR signal, so the list is scannable without hovering the
+  badge or opening the pane. Multi-repo workspaces collapse to their single
+  highest-attention candidate; the pane keeps the per-repo breakdown.
 - a ``pane`` (the in-session GitHub tool-window, opened in the right dock by
   default via ``default_location``) whose payload is a flexible
   ``{"title", "blocks": [...]}`` block list. Per PR the pane shows a headline
@@ -38,6 +46,10 @@ from typing import Any
 from aoe_github_plugin.graphql import MERGED_COLOR
 
 ROW_BADGE_SLOT = ("row-badge", "github_pr_badge")
+# A single per-session text cell summarizing the highest-attention PR state, so
+# the session list is scannable without opening the pane. The badge (per repo)
+# carries the icon; this carries the words.
+ROW_COLUMN_SLOT = ("row-column", "github_pr_status")
 PANE_SLOT = ("pane", "github_pane")
 # Dock the GitHub pane opens in by default; the user can move it after.
 PANE_DEFAULT_LOCATION = "right"
@@ -69,6 +81,63 @@ _CHECK_VISUAL: dict[str, tuple[str, str, str]] = {
     "unknown": ("circle-help", "neutral", "unknown"),
 }
 
+# PR attention kind -> (rank, lucide icon, host Tone, compact label). Lower rank
+# = more attention, so it wins the badge icon and the row-column summary. The
+# order follows issue #36: changes-requested outranks everything, failing checks
+# outrank running/queued, unresolved comments surface even without a formal
+# review. Glyphs/tones reuse the pane vocabulary above so the row and pane agree.
+# "open" is a healthy non-rich PR (no token, or nothing notable); "draft" is WIP.
+_ATTENTION_VISUAL: dict[str, tuple[int, str, str, str]] = {
+    "error": (0, _ICON_ERROR, "danger", "error"),
+    "changes-requested": (1, *_REVIEW_VISUAL["changes-requested"][:2], "changes requested"),
+    "checks-failing": (2, *_CHECK_VISUAL["failing"][:2], "CI failing"),
+    "unresolved": (3, "message-square", "warn", "unresolved comments"),
+    "checks-running": (4, *_CHECK_VISUAL["running"][:2], "CI running"),
+    "checks-queued": (5, *_CHECK_VISUAL["queued"][:2], "CI queued"),
+    "awaiting-review": (6, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
+    "commented": (7, *_REVIEW_VISUAL["commented"][:2], "commented"),
+    "approved": (8, *_REVIEW_VISUAL["approved"][:2], "approved"),
+    "open": (9, _ICON_OPEN, "success", "open PR"),
+    "draft": (10, _ICON_DRAFT, "warn", "draft"),
+}
+
+
+def _pull_attention(pull: dict[str, Any]) -> str:
+    """The attention kind for one non-merged PR, in issue #36 priority order. The
+    rich (review_state/checks/comments) keys are absent in the no-token shape, so
+    a token-less PR falls through to ``open``/``draft`` and the row degrades to
+    the basic view rather than mislabeling state it cannot see."""
+    if pull.get("draft"):
+        return "draft"
+    review = pull.get("review_state")
+    checks = pull.get("checks")
+    cstate = checks.get("state") if isinstance(checks, dict) else None
+    comments = pull.get("comments")
+    unresolved = comments.get("unresolved") if isinstance(comments, dict) else 0
+    # Priority ladder (issue #36); first match wins. A no-token PR matches none
+    # of these (rich keys absent) and falls through to the healthy "open".
+    rules: tuple[tuple[bool, str], ...] = (
+        (review == "changes-requested", "changes-requested"),
+        (cstate == "failing", "checks-failing"),
+        (bool(unresolved), "unresolved"),
+        (cstate == "running", "checks-running"),
+        (cstate == "queued", "checks-queued"),
+        (review == "waiting", "awaiting-review"),
+        (review == "commented", "commented"),
+        (review == "approved", "approved"),
+    )
+    return next((kind for cond, kind in rules if cond), "open")
+
+
+def _top_attention_pull(repo: dict[str, Any]) -> tuple[dict[str, Any], str] | None:
+    """The ``(pull, kind)`` of the highest-attention open PR in a repo, or ``None``
+    when it has no open (non-merged) PR. Drives the badge icon/tone and href."""
+    candidates = [(p, _pull_attention(p)) for p in _open_pulls(repo)]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda c: _ATTENTION_VISUAL[c[1]][0])
+
+
 # Per-PR caps so one pathological PR cannot blow past the host's 64KB/entry limit.
 _MAX_CHECK_ROWS = 20
 # Generous cap: send every unresolved comment in practice, but keep a backstop
@@ -89,17 +158,18 @@ def _open_pulls(repo: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _status(repo: dict[str, Any]) -> tuple[str, str] | None:
-    """``(lucide_icon, tone)`` for a repo's headline state, or ``None`` when it
-    has nothing worth a row badge (no OPEN PR, or a benign non-github checkout).
-    Merged-only repos return ``None`` so they stay out of the actionable row."""
+    """``(lucide_icon, tone)`` for a repo's badge, reflecting its highest-attention
+    open PR (issue #36): a failing/changes-requested PR is danger, unresolved is
+    warn, healthy is success, etc. ``None`` when there is nothing worth a badge
+    (no OPEN PR, or a benign non-github checkout). Merged-only repos return
+    ``None`` so they stay out of the actionable row."""
     if repo.get("error"):
         return _ICON_ERROR, "danger"
-    open_pulls = _open_pulls(repo)
-    if any(not p.get("draft") for p in open_pulls):
-        return _ICON_OPEN, "success"
-    if open_pulls:
-        return _ICON_DRAFT, "warn"
-    return None
+    top = _top_attention_pull(repo)
+    if top is None:
+        return None
+    _, icon, tone, _label = _ATTENTION_VISUAL[top[1]]
+    return icon, tone
 
 
 def _first_pull(repo: dict[str, Any]) -> dict[str, Any] | None:
@@ -117,11 +187,13 @@ def _badge_tooltip(repo: dict[str, Any]) -> str:
     name = repo.get("name") or repo.get("repo") or "repo"
     if repo.get("error"):
         return f"{name}: {str(repo['error'].get('hint', 'error')).splitlines()[0]}"
-    pull = _first_pull(repo)
-    if pull is None:
+    top = _top_attention_pull(repo)
+    if top is None:
         return f"{name}: no open PR"
-    kind = "draft PR" if pull.get("draft") else "PR"
-    return f"{name}: {kind} #{pull.get('number', '?')} {pull.get('title', '')}".rstrip()
+    pull, kind = top
+    label = _ATTENTION_VISUAL[kind][3]
+    head = f"{name}: PR #{pull.get('number', '?')} {pull.get('title', '')}".rstrip()
+    return f"{head} ({label})"
 
 
 def _badge_items(repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -134,11 +206,41 @@ def _badge_items(repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         icon, tone = status
         item: dict[str, Any] = {"icon": icon, "tone": tone, "tooltip": _badge_tooltip(repo)}
-        pull = _first_pull(repo)
+        top = _top_attention_pull(repo)
+        pull = top[0] if top else _first_pull(repo)
         if pull and pull.get("url"):
             item["href"] = pull["url"]
         items.append(item)
     return items
+
+
+def _status_column(repos: list[dict[str, Any]]) -> dict[str, Any]:
+    """A single per-session summary cell: the highest-attention PR (or repo error)
+    across the workspace, as ``{text, tone, icon, tooltip, href?}``. Returns ``{}``
+    when there is nothing worth showing (no open PR, no error), which clears any
+    stale row state on the next push.
+
+    ponytail: one winning candidate, not per-repo detail. A multi-repo workspace
+    collapses to its single most-urgent signal here; the pane keeps the full
+    breakdown. Add per-repo cells only if multi-repo rows prove confusing.
+    """
+    best: tuple[int, dict[str, Any]] | None = None
+    for repo in repos:
+        if repo.get("error"):
+            rank, icon, tone, label = _ATTENTION_VISUAL["error"]
+            cell: dict[str, Any] = {"text": label, "tone": tone, "icon": icon, "tooltip": _badge_tooltip(repo)}
+        else:
+            top = _top_attention_pull(repo)
+            if top is None:
+                continue
+            pull, kind = top
+            rank, icon, tone, label = _ATTENTION_VISUAL[kind]
+            cell = {"text": label, "tone": tone, "icon": icon, "tooltip": _badge_tooltip(repo)}
+            if pull.get("url"):
+                cell["href"] = pull["url"]
+        if best is None or rank < best[0]:
+            best = (rank, cell)
+    return best[1] if best else {}
 
 
 def _pull_visual(pull: dict[str, Any]) -> tuple[str, str | None, str | None]:
@@ -368,6 +470,14 @@ def snapshot_ui_state_params(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 "id": ROW_BADGE_SLOT[1],
                 "session_id": sid,
                 "payload": {"items": _badge_items(repos)},
+            }
+        )
+        params.append(
+            {
+                "slot": ROW_COLUMN_SLOT[0],
+                "id": ROW_COLUMN_SLOT[1],
+                "session_id": sid,
+                "payload": _status_column(repos),
             }
         )
         params.append(
