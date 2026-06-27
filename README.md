@@ -215,8 +215,16 @@ token, since they come from the authenticated GraphQL query.
 ## Releases
 
 Tagging `vX.Y.Z` runs the checks and publishes a GitHub Release with a source
-archive and its content hash (`.github/workflows/release.yml`). AoE maintainers
-pin that hash in the featured index (#2364) to mark the release trusted.
+archive and its content hash (`.github/workflows/release.yml`). On a successful
+publish the `featured-pr` job then opens a PR on `agent-of-empires/agent-of-empires`
+that pins the release's source tree hash in `plugins/featured.toml`, marking it
+trusted. It no-ops if the version is already pinned.
+
+That job needs an `AOE_FEATURED_PR_TOKEN` secret (a fine-scoped PAT or App token
+with contents and pull-request write on `agent-of-empires/agent-of-empires`); it
+is skipped with a warning if the secret is unset. It runs behind the
+required-reviewer `release` environment, so it waits for maintainer approval
+before the cross-repo PR opens.
 
 ## Discovery
 
