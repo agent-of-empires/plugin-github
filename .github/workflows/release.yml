@@ -131,6 +131,9 @@ jobs:
       - name: Compute released tree hash
         id: hash
         if: steps.gate.outputs.skip == 'false'
+        env:
+          # The aoe binary lives in the AoE release; the token reads it.
+          GH_TOKEN: ${{ secrets.AOE_FEATURED_PR_TOKEN }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
@@ -138,11 +141,22 @@ jobs:
             echo "::error::Unexpected release tag: $tag"
             exit 1
           fi
+
+          # Canonical hash: download the latest agent-of-empires release binary
+          # and run `aoe plugin hash`, so this never has to track the host's
+          # hashing algorithm.
+          asset="aoe-linux-amd64"
+          bindir="$(mktemp -d)"
+          gh release download --repo agent-of-empires/agent-of-empires \
+            --pattern "${asset}.tar.gz" --dir "$bindir"
+          tar -xzf "${bindir}/${asset}.tar.gz" -C "$bindir"
+          chmod +x "${bindir}/${asset}"
+
           # Hash the released commit's tracked tree (git archive strips .git and
           # untracked build output), matching the host's clone-then-strip fetch.
           work="$(mktemp -d)"
           git archive --format=tar HEAD | tar -x -C "$work"
-          tree_hash="$(uv run python scripts/featured_index.py hash "$work")"
+          tree_hash="$("${bindir}/${asset}" plugin hash "$work")"
           if ! echo "$tree_hash" | grep -qE '^sha256:[0-9a-f]{64}$'; then
             echo "::error::Bad tree hash: $tree_hash"
             exit 1
