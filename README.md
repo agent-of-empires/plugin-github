@@ -7,8 +7,10 @@ common git/GitHub operations from #658 without dropping into a terminal.
 > Status: **read operations**. This release ports the GitHub client + token-auth
 > layer from AoE core (PR #1681 / issue #1667) into a Tier 1 plugin worker, with
 > structured `github.status` (open PRs for the branch, each with its URL) and
-> `github.open` (open-in-GitHub). The write operations (create/merge PR, push,
-> pull, fix-CI) land in follow-ups.
+> `github.open` (open-in-GitHub). The per-session pane shows rich PR state
+> (state incl. merged, review state, CI checks, and unresolved comments) when a
+> token is present, degrading to open PRs only without one. The write operations
+> (create/merge PR, push, pull, fix-CI) land in follow-ups.
 
 ## Layout
 
@@ -87,31 +89,43 @@ Beyond answering requests, the worker proactively drives the UI. On startup, on
    worktree's `.git` is a file, so discovery asks `git rev-parse --show-toplevel`
    rather than looking for a `.git` directory).
 3. Resolve each checkout to `(owner, repo, branch)`, deduplicate (a branch shared
-   across workspaces is fetched once), and look up the open PRs concurrently.
+   across workspaces is fetched once), and look up its PRs concurrently. With a
+   token the lookup is a single GitHub GraphQL query per branch that returns the
+   rich state (PR state incl. MERGED, `reviewDecision`, the head commit's check
+   rollup + per-check runs, and review threads with their resolved flag and first
+   comment). Without a token it falls back to the basic REST open-PR lookup.
 4. Push two `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- one
-   colored, clickable PR icon per repo with a PR) and a `pane`
+   colored, clickable PR icon per repo with an OPEN/draft PR; merged-only repos
+   are omitted, since the badge is an actionable indicator) and a `pane`
    (`{title, default_location, icon, blocks: [...]}` -- the in-session GitHub
-   tool-window listing each repo's PR / review / CI state; `icon` is a lucide
-   name for its activity-bar button). The pane ends with an `action` block
-   ("Refresh") whose click POSTs back to the host, which forwards `github.refresh`
-   to this worker.
+   tool-window listing, per PR, a headline row, a review-state row, a Checks
+   section, and an unresolved-comments section; `icon` is a lucide name for its
+   activity-bar button). The pane ends with an `action` block ("Refresh") whose
+   click POSTs back to the host, which forwards `github.refresh` to this worker.
 
-GitHub lookups are conditional (ETag / `If-None-Match`; a `304` does not count
-against the rate limit) and a `403`/`429` trips a short backoff that serves
-cached values, so a many-repo, many-session setup stays well under GitHub's
-60 req/hr unauthenticated ceiling.
+Rate limits: the REST fallback uses conditional requests (ETag / `If-None-Match`;
+a `304` does not count) to stay under the 60 req/hr unauthenticated ceiling. The
+GraphQL path has no ETag, so it reads `rateLimit { remaining }` from each
+response and trips a short backoff (serving the last-good cached result) when the
+point budget (5000/hr) runs low or a `403`/`429`/`RATE_LIMITED` is returned; the
+worker's poll cadence (`ui_refresh_secs`) bounds how often it queries.
 
 Each push is `params: { slot, id, session_id, payload }`. A badge item is
 `{ icon, tone?, href?, tooltip? }` (`icon` is a lucide name, e.g.
 `git-pull-request-arrow`; `tone` colors it; `href` opens the PR). A pane block
 is one of a small, extensible set (`heading`, `row`, `note`, `divider`,
-`action`) -- a `row` is `{ label, value?, sublabel?, icon?, tone?, href? }` and
-an `action` is `{ label, method, icon? }` (a button that forwards `method` to
-this worker). The host renders
-the block kinds it knows and ignores the rest, so the pane can grow (review, CI,
-checks) without a lockstep host change. `tone` is one of the host's `Tone` set
+`section`, `action`, `comment`) -- a `row` is
+`{ label, value?, sublabel?, icon?, tone?, color?, href? }`, a `comment` is
+`{ author, body, path?, line?, resolved?, href? }` (read-only), and an `action`
+is `{ label, method, icon? }` (a button that forwards `method` to this worker).
+The host renders the block kinds it knows and ignores the rest, so the pane can
+grow without a lockstep host change. `tone` is one of the host's `Tone` set
 (`neutral`, `info`, `success`, `warn`, `danger`): a non-draft open PR is
-`success`, a draft `warn`, a hard error (auth/rate-limit/network) `danger`.
+`success`, a draft `warn`, a hard error (auth/rate-limit/network) `danger`. A
+merged PR has no semantic tone, so its headline row carries a validated hex
+`color` (`#8957e5`, GitHub purple) instead; `color` accepts only `#rgb`/`#rrggbb`
+literals so it can never carry arbitrary CSS. When no token is present the pane
+prepends a warn `note` telling the user a token unlocks review/CI/comments/merged.
 The host replies on stdin; the worker ignores the reply (a push is best-effort).
 
 The poll interval comes from the `ui_refresh_secs` setting, which the worker
@@ -155,7 +169,9 @@ echo '{"jsonrpc":"2.0","id":2,"method":"github.open","params":{"args":{"path":".
 
 Token resolution order: `GITHUB_TOKEN`, then `GH_TOKEN`, then `gh auth token`
 (only when `gh` is installed and authenticated). `gh` is an optional source,
-never required; requests fall back to unauthenticated when no token resolves.
+never required; without a token the worker still shows open PRs (the basic REST
+view), but review state, CI checks, unresolved comments, and merged PRs need a
+token, since they come from the authenticated GraphQL query.
 
 ## Releases
 

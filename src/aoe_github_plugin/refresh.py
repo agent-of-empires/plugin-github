@@ -25,12 +25,16 @@ import threading
 import subprocess
 from typing import Any
 from pathlib import Path
+from datetime import datetime
+from datetime import timezone
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
+from aoe_github_plugin import graphql
 from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.client import GitHubClient
+from aoe_github_plugin.errors import ApiError
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.handlers import _resolve_optional_token
@@ -38,10 +42,20 @@ from aoe_github_plugin.utils.gitctx import parse_owner_repo
 
 GIT_TIMEOUT = 2.0
 MAX_WORKERS = 10
-# ponytail: fixed 60s backoff after a rate-limit response, not the precise
-# X-RateLimit-Reset (which classify_status discards). Short enough to recover
-# quickly, long enough to stop hammering. Parse the reset header if it matters.
+# Back off proactively once the GraphQL point budget (5000/hr) is nearly spent,
+# so a busy workspace degrades to stale data rather than hard rate-limit errors.
+RATELIMIT_FLOOR = 50
+# GraphQL has no ETag/304, so a per-key TTL is its only conditional mechanism: a
+# key re-queried within this window serves its cached result instead of spending
+# points. Floors the cost even if the poll cadence is set aggressively low.
+GRAPHQL_TTL = 60.0
+# Fixed fallback backoff when no precise reset is known (REST 403/429, which
+# classify_status discards the reset for). The GraphQL path prefers the
+# response's rateLimit.resetAt; see _set_backoff.
 BACKOFF_SECS = 60.0
+# Cap a reset-derived backoff so a far-future or skewed resetAt cannot wedge the
+# worker for an unreasonable stretch.
+MAX_BACKOFF_SECS = 3600.0
 
 RepoKey = tuple[str, str, str]  # (owner, repo, branch)
 
@@ -49,6 +63,9 @@ RepoKey = tuple[str, str, str]  # (owner, repo, branch)
 # fan-out threads read/write both, so guard with a lock.
 _cache_lock = threading.Lock()
 _etag_cache: dict[RepoKey, dict[str, Any]] = {}  # key -> {"etag", "pulls"}
+# Last-good rich (GraphQL) result per key: {"pulls", "fetched_at"}. Serves the
+# TTL window and is the stale fallback while rate-limited.
+_graphql_cache: dict[RepoKey, dict[str, Any]] = {}
 # Mutable holder (not a bare module float) so updating it needs no `global`.
 _backoff = {"until": 0.0}  # time.monotonic() seconds; HTTP is skipped until then
 
@@ -135,9 +152,29 @@ def _trim(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _set_backoff() -> None:
+def _reset_to_monotonic(reset_at: Any) -> float | None:
+    """An ISO-8601 ``rateLimit.resetAt`` -> a ``time.monotonic`` deadline, or
+    ``None`` when it is absent/unparseable/in the past. Capped so a skewed or
+    far-future reset cannot wedge the worker."""
+    if not isinstance(reset_at, str):
+        return None
+    try:
+        ts = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    delta = (ts - datetime.now(timezone.utc)).total_seconds()
+    if delta <= 0:
+        return None
+    return time.monotonic() + min(delta, MAX_BACKOFF_SECS)
+
+
+def _set_backoff(reset_at: Any = None) -> None:
+    """Arm the shared backoff gate. Prefers the GraphQL response's ``resetAt``
+    (so we wait exactly until the budget refills); falls back to a fixed window
+    for the REST path, which has no usable reset."""
+    until = _reset_to_monotonic(reset_at)
     with _cache_lock:
-        _backoff["until"] = time.monotonic() + BACKOFF_SECS
+        _backoff["until"] = until if until is not None else time.monotonic() + BACKOFF_SECS
 
 
 def _fetch_key(client: GitHubClient, key: RepoKey) -> list[dict[str, Any]]:
@@ -169,42 +206,130 @@ def _fetch_key(client: GitHubClient, key: RepoKey) -> list[dict[str, Any]]:
     return pulls
 
 
+def _graphql_rate_limited(data: dict[str, Any]) -> bool:
+    """GitHub signals a GraphQL secondary rate limit as a 200 carrying an error
+    of type ``RATE_LIMITED`` (not an HTTP 4xx), so detect it in the envelope."""
+    errors = data.get("errors")
+    return isinstance(errors, list) and any(isinstance(e, dict) and e.get("type") == "RATE_LIMITED" for e in errors)
+
+
+def _graphql_no_repository(
+    data: dict[str, Any],
+    rate_info: dict[str, Any],
+    cached: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Resolve a response that carried no ``repository``: serve stale if we have
+    it, else back off (rate limit) or surface the error. A genuinely null repo
+    (private/not found) is an empty result, not an error."""
+    if _graphql_rate_limited(data):
+        _set_backoff(rate_info.get("resetAt"))
+        if cached is not None:
+            return cached["pulls"]
+        raise RateLimitedError
+    errors = data.get("errors")
+    if errors:
+        if cached is not None:
+            return cached["pulls"]
+        message = next((e.get("message") for e in errors if isinstance(e, dict) and e.get("message")), "GraphQL error")
+        raise ApiError(200, str(message))
+    return []
+
+
+def _fetch_key_graphql(client: GitHubClient, key: RepoKey, *, force: bool = False) -> list[dict[str, Any]]:
+    """Rich PR data for one ``(owner, repo, branch)`` via GraphQL. Serves the
+    per-key TTL cache, honors the backoff gate, and prefers any usable response
+    data (a GraphQL partial success is kept, not discarded). Raises
+    ``GitHubError`` only when there is nothing to fall back on. ``force`` skips
+    the TTL freshness check (a user-initiated refresh wants live CI/review data,
+    not a cache hit) while still respecting the backoff gate and stale fallback,
+    so it never hammers a rate-limited API."""
+    owner, repo, branch = key
+    now = time.monotonic()
+    with _cache_lock:
+        cached = _graphql_cache.get(key)
+        blocked = now < _backoff["until"]
+    if not force and cached is not None and (now - cached["fetched_at"]) < GRAPHQL_TTL:
+        return cached["pulls"]
+    if blocked:
+        if cached is not None:
+            return cached["pulls"]
+        raise RateLimitedError
+    variables = {"owner": owner, "repo": repo, "branch": branch}
+    try:
+        data = client.post_graphql(graphql.QUERY, variables)
+    except RateLimitedError:
+        _set_backoff()
+        if cached is not None:
+            return cached["pulls"]
+        raise
+
+    payload = data.get("data") or {}
+    rate_info = payload.get("rateLimit") or {}
+    if payload.get("repository") is None:
+        return _graphql_no_repository(data, rate_info, cached)
+
+    pulls = graphql.normalize_pulls(payload)
+    # Arm backoff for the next refresh if a rate limit rode along with the data,
+    # or the remaining point budget is running low.
+    remaining = rate_info.get("remaining")
+    if _graphql_rate_limited(data) or (isinstance(remaining, int) and remaining < RATELIMIT_FLOOR):
+        _set_backoff(rate_info.get("resetAt"))
+    with _cache_lock:
+        _graphql_cache[key] = {"pulls": pulls, "fetched_at": time.monotonic()}
+    return pulls
+
+
 def _fetch_all(
     keys: set[RepoKey],
     env: TokenEnvironment | None,
     transport: httpx.BaseTransport | None,
-) -> dict[RepoKey, dict[str, Any]]:
-    """Fetch every unique key concurrently. Returns ``key -> {"pulls": [...]}``
-    or ``key -> {"error": {kind, hint}}``. httpx.Client is safe to share across
-    the pool threads; none of them touch stdin or host RPCs."""
+    *,
+    force: bool = False,
+) -> tuple[dict[RepoKey, dict[str, Any]], bool]:
+    """Fetch every unique key concurrently. Returns ``(results, token_present)``
+    where results is ``key -> {"pulls": [...]}`` or ``key -> {"error": {...}}``.
+    With a token, each key is fetched via the rich GraphQL path; without one we
+    keep the REST open-PR path and report ``token_present=False`` so the UI can
+    show the "token needed" banner. ``force`` bypasses the GraphQL TTL on the
+    token path (a manual refresh); the REST path always revalidates via ETag so
+    it ignores the flag. httpx.Client is safe to share across the pool threads;
+    none of them touch stdin or host RPCs."""
     if not keys:
-        return {}
+        return {}, True
     token = _resolve_optional_token(env)
+    present = token is not None
+    fetch = (lambda c, k: _fetch_key_graphql(c, k, force=force)) if present else _fetch_key
     with GitHubClient(token=token, transport=transport) as client:
 
         def one(key: RepoKey) -> tuple[RepoKey, dict[str, Any]]:
             try:
-                return key, {"pulls": _fetch_key(client, key)}
+                return key, {"pulls": fetch(client, key)}
             except GitHubError as exc:
                 return key, {"error": {"kind": exc.kind, "hint": str(exc)}}
             except Exception as exc:  # noqa: BLE001 - fail-soft per repo, never abort the refresh
                 return key, {"error": {"kind": "internal", "hint": f"refresh failed: {exc}"}}
 
         with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(keys))) as ex:
-            return dict(ex.map(one, keys))
+            return dict(ex.map(one, keys)), present
 
 
 def build_snapshot(
     sessions: list[dict[str, Any]],
     env: TokenEnvironment | None = None,
     transport: httpx.BaseTransport | None = None,
+    *,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Assemble the aggregate snapshot from a host ``sessions.list`` result.
 
-    Returns ``{"sessions": [{session_id, title, project_path, repos: [...]}]}``
-    where each repo is ``{path, name, repo, branch, pulls, error}``. Pure of IO
-    side effects on the host channel; only filesystem + GitHub HTTP. ``env`` and
-    ``transport`` are test seams.
+    Returns ``{"sessions": [{session_id, title, project_path, repos: [...]}],
+    "auth": {"present": bool}}`` where each repo is
+    ``{path, name, repo, branch, pulls, error}``. With a token the pulls carry
+    rich fields (state/merged/review_state/checks/comments); without one they
+    are the basic REST shape and ``auth.present`` is ``False``. ``force`` bypasses
+    the GraphQL TTL so a user-initiated refresh fetches live CI/review data. Pure
+    of IO side effects on the host channel; only filesystem + GitHub HTTP. ``env``
+    and ``transport`` are test seams.
     """
     per_session: list[tuple[dict[str, Any], list[str]]] = []
     for session in sessions:
@@ -226,7 +351,7 @@ def build_snapshot(
             if key is not None:
                 keys.add(key)
 
-    fetched = _fetch_all(keys, env, transport)
+    fetched, auth_present = _fetch_all(keys, env, transport, force=force)
 
     out_sessions: list[dict[str, Any]] = []
     for session, checkouts in per_session:
@@ -254,4 +379,4 @@ def build_snapshot(
                 "repos": repos,
             }
         )
-    return {"sessions": out_sessions}
+    return {"sessions": out_sessions, "auth": {"present": auth_present}}

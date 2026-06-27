@@ -204,19 +204,20 @@ class Runtime:
             return None
         return sessions
 
-    def run_refresh(self, sessions: list[dict[str, Any]] | None = None) -> None:
+    def run_refresh(self, sessions: list[dict[str, Any]] | None = None, *, force: bool = False) -> None:
         """Build the aggregate snapshot from the session list and reconcile UI
         state: push each current session's row-badge + pane, then remove the
         slots of any session that has since vanished. Fail-soft: a host error, a
         bad workspace, or a closed pipe never raises. Skips entirely (no prune)
         when the session list is unavailable, so a transient failure cannot wipe
-        live UI."""
+        live UI. ``force`` bypasses the GraphQL TTL so a user-clicked refresh
+        fetches live CI/review data instead of a cache hit."""
         if sessions is None:
             sessions = self.list_sessions()
         if sessions is None:
             return
         with contextlib.suppress(Exception):
-            snapshot = refresh.build_snapshot(sessions)
+            snapshot = refresh.build_snapshot(sessions, force=force)
             current_ids: set[str] = set()
             for params in uistate.snapshot_ui_state_params(snapshot):
                 sid = params.get("session_id")
@@ -255,9 +256,9 @@ class Runtime:
                 return value
         return _env_interval()
 
-    def _refresh_and_reset(self, sessions: list[dict[str, Any]] | None = None) -> None:
+    def _refresh_and_reset(self, sessions: list[dict[str, Any]] | None = None, *, force: bool = False) -> None:
         """Refresh, re-baseline the seen-id set, and push the network tick out."""
-        self.run_refresh(sessions)
+        self.run_refresh(sessions, force=force)
         self._seen_ids = set(self.pushed_session_ids)
         if self._next_network is not None:
             self._next_network = time.monotonic() + self._interval
@@ -268,7 +269,7 @@ class Runtime:
         now = time.monotonic()
         if self.refresh_due:
             self.refresh_due = False
-            self._refresh_and_reset()
+            self._refresh_and_reset(force=True)
         if self._next_poll is not None and now >= self._next_poll:
             sessions = self.list_sessions(SESSION_LIST_TIMEOUT)
             if sessions is not None:

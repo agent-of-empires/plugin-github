@@ -21,7 +21,7 @@ def _runtime():
 
 
 def _fake_params(monkeypatch, session_ids):
-    monkeypatch.setattr(refresh, "build_snapshot", lambda sessions: {"sessions": sessions})
+    monkeypatch.setattr(refresh, "build_snapshot", lambda sessions, **_kwargs: {"sessions": sessions})
     monkeypatch.setattr(
         uistate,
         "snapshot_ui_state_params",

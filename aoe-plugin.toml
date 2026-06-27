@@ -9,7 +9,7 @@
 # The host parses this strictly (deny_unknown_fields), so every key below must
 # match a field in that schema.
 
-id = "seluj78.agent-of-empires.github"
+id = "agent-of-empires.github"
 name = "GitHub"
 version = "0.1.0"
 # Manifest schema / host API version. Host supports 1..=1.
