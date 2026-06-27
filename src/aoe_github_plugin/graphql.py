@@ -41,8 +41,8 @@ fragment PRConnection on PullRequestConnection {
     id number title url state isDraft merged reviewDecision
     commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 50) { nodes {
       __typename
-      ... on CheckRun { name status conclusion detailsUrl }
-      ... on StatusContext { context state targetUrl }
+      ... on CheckRun { name status conclusion detailsUrl startedAt completedAt }
+      ... on StatusContext { context state targetUrl createdAt }
     } } } } } }
     reviews(last: 1, states: [COMMENTED]) { nodes { state } }
     reviewThreads(first: 100) {
@@ -193,16 +193,35 @@ def check_summary(pr: dict[str, Any]) -> dict[str, Any] | None:
     rollup = commits[0].get("commit", {}).get("statusCheckRollup") if commits else None
     if not isinstance(rollup, dict):
         return None
-    runs: list[dict[str, Any]] = []
+    # GitHub returns one node per check run, so reusable/multi-caller workflows
+    # yield several runs sharing a display name (#37). Collapse same-named runs
+    # to a single row, keeping the latest by timestamp. ISO 8601 timestamps sort
+    # lexicographically, so plain string ``>`` is correct; missing timestamps are
+    # the empty string. On a tie (equal or both missing) keep the worse state, so
+    # a flake cannot hide a real failure.
+    latest: dict[str, dict[str, Any]] = {}
+    ts: dict[str, str] = {}
     for ctx in _nodes(rollup, "contexts"):
+        run: dict[str, Any]
         if ctx.get("__typename") == "CheckRun":
-            runs.append(
-                {"name": ctx.get("name") or "check", "state": _context_state(ctx), "url": ctx.get("detailsUrl")}
-            )
+            name = ctx.get("name") or "check"
+            when = ctx.get("completedAt") or ctx.get("startedAt") or ""
+            run = {"name": name, "state": _context_state(ctx), "url": ctx.get("detailsUrl")}
         else:
-            runs.append(
-                {"name": ctx.get("context") or "check", "state": _context_state(ctx), "url": ctx.get("targetUrl")}
-            )
+            name = ctx.get("context") or "check"
+            when = ctx.get("createdAt") or ""
+            run = {"name": name, "state": _context_state(ctx), "url": ctx.get("targetUrl")}
+        if name not in latest:
+            latest[name] = run
+            ts[name] = when
+            continue
+        prev_when = ts[name]
+        if when > prev_when:
+            latest[name] = run
+            ts[name] = when
+        elif when == prev_when and _STATE_RANK.get(run["state"], 5) < _STATE_RANK.get(latest[name]["state"], 5):
+            latest[name] = run
+    runs = list(latest.values())
     # Stable sort by state rank keeps GitHub's order within each group while
     # surfacing failures at the top.
     runs.sort(key=lambda r: _STATE_RANK.get(r["state"], 5))

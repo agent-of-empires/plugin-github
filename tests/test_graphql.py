@@ -26,12 +26,25 @@ def _rollup(state, contexts):
     return {"state": state, "contexts": {"nodes": list(contexts)}}
 
 
-def _checkrun(name, status, conclusion=None, url="cu"):
-    return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion, "detailsUrl": url}
+def _checkrun(name, status, conclusion=None, url="cu", completed_at=None):
+    return {
+        "__typename": "CheckRun",
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "detailsUrl": url,
+        "completedAt": completed_at,
+    }
 
 
-def _statusctx(context, state, url="su"):
-    return {"__typename": "StatusContext", "context": context, "state": state, "targetUrl": url}
+def _statusctx(context, state, url="su", created_at=None):
+    return {
+        "__typename": "StatusContext",
+        "context": context,
+        "state": state,
+        "targetUrl": url,
+        "createdAt": created_at,
+    }
 
 
 def _thread(resolved, author="al", body="hi", path="a.py", line=3):
@@ -82,6 +95,48 @@ def test_check_summary_maps_runs_and_rollup():
 
 def test_check_summary_none_without_rollup():
     assert graphql.check_summary(_pr(rollup=None)) is None
+
+
+def test_check_summary_collapses_same_named_runs():
+    # Reusable workflow invoked thrice: three runs share one display name (#37).
+    rollup = _rollup(
+        "SUCCESS",
+        [
+            _checkrun("Lint PR title", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:00:00Z"),
+            _checkrun("Lint PR title", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:01:00Z"),
+            _checkrun("Lint PR title", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:02:00Z"),
+        ],
+    )
+    summary = graphql.check_summary(_pr(rollup=rollup))
+    names = [r["name"] for r in summary["runs"]]
+    assert names == ["Lint PR title"]
+
+
+def test_check_summary_keeps_latest_same_named_run():
+    # Older failure, newer success: the newest timestamp wins regardless of order.
+    rollup = _rollup(
+        "SUCCESS",
+        [
+            _checkrun("flaky", "COMPLETED", "FAILURE", url="old", completed_at="2024-01-01T00:00:00Z"),
+            _checkrun("flaky", "COMPLETED", "SUCCESS", url="new", completed_at="2024-01-01T00:05:00Z"),
+        ],
+    )
+    summary = graphql.check_summary(_pr(rollup=rollup))
+    assert [(r["name"], r["state"], r["url"]) for r in summary["runs"]] == [("flaky", "succeeded", "new")]
+
+
+def test_check_summary_tie_keeps_worst_state():
+    # Equal (here, missing) timestamps: keep the worse state so a flake cannot
+    # hide a real failure.
+    rollup = _rollup(
+        "FAILURE",
+        [
+            _checkrun("tie", "COMPLETED", "SUCCESS", url="ok"),
+            _checkrun("tie", "COMPLETED", "FAILURE", url="bad"),
+        ],
+    )
+    summary = graphql.check_summary(_pr(rollup=rollup))
+    assert [(r["name"], r["state"], r["url"]) for r in summary["runs"]] == [("tie", "failing", "bad")]
 
 
 def test_comment_summary_keeps_only_unresolved():
