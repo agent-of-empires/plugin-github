@@ -244,7 +244,14 @@ def _comments_section(comments: Any) -> dict[str, Any] | None:
 
 def _pull_detail_blocks(pull: dict[str, Any]) -> list[dict[str, Any]]:
     """Review/CI/comment blocks for one PR. Empty for the basic (no-token) shape,
-    where these fields are absent, so the same code renders either source."""
+    where these fields are absent, so the same code renders either source.
+
+    A merged PR is a terminal state: its headline row already says MERGED, and
+    its review decision / CI rollup / unresolved threads are historical, not
+    actionable, so they are suppressed to avoid presenting a closed PR as live.
+    """
+    if _is_merged(pull):
+        return []
     candidates = (
         _review_row(pull.get("review_state")),
         _checks_section(pull.get("checks")),

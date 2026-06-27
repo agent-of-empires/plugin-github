@@ -154,6 +154,27 @@ def test_merged_pr_uses_purple_color_and_is_omitted_from_badge():
     assert head["value"].startswith("MERGED #5")
 
 
+def test_merged_pr_suppresses_review_checks_and_comments():
+    # A merged PR is terminal: the headline says MERGED, but its historical
+    # review/CI/comment data must NOT render as active badges/sections.
+    checks = {"state": "failing", "runs": [{"name": "test", "state": "failing", "url": "https://ci/1"}]}
+    comments = {
+        "unresolved": 1,
+        "items": [{"author": "al", "body": "fix", "path": "a.py", "line": 2, "url": "https://c/1", "resolved": False}],
+    }
+    pull = _rich_pull(state="MERGED", merged=True, review="changes-requested", checks=checks, comments=comments)
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
+        "blocks"
+    ]
+    # Headline still present and merged.
+    head = next(b for b in blocks if b.get("kind") == "row" and b.get("label") == "r")
+    assert head["value"].startswith("MERGED #5")
+    # No active review row, no Checks section, no Unresolved-comments section.
+    assert not [b for b in blocks if b.get("kind") == "row" and b.get("label") == "Review"]
+    assert not [b for b in blocks if b.get("kind") == "section"]
+    assert not [b for b in blocks if b.get("kind") == "comment"]
+
+
 def test_pane_renders_review_checks_and_comments():
     checks = {"state": "failing", "runs": [{"name": "test", "state": "failing", "url": "https://ci/1"}]}
     comments = {
