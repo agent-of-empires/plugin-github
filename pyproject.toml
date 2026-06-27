@@ -30,6 +30,9 @@ dev = [
     "pre-commit>=4.0.1",
     "pytest>=8.3.4",
     "ruff>=0.11.4",
+    # CI-only: scripts/featured_index.py edits AoE's featured.toml trust root
+    # through a real TOML parser, never string surgery.
+    "tomlkit>=0.13",
 ]
 
 [tool.mypy]
@@ -111,6 +114,9 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 # ARG001: httpx MockTransport handlers must take `request` even when unused.
 # SLF001: tests legitimately drive the worker's internal helpers directly.
 "tests/**" = ["S101", "S106", "ANN", "INP001", "D", "PLR2004", "FBT002", "ARG001", "ARG002", "SLF001"]
+# scripts/: CLI tooling whose stdout is the interface (consumed by CI), so
+# `print` is correct here.
+"scripts/**" = ["T201"]
 
 [tool.ruff.format]
 quote-style = "double"
