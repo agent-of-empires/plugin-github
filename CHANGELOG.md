@@ -1,0 +1,26 @@
+# Changelog
+
+All notable changes to the Agent of Empires GitHub plugin will be documented in this file.
+
+The format follows [Conventional Commits](https://www.conventionalcommits.org/).
+
+## [1.0.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.0.0) - 2026-06-27
+
+
+
+### Bug Fixes
+
+- **manifest:** Conform aoe-plugin.toml to the merged #2093 contribution schema in [#4](https://github.com/agent-of-empires/plugin-github/pull/4) by [@Seluj78](https://github.com/Seluj78) ([`dce1226`](https://github.com/agent-of-empires/plugin-github/commit/dce12262c2086b7e9411bf9809406f3b941638ba))
+- **plugin:** Change capabilities from 'net-fetch' to 'net' to comply with known capabilities by [@Seluj78](https://github.com/Seluj78) ([`e745413`](https://github.com/agent-of-empires/plugin-github/commit/e74541354ba848ff18201c9e749aa8a36b5f07c1))
+- **uistate:** Suppress active review/CI/comments for merged PR in [#15](https://github.com/agent-of-empires/plugin-github/pull/15) by [@Seluj78](https://github.com/Seluj78) ([`bd9d7d6`](https://github.com/agent-of-empires/plugin-github/commit/bd9d7d6656fdfa7b5f62e5ceb72720bba23bb38a))
+
+
+### Features
+
+- Scaffold the Agent of Empires GitHub plugin by [@Seluj78](https://github.com/Seluj78) ([`96ef093`](https://github.com/agent-of-empires/plugin-github/commit/96ef093a835d63be8059d054d8655f2a5c228082))
+- **worker:** GitHub client + auth foundation, packaging, and CI in [#1](https://github.com/agent-of-empires/plugin-github/pull/1) by [@Seluj78](https://github.com/Seluj78) ([`7cce10d`](https://github.com/agent-of-empires/plugin-github/commit/7cce10da9483507f72f12e4ec87d905eac5d7780))
+- **worker:** Structured github.status + github.open (P2 read ops) in [#3](https://github.com/agent-of-empires/plugin-github/pull/3) by [@Seluj78](https://github.com/Seluj78) ([`1f9e228`](https://github.com/agent-of-empires/plugin-github/commit/1f9e22835cba4b420c2d29eaed57479cb075da79))
+- **worker:** Proactively push PR status to host UI slots in [#5](https://github.com/agent-of-empires/plugin-github/pull/5) by [@Seluj78](https://github.com/Seluj78) ([`6efa8c2`](https://github.com/agent-of-empires/plugin-github/commit/6efa8c2ffeb35f9796d2d5f41422aad33a4548a7))
+- Multi-session multi-repo GitHub UI refresh (+ manifest/worker fixes) in [#6](https://github.com/agent-of-empires/plugin-github/pull/6) by [@Seluj78](https://github.com/Seluj78) ([`352a981`](https://github.com/agent-of-empires/plugin-github/commit/352a981eca8473059dbc4f171f2570d70b28b07d))
+- Dockable pane slot, fresh-on-session-change, and a Refresh button in [#7](https://github.com/agent-of-empires/plugin-github/pull/7) by [@Seluj78](https://github.com/Seluj78) ([`795c6d3`](https://github.com/agent-of-empires/plugin-github/commit/795c6d367f5e81be0bf32aa3aff63c639cff8e27))
+- **pane:** Rich per-PR state (merged/review/CI/comments) via token-gated GraphQL in [#13](https://github.com/agent-of-empires/plugin-github/pull/13) by [@Seluj78](https://github.com/Seluj78) ([`4b66d82`](https://github.com/agent-of-empires/plugin-github/commit/4b66d8212709a4dca18185f35e78db490ea5fc04))
