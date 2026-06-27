@@ -240,21 +240,28 @@ def _gql_node(number=7, state="OPEN", merged=False, draft=False, decision="APPRO
     }
 
 
-def _gql_transport(nodes, remaining=5000, errors=None, capture=None):
+def _rich_transport(nodes, *, etag='W/"v1"', remaining=5000, errors=None, gql=None):
+    """Combined transport for the token path: a REST conditional probe (GET) then
+    a GraphQL query (POST). The REST probe answers 304 when the caller already
+    holds ``etag`` (no change), else 200 with a one-PR list (changed). ``gql`` is
+    an optional capture list for the GraphQL requests."""
+
     def handler(request):
-        if capture is not None:
-            capture.append(request)
-        assert request.method == "POST"
-        assert str(request.url).endswith("/graphql")
-        if errors is not None:
-            return httpx.Response(200, json={"errors": errors})
-        body = {
-            "data": {
-                "rateLimit": {"remaining": remaining, "resetAt": "x"},
-                "repository": {"pullRequests": {"nodes": nodes}},
+        if str(request.url).endswith("/graphql"):
+            if gql is not None:
+                gql.append(request)
+            if errors is not None:
+                return httpx.Response(200, json={"errors": errors})
+            body = {
+                "data": {
+                    "rateLimit": {"cost": 1, "remaining": remaining, "resetAt": "x"},
+                    "repository": {"pullRequests": {"nodes": nodes}},
+                }
             }
-        }
-        return httpx.Response(200, json=body)
+            return httpx.Response(200, json=body)
+        if request.headers.get("If-None-Match") == etag:
+            return httpx.Response(304)
+        return httpx.Response(200, headers={"ETag": etag}, json=[_pull()])
 
     return httpx.MockTransport(handler)
 
@@ -264,7 +271,7 @@ def test_graphql_path_parses_rich_fields(tmp_path):
     ws.mkdir()
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
-    snap = refresh.build_snapshot(sessions, env=_Env(), transport=_gql_transport([_gql_node()]))
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node()]))
     assert snap["auth"]["present"] is True
     pull = snap["sessions"][0]["repos"][0]["pulls"][0]
     assert pull["review_state"] == "approved"
@@ -280,7 +287,7 @@ def test_graphql_merged_pull_flagged(tmp_path):
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
     snap = refresh.build_snapshot(
-        sessions, env=_Env(), transport=_gql_transport([_gql_node(state="MERGED", merged=True)])
+        sessions, env=_Env(), transport=_rich_transport([_gql_node(state="MERGED", merged=True)])
     )
     pull = snap["sessions"][0]["repos"][0]["pulls"][0]
     assert pull["merged"] is True
@@ -288,36 +295,71 @@ def test_graphql_merged_pull_flagged(tmp_path):
 
 
 def _expire_graphql_cache():
-    """Age every cached GraphQL entry past the TTL so the next refresh re-queries."""
+    """Age every cached GraphQL entry past the freshness ceiling so the next
+    refresh re-queries even on a REST 304."""
     for entry in refresh._graphql_cache.values():
-        entry["fetched_at"] -= refresh.GRAPHQL_TTL + 1
+        entry["fetched_at"] -= refresh.GRAPHQL_MAX_STALE + 1
 
 
-def test_graphql_ttl_serves_cache_without_http(tmp_path):
+def test_rest_304_with_fresh_cache_skips_graphql(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
-    refresh.build_snapshot(sessions, env=_Env(), transport=_gql_transport([_gql_node(number=7)]))
-
-    # Within the TTL the next refresh must not hit HTTP; it serves the cache.
-    def boom(request):
-        raise AssertionError("HTTP must not be called within the TTL window")
-
-    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(boom))
+    gql = []
+    transport = _rich_transport([_gql_node(number=7)], gql=gql)
+    # First load: REST reports a change (no cached etag), so GraphQL fires once.
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1
+    # Steady state: REST answers 304 and the rich cache is fresh, so NO GraphQL.
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 7
 
 
-def test_force_bypasses_graphql_ttl(tmp_path):
+def test_rest_change_triggers_graphql(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
-    refresh.build_snapshot(sessions, env=_Env(), transport=_gql_transport([_gql_node(number=7)]))
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=7)]))
+    # A changed PR list (different etag -> REST 200) re-fires GraphQL on the next tick.
+    gql = []
+    snap = refresh.build_snapshot(
+        sessions, env=_Env(), transport=_rich_transport([_gql_node(number=8)], etag='W/"v2"', gql=gql)
+    )
+    assert len(gql) == 1
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 8
 
-    # A user-clicked refresh (force=True) must re-query within the TTL window
-    # and surface the live data, not the cached pull.
-    snap = refresh.build_snapshot(sessions, env=_Env(), transport=_gql_transport([_gql_node(number=8)]), force=True)
+
+def test_stale_cache_triggers_graphql_on_304(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=7)]))
+    _expire_graphql_cache()
+    # REST still answers 304 (unchanged list), but the rich cache is past the
+    # ceiling, so GraphQL fires to refresh CI/review state.
+    gql = []
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=9)], gql=gql))
+    assert len(gql) == 1
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 9
+
+
+def test_force_refetches_graphql_on_304(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=7)]))
+    # A user-clicked refresh (force=True) re-queries even when REST reports 304
+    # and the cache is fresh, surfacing live data over the cached pull.
+    gql = []
+    snap = refresh.build_snapshot(
+        sessions, env=_Env(), transport=_rich_transport([_gql_node(number=8)], gql=gql), force=True
+    )
+    assert len(gql) == 1
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 8
 
 
@@ -326,17 +368,32 @@ def test_graphql_rate_limit_serves_stale(tmp_path):
     ws.mkdir()
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
-    # Seed the cache with a good result, then age it past the TTL.
-    refresh.build_snapshot(sessions, env=_Env(), transport=_gql_transport([_gql_node(number=42)]))
+    # Seed the cache with a good result, then age it past the ceiling.
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=42)]))
     _expire_graphql_cache()
     # Next refresh hits a GraphQL secondary rate limit: serve the cached pull and arm backoff.
     snap = refresh.build_snapshot(
         sessions,
         env=_Env(),
-        transport=_gql_transport([], errors=[{"type": "RATE_LIMITED", "message": "slow down"}]),
+        transport=_rich_transport([], errors=[{"type": "RATE_LIMITED", "message": "slow down"}]),
     )
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 42
     assert refresh._backoff["until"] > time.monotonic()
+
+
+def test_graphql_failure_falls_back_to_basic_pulls(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    # First load (no rich cache): REST returns a basic pull, GraphQL errors out.
+    # The basic REST pull is served rather than blanking the repo.
+    snap = refresh.build_snapshot(
+        sessions,
+        env=_Env(),
+        transport=_rich_transport([], errors=[{"message": "boom"}]),
+    )
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 12
 
 
 def test_graphql_keeps_partial_data_with_rate_limit_error(tmp_path):
@@ -345,12 +402,14 @@ def test_graphql_keeps_partial_data_with_rate_limit_error(tmp_path):
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
 
-    # A 200 carrying BOTH repository data and a RATE_LIMITED error: keep the data,
-    # but still arm the backoff for the next refresh.
+    # A GraphQL 200 carrying BOTH repository data and a RATE_LIMITED error: keep
+    # the data, but still arm the backoff for the next refresh.
     def handler(request):
+        if not str(request.url).endswith("/graphql"):
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
         body = {
             "data": {
-                "rateLimit": {"remaining": 10, "resetAt": "x"},
+                "rateLimit": {"cost": 1, "remaining": 10, "resetAt": "x"},
                 "repository": {"pullRequests": {"nodes": [_gql_node(number=99)]}},
             },
             "errors": [{"type": "RATE_LIMITED", "message": "slow down"}],
