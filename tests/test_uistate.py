@@ -362,6 +362,14 @@ def test_column_skips_disabled_category_and_falls_through():
     assert _column_with(repos, frozenset())["text"] == "open PR"
 
 
+def test_show_column_false_clears_status_text_but_keeps_badge():
+    repos = [_repo(pulls=[_rich_pull(review="changes-requested")])]
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos)), show_column=False)
+    # The row-column is still pushed (to clear) but empty; the badge still has chips.
+    assert _column(params)["payload"] == {}
+    assert _badge(params)["payload"]["items"]
+
+
 def test_column_summarizes_top_attention_with_text_and_tone():
     payload = _column_payload([_repo(pulls=[_rich_pull(review="changes-requested")])])
     assert payload["text"] == "changes requested"

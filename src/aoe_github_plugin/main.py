@@ -61,6 +61,9 @@ CHIP_SETTING_KEYS = {
     "show_ci_status": "ci",
     "show_comment_status": "comments",
 }
+# Toggle for the row-column status-text cell (the words summary). Off keeps the
+# badge icons but clears the text. Defaults on.
+STATUS_TEXT_SETTING_KEY = "show_status_text"
 # Default NETWORK poll interval. Sized so worst-case (every key changes every
 # tick, so each spends a REST + a GraphQL query) stays well under the user's
 # shared 5000/hr budgets: at 120s a 20-key workspace tops out around 600 REST
@@ -182,6 +185,8 @@ class Runtime:
         # Enabled session-row chip categories; resolved from settings in run(),
         # all-on until then so the startup push is never accidentally empty.
         self._chip_flags: frozenset[str] = frozenset(CHIP_SETTING_KEYS.values())
+        # Whether the row-column status text is shown; resolved in run(), on until.
+        self._show_status_text = True
         self._next_network: float | None = None
         self._next_poll: float | None = None
 
@@ -274,7 +279,9 @@ class Runtime:
         with contextlib.suppress(Exception):
             snapshot = refresh.build_snapshot(sessions, force=force)
             current_ids: set[str] = set()
-            for params in uistate.snapshot_ui_state_params(snapshot, chips_on=self._chip_flags):
+            for params in uistate.snapshot_ui_state_params(
+                snapshot, chips_on=self._chip_flags, show_column=self._show_status_text
+            ):
                 sid = params.get("session_id")
                 if isinstance(sid, str):
                     current_ids.add(sid)
@@ -369,6 +376,7 @@ class Runtime:
         # Resolve chip-visibility settings before the first push so the startup
         # row reflects the user's choices, not the all-on default.
         self._chip_flags = self.resolve_chip_flags()
+        self._show_status_text = self._setting_on(STATUS_TEXT_SETTING_KEY)
         # Proactive refresh on startup so slots populate before any user action.
         self.run_refresh()
         self._seen_ids = set(self.pushed_session_ids)

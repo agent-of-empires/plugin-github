@@ -490,14 +490,15 @@ def _pane_blocks(repos: list[dict[str, Any]], *, auth_present: bool) -> list[dic
 
 
 def snapshot_ui_state_params(
-    snapshot: dict[str, Any], *, chips_on: frozenset[str] = _ALL_CHIPS
+    snapshot: dict[str, Any], *, chips_on: frozenset[str] = _ALL_CHIPS, show_column: bool = True
 ) -> list[dict[str, Any]]:
     """``ui.state.set`` params for a refresh snapshot: per session, a ``row-badge``
     (a chip sequence per PR), a ``row-column`` (the status summary), and a ``pane``
     (the GitHub tool-window). No global slot. ``chips_on`` is the set of enabled
     chip categories (``review``/``ci``/``comments``); a disabled one is hidden from
-    both the badge and the column. Pure and total: a missing/partial snapshot
-    yields no pushes rather than raising.
+    both the badge and the column. ``show_column`` False pushes an empty row-column
+    (clearing it) so the user can drop the status text and keep only the icons.
+    Pure and total: a missing/partial snapshot yields no pushes rather than raising.
     """
     sessions = snapshot.get("sessions") or []
     auth_present = bool((snapshot.get("auth") or {}).get("present", True))
@@ -520,7 +521,7 @@ def snapshot_ui_state_params(
                 "slot": ROW_COLUMN_SLOT[0],
                 "id": ROW_COLUMN_SLOT[1],
                 "session_id": sid,
-                "payload": _status_column(repos, chips_on),
+                "payload": _status_column(repos, chips_on) if show_column else {},
             }
         )
         params.append(
