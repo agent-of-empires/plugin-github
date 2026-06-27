@@ -429,10 +429,10 @@ def test_forced_refresh_during_backoff_emits_one_notice(tmp_path):
     ws.mkdir()
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
-    refresh.build_snapshot(sessions, env=_Env(), transport=_gql_transport([_gql_node(number=42)]))
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=42)]))
     _expire_graphql_cache()
     # A GraphQL secondary rate limit on a forced refresh: serve stale + announce.
-    rl = _gql_transport([], errors=[{"type": "RATE_LIMITED", "message": "slow down"}])
+    rl = _rich_transport([], errors=[{"type": "RATE_LIMITED", "message": "slow down"}])
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=rl, force=True)
     notice = snap.get("rate_limit_notice")
     assert notice is not None
