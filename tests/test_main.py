@@ -135,6 +135,21 @@ def test_background_refresh_emits_no_notify(monkeypatch):
     assert _notifies(sent) == []
 
 
+def test_resolve_chip_flags_defaults_all_on():
+    # No host answer (None) -> every category stays on, so nothing is hidden by
+    # accident when the setting is unset or the host does not reply.
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: None
+    assert rt.resolve_chip_flags() == frozenset({"review", "ci", "comments"})
+
+
+def test_resolve_chip_flags_respects_disabled_setting():
+    rt = main.Runtime(send=lambda _m: None)
+    off = {"show_ci_status"}
+    rt.call_host = lambda _method, params, **_kw: {"value": params["key"] not in off}
+    assert rt.resolve_chip_flags() == frozenset({"review", "comments"})
+
+
 def test_default_network_interval_is_120():
     # Network tick default sized for the rate-limit budget (#22). The fast local
     # session tick is a separate, smaller constant.

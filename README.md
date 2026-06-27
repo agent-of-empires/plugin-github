@@ -43,7 +43,7 @@ Installing prompts for the plugin's declared capabilities (`net`,
 | Command | `status` -> worker method `github.status`                          |
 | Command | `refresh` -> worker method `github.refresh`                        |
 | Command | `open` (open-in-GitHub) -> worker method `github.open`             |
-| UI      | a `row-badge` (`github_pr_badge`) and a `pane` tool-window (`github_pane`) |
+| UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
 At install/update the host runs the manifest's `[[runtime.build]]` steps in the
@@ -104,9 +104,20 @@ Beyond answering requests, the worker proactively drives the UI. On startup, on
    a workspace of many worktrees of one repo costs a single query (split into a
    few once it exceeds the per-query alias cap). Without a token it is the basic
    REST open-PR lookup only.
-4. Push two `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- one
-   colored, clickable PR icon per repo with an OPEN/draft PR; merged-only repos
-   are omitted, since the badge is an actionable indicator) and a `pane`
+4. Push three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
+   chip sequence per open PR: a clickable PR icon, then review-state, CI-rollup,
+   and unresolved-comment chips, each shown only when a token supplies that field,
+   concatenated across the workspace's repos, plus an error marker per failed
+   repo. Each chip is colored by tone, so failing CI / changes requested read as
+   danger, unresolved comments as warn, and a healthy PR as success,
+   distinguishing a broken PR from a healthy one at a glance; a draft shows the PR
+   chip alone and merged-only repos are omitted, since the badge is an actionable
+   indicator), a `row-column`
+   (`{text, tone, icon, tooltip, href?}`, or `{}` to clear -- one deterministic
+   words summary of the session's most-urgent PR signal so the list is scannable
+   without hovering the badge; a multi-repo workspace collapses to its single
+   highest-attention candidate, with the pane keeping the per-repo breakdown), and
+   a `pane`
    (`{title, default_location, icon, blocks: [...]}` -- the in-session GitHub
    tool-window listing, per PR, a headline row, a review-state row, a Checks
    section, and an unresolved-comments section; `icon` is a lucide name for its
