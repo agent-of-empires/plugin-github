@@ -35,13 +35,13 @@ from typing import Any
 from pathlib import Path
 from datetime import datetime
 from datetime import timezone
+from collections import defaultdict
 
 import httpx
 
 from aoe_github_plugin import graphql
 from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.client import GitHubClient
-from aoe_github_plugin.errors import ApiError
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.handlers import _resolve_optional_token
@@ -57,6 +57,21 @@ RATELIMIT_FLOOR = 50
 # this old is refreshed even on a ``304``. Bounds how stale CI/review state can
 # get (a user-clicked refresh forces it immediately regardless).
 GRAPHQL_MAX_STALE = 300.0
+# Shorter ceiling for a branch whose cached rich state is ACTIVE: a CI check is
+# running or queued (#26). Such state transitions in seconds and the ``/pulls``
+# ETag does not bump for it, so the 300s ceiling would lag a finishing CI run by
+# minutes. A small floor (vs 0) still refreshes on every background tick while
+# deduping sub-tick bursts (closely spaced session-list changes, host retries).
+# Scoped to CI on purpose: a PR merely awaiting review can sit idle for days, so
+# polling it every tick would burn budget for no signal; it keeps the 300s gate.
+GRAPHQL_ACTIVE_STALE = 30.0
+# Max branches aliased into one batched GraphQL query (#25). Caps the per-query
+# point cost (cost scales with aliases x their nested connections) so a repo with
+# many worktrees splits across a few serial queries rather than one giant one.
+MAX_GRAPHQL_ALIASES = 10
+# Hard cap on review threads paginated for one PR (#28), matching uistate's
+# render cap. The graceful last-resort bound against a pathological PR.
+MAX_REVIEW_THREADS = 500
 # Fixed fallback backoff when no precise reset is known (REST 403/429, which
 # classify_status discards the reset for). The GraphQL path prefers the
 # response's rateLimit.resetAt; see _set_backoff.
@@ -270,6 +285,17 @@ def _fetch_key(client: GitHubClient, key: RepoKey) -> list[dict[str, Any]]:
     return pulls
 
 
+def _fetch_one_basic(client: GitHubClient, key: RepoKey) -> dict[str, Any]:
+    """Fail-soft no-token result for one key: a typed error or any surprise
+    becomes an error entry for that key, never aborting the whole refresh."""
+    try:
+        return {"pulls": _fetch_key(client, key)}
+    except GitHubError as exc:
+        return _error_entry(exc)
+    except Exception as exc:  # noqa: BLE001 - fail-soft per repo, never abort the refresh
+        return {"error": {"kind": "internal", "hint": f"refresh failed: {exc}"}}
+
+
 def _graphql_rate_limited(data: dict[str, Any]) -> bool:
     """GitHub signals a GraphQL secondary rate limit as a 200 carrying an error
     of type ``RATE_LIMITED`` (not an HTTP 4xx), so detect it in the envelope."""
@@ -277,94 +303,233 @@ def _graphql_rate_limited(data: dict[str, Any]) -> bool:
     return isinstance(errors, list) and any(isinstance(e, dict) and e.get("type") == "RATE_LIMITED" for e in errors)
 
 
-def _graphql_no_repository(
+def _error_entry(exc: GitHubError) -> dict[str, Any]:
+    """A typed error rendered as the per-key result fragment the UI mapper reads."""
+    return {"error": {"kind": exc.kind, "hint": str(exc)}}
+
+
+def _is_active(pulls: list[dict[str, Any]]) -> bool:
+    """A branch's cached rich state is ACTIVE when a non-merged PR has a CI check
+    running or queued (#26). That state finishes in seconds yet does not bump the
+    ``/pulls`` ETag, so it earns the shorter staleness ceiling. A PR merely
+    awaiting review is deliberately NOT active: it can idle for days, so polling
+    it every tick would burn budget for no signal."""
+    for pull in pulls:
+        if pull.get("merged"):
+            continue
+        checks = pull.get("checks")
+        if not isinstance(checks, dict):
+            continue
+        if checks.get("state") in ("running", "queued"):
+            return True
+        if any(isinstance(run, dict) and run.get("state") in ("running", "queued") for run in checks.get("runs") or []):
+            return True
+    return False
+
+
+def _rich_stale(rich: dict[str, Any] | None, now: float) -> bool:
+    """Whether the cached rich result is missing or aged past its ceiling: the
+    short ``GRAPHQL_ACTIVE_STALE`` for an active branch (#26), else the 300s one."""
+    if rich is None:
+        return True
+    ceiling = GRAPHQL_ACTIVE_STALE if _is_active(rich["pulls"]) else GRAPHQL_MAX_STALE
+    return (now - rich["fetched_at"]) >= ceiling
+
+
+def _error_aliases(data: dict[str, Any]) -> set[str]:
+    """Aliases (``b0``/``b1``/...) named in a GraphQL ``errors[].path`` so a
+    field-level failure is attributed to its own branch, not the whole group.
+    Errors with no usable path (e.g. a global RATE_LIMITED) name nothing here and
+    are handled by the budget/backoff check instead."""
+    out: set[str] = set()
+    for err in data.get("errors") or []:
+        if not isinstance(err, dict):
+            continue
+        path = err.get("path")
+        if isinstance(path, list) and len(path) >= 2 and path[0] == "repository" and isinstance(path[1], str):
+            out.add(path[1])
+    return out
+
+
+def _paginate_threads(client: GitHubClient, pull_node: dict[str, Any]) -> None:
+    """When a PR's first reviewThreads page did not cover them all (#28), fetch
+    the rest by the node id and append the raw thread nodes onto ``pull_node`` IN
+    PLACE, so the normalizer counts every unresolved comment. Bounded by
+    ``MAX_REVIEW_THREADS`` and fail-soft: any error keeps the first page rather
+    than blanking comments (the next refresh retries the tail)."""
+    threads = pull_node.get("reviewThreads")
+    node_id = pull_node.get("id")
+    if not isinstance(threads, dict) or not isinstance(node_id, str):
+        return
+    nodes = threads.get("nodes")
+    if not isinstance(nodes, list):
+        return
+    page = threads.get("pageInfo") or {}
+    cursor = page.get("endCursor")
+    try:
+        while page.get("hasNextPage") and isinstance(cursor, str) and len(nodes) < MAX_REVIEW_THREADS:
+            data = client.post_graphql(graphql.THREADS_PAGE_QUERY, {"id": node_id, "cursor": cursor})
+            conn = ((data.get("data") or {}).get("node") or {}).get("reviewThreads") or {}
+            more = [n for n in (conn.get("nodes") or []) if isinstance(n, dict)]
+            if not more:
+                break
+            nodes.extend(more)
+            page = conn.get("pageInfo") or {}
+            cursor = page.get("endCursor")
+    except GitHubError:
+        return
+
+
+def _fallback_pulls(pending: dict[str, Any]) -> dict[str, Any]:
+    """Per-key result when GraphQL could not produce fresh data: the last-good
+    rich cache if present, else the basic REST open-PR pulls. Never an error and
+    never accidentally empty, preserving the fail-soft per-key contract."""
+    rich = pending["rich"]
+    return {"pulls": rich["pulls"] if rich is not None else pending["basic"]}
+
+
+def _chunk_fallback(
+    chunk: list[RepoKey],
+    pending: dict[RepoKey, dict[str, Any]],
+    out: dict[RepoKey, dict[str, Any]],
+) -> None:
+    """Fall back every key in a chunk (blocked gate or a whole-query failure)."""
+    for key in chunk:
+        out[key] = _fallback_pulls(pending[key])
+
+
+def _resolve_null_repository(
+    chunk: list[RepoKey],
+    pending: dict[RepoKey, dict[str, Any]],
     data: dict[str, Any],
-    rate_info: dict[str, Any],
-    cached: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    """Resolve a response that carried no ``repository``: serve stale if we have
-    it, else back off (rate limit) or surface the error. A genuinely null repo
-    (private/not found) is an empty result, not an error."""
-    if _graphql_rate_limited(data):
-        _set_backoff(rate_info.get("resetAt"))
-        if cached is not None:
-            return cached["pulls"]
-        raise RateLimitedError
-    errors = data.get("errors")
-    if errors:
-        if cached is not None:
-            return cached["pulls"]
-        message = next((e.get("message") for e in errors if isinstance(e, dict) and e.get("message")), "GraphQL error")
-        raise ApiError(200, str(message))
-    return []
+    out: dict[RepoKey, dict[str, Any]],
+) -> None:
+    """Per-key result when the batched response carried no ``repository``: prefer
+    the last-good rich cache; a GraphQL error with no cache degrades to the basic
+    REST pulls (never blanks a PR over a transient failure); a genuinely null repo
+    (no errors) is an empty result, matching the prior single-key behavior."""
+    errored = bool(data.get("errors"))
+    for key in chunk:
+        rich = pending[key]["rich"]
+        if rich is not None:
+            out[key] = {"pulls": rich["pulls"]}
+        elif errored:
+            out[key] = {"pulls": pending[key]["basic"]}
+        else:
+            out[key] = {"pulls": []}
 
 
-def _fetch_key_graphql(client: GitHubClient, key: RepoKey) -> list[dict[str, Any]]:
-    """Rich PR data for one ``(owner, repo, branch)`` via GraphQL. Honors the
-    backoff gate and prefers any usable response data (a GraphQL partial success
-    is kept, not discarded). Raises ``GitHubError`` only when there is nothing to
-    fall back on. The decision of *whether* to spend a GraphQL query (vs serving
-    the cache) belongs to ``_fetch_key_rich_gated``, which gates on the cheap
-    REST conditional check; this only runs once that gate has decided to fetch."""
-    owner, repo, branch = key
+def _apply_aliases(
+    client: GitHubClient,
+    chunk: list[RepoKey],
+    pending: dict[RepoKey, dict[str, Any]],
+    data: dict[str, Any],
+    out: dict[RepoKey, dict[str, Any]],
+) -> None:
+    """Normalize each alias connection back into its key's cache + result. A failed
+    (named in ``errors[].path``) or malformed alias falls back per key, never
+    poisoning its siblings. ``data`` is the full envelope (its ``repository`` is a
+    dict here, validated by the caller)."""
+    repository = (data.get("data") or {}).get("repository") or {}
+    failed = _error_aliases(data)
+    now = time.monotonic()
+    for i, key in enumerate(chunk):
+        conn = repository.get(f"b{i}")
+        if f"b{i}" in failed or not isinstance(conn, dict):
+            out[key] = _fallback_pulls(pending[key])
+            continue
+        for node in conn.get("nodes") or []:
+            if isinstance(node, dict):
+                _paginate_threads(client, node)
+        pulls = graphql.normalize_connection(conn)
+        with _cache_lock:
+            _graphql_cache[key] = {"pulls": pulls, "fetched_at": now}
+        out[key] = {"pulls": pulls}
+
+
+def _fetch_chunk(
+    client: GitHubClient,
+    chunk: list[RepoKey],
+    pending: dict[RepoKey, dict[str, Any]],
+    out: dict[RepoKey, dict[str, Any]],
+) -> None:
+    """One batched GraphQL query for up to ``MAX_GRAPHQL_ALIASES`` branches of one
+    repo (#25), aliased ``b0:``/``b1:``/... ``chunk`` is non-empty and all keys
+    share one ``(owner, repo)``. Writes a per-key result into ``out`` for every
+    key in ``chunk``, isolating failures: a blocked/rate-limited query or a single
+    failed alias falls back per key (rich cache, then basic REST), never
+    group-wide."""
+    owner, repo, _ = chunk[0]
     with _cache_lock:
-        cached = _graphql_cache.get(key)
         blocked = time.monotonic() < _backoff["until"]
     if blocked:
-        if cached is not None:
-            return cached["pulls"]
-        raise RateLimitedError
-    variables = {"owner": owner, "repo": repo, "branch": branch}
+        _chunk_fallback(chunk, pending, out)
+        return
+
+    variables: dict[str, Any] = {"owner": owner, "repo": repo}
+    for i, key in enumerate(chunk):
+        variables[f"b{i}"] = key[2]
     try:
-        data = client.post_graphql(graphql.QUERY, variables)
+        data = client.post_graphql(graphql.build_query(len(chunk)), variables)
     except RateLimitedError:
         _set_backoff()
-        if cached is not None:
-            return cached["pulls"]
-        raise
+        _chunk_fallback(chunk, pending, out)
+        return
+    except GitHubError:
+        _chunk_fallback(chunk, pending, out)
+        return
 
     payload = data.get("data") or {}
     rate_info = payload.get("rateLimit") or {}
-    if payload.get("repository") is None:
-        return _graphql_no_repository(data, rate_info, cached)
-
-    pulls = graphql.normalize_pulls(payload)
-    # Arm backoff for the next refresh if a rate limit rode along with the data,
-    # or the remaining point budget is running low.
+    repository = payload.get("repository")
+    # Arm backoff for the next refresh on a riding rate-limit error or a low
+    # remaining budget, after caching whatever good data this response carries.
     remaining = rate_info.get("remaining")
     if _graphql_rate_limited(data) or (isinstance(remaining, int) and remaining < RATELIMIT_FLOOR):
         _set_backoff(rate_info.get("resetAt"))
-    with _cache_lock:
-        _graphql_cache[key] = {"pulls": pulls, "fetched_at": time.monotonic()}
-    return pulls
+
+    if not isinstance(repository, dict):
+        _resolve_null_repository(chunk, pending, data, out)
+        return
+    _apply_aliases(client, chunk, pending, data, out)
 
 
-def _fetch_key_rich_gated(client: GitHubClient, key: RepoKey, *, force: bool = False) -> list[dict[str, Any]]:
-    """Rich PR data for one key, with the cheap REST conditional check as the
-    primary gate (#21). Fires the expensive GraphQL query only when ``force`` (a
-    user refresh / first load), the REST probe reports a change, there is no rich
-    cache yet, or the cached rich result has aged past ``GRAPHQL_MAX_STALE``;
-    otherwise it serves the cached rich pulls for ~0 rate-limit cost. Fail-soft:
-    if GraphQL fails it falls back to the rich cache, then the basic REST pulls,
-    so a transient rich-path failure never blanks a PR."""
+def _fetch_rich(client: GitHubClient, keys: list[RepoKey], *, force: bool) -> dict[RepoKey, dict[str, Any]]:
+    """Token path: a cheap REST conditional probe gates each key (#21), then the
+    keys that need fresh GraphQL are grouped by ``(owner, repo)`` and aliased into
+    one batched query per group, chunked to ``MAX_GRAPHQL_ALIASES`` (#25). Gating
+    is PER KEY before grouping, so one active branch never drags its quiescent
+    siblings into a fetch. Fail-soft per key: a probe error or GraphQL failure
+    serves the rich cache, then basic REST pulls, then a typed error."""
     now = time.monotonic()
-    with _cache_lock:
-        rich = _graphql_cache.get(key)
-    try:
-        changed, basic = _rest_probe(client, key)
-    except GitHubError:
-        if rich is not None:
-            return rich["pulls"]
-        raise
-    stale = rich is None or (now - rich["fetched_at"]) >= GRAPHQL_MAX_STALE
-    if not force and not changed and not stale and rich is not None:
-        return rich["pulls"]
-    try:
-        return _fetch_key_graphql(client, key)
-    except GitHubError:
-        if rich is not None:
-            return rich["pulls"]
-        return basic
+    out: dict[RepoKey, dict[str, Any]] = {}
+    pending: dict[RepoKey, dict[str, Any]] = {}
+    for key in keys:
+        with _cache_lock:
+            rich = _graphql_cache.get(key)
+        try:
+            changed, basic = _rest_probe(client, key)
+        except GitHubError as exc:
+            out[key] = {"pulls": rich["pulls"]} if rich is not None else _error_entry(exc)
+            continue
+        if rich is not None and not force and not changed and not _rich_stale(rich, now):
+            out[key] = {"pulls": rich["pulls"]}
+            continue
+        pending[key] = {"basic": basic, "rich": rich}
+
+    groups: dict[tuple[str, str], list[RepoKey]] = defaultdict(list)
+    for key in pending:
+        groups[(key[0], key[1])].append(key)
+    for gkeys in groups.values():
+        gkeys.sort(key=lambda k: k[2])
+        for start in range(0, len(gkeys), MAX_GRAPHQL_ALIASES):
+            chunk = gkeys[start : start + MAX_GRAPHQL_ALIASES]
+            try:
+                _fetch_chunk(client, chunk, pending, out)
+            except Exception as exc:  # noqa: BLE001 - fail-soft per repo, never abort the refresh
+                for key in chunk:
+                    out.setdefault(key, {"error": {"kind": "internal", "hint": f"refresh failed: {exc}"}})
+    return out
 
 
 def _fetch_all(
@@ -374,35 +539,27 @@ def _fetch_all(
     *,
     force: bool = False,
 ) -> tuple[dict[RepoKey, dict[str, Any]], bool]:
-    """Fetch every unique key SERIALLY. Returns ``(results, token_present)``
-    where results is ``key -> {"pulls": [...]}`` or ``key -> {"error": {...}}``.
-    With a token, each key goes through the REST-conditional-gated rich path
-    (``_fetch_key_rich_gated``); without one we keep the basic REST open-PR path
-    and report ``token_present=False`` so the UI can show the "token needed"
-    banner. ``force`` (a manual refresh) bypasses the staleness gate on the token
-    path. Requests are serialized (sorted for determinism) rather than fanned
-    out, to stay under GitHub's secondary/concurrency limits (#22); none of this
-    touches stdin or host RPCs."""
+    """Fetch every unique key. Returns ``(results, token_present)`` where results
+    is ``key -> {"pulls": [...]}`` or ``key -> {"error": {...}}``. With a token,
+    keys go through the REST-conditional-gated rich path and same-repo branches
+    that need GraphQL share one batched query (``_fetch_rich``); without one we
+    keep the basic REST open-PR path and report ``token_present=False`` so the UI
+    can show the "token needed" banner. ``force`` (a manual refresh) bypasses the
+    staleness gate on the token path. GraphQL is batched per repo but otherwise
+    serialized (sorted for determinism), to stay under GitHub's secondary/
+    concurrency limits (#22); none of this touches stdin or host RPCs."""
     if not keys:
         return {}, True
     token = _resolve_optional_token(env)
     present = token is not None
-    fetch = (lambda c, k: _fetch_key_rich_gated(c, k, force=force)) if present else _fetch_key
-
-    def one(client: GitHubClient, key: RepoKey) -> dict[str, Any]:
-        """Fail-soft per repo: a typed error or any surprise becomes an error
-        entry for that one key, never aborting the whole refresh."""
-        try:
-            return {"pulls": fetch(client, key)}
-        except GitHubError as exc:
-            return {"error": {"kind": exc.kind, "hint": str(exc)}}
-        except Exception as exc:  # noqa: BLE001 - fail-soft per repo, never abort the refresh
-            return {"error": {"kind": "internal", "hint": f"refresh failed: {exc}"}}
-
+    ordered = sorted(keys)
     results: dict[RepoKey, dict[str, Any]] = {}
     with GitHubClient(token=token, transport=transport) as client:
-        for key in sorted(keys):
-            results[key] = one(client, key)
+        if present:
+            results = _fetch_rich(client, ordered, force=force)
+        else:
+            for key in ordered:
+                results[key] = _fetch_one_basic(client, key)
     return results, present
 
 

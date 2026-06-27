@@ -17,41 +17,87 @@ from __future__ import annotations
 
 from typing import Any
 
-# One query per (owner, repo, branch). ``pullRequests(headRefName:)`` matches by
-# the head ref NAME, so a merged PR still resolves after its remote branch is
-# deleted (unlike ref(qualifiedName:), which would be null). Connections are
-# capped so a pathological PR cannot blow past the host's 8KB/entry payload cap.
+# The per-PR node selection, shared by every aliased ``pullRequests`` field in a
+# batched query (#25). Kept as a fragment so only the top-level aliases and their
+# ``headRefName`` args are dynamic. ``pullRequests(headRefName:)`` matches by the
+# head ref NAME, so a merged PR still resolves after its remote branch is deleted
+# (unlike ref(qualifiedName:), which would be null). Connections are capped so a
+# pathological PR cannot blow past the host's payload cap.
 #
-# Counts are sized to what the pane actually renders (#23), to keep the GraphQL
-# point cost low now that this query fires only on a detected change (#21):
+# Counts are sized to what the pane renders, to keep the GraphQL point cost low
+# now that this query fires only on a detected change (#21):
 # - pullRequests first:3 (a branch rarely has more than one open + one merged PR);
 # - reviews last:1, states:[COMMENTED] (review_state only needs to know whether a
 #   COMMENTED review exists; APPROVED/CHANGES_REQUESTED come from reviewDecision);
-# - reviewThreads first:20 (the pane caps unresolved comments at 10).
+# - reviewThreads first:100 with pageInfo, so a big review (e.g. a CodeRabbit
+#   pass) surfaces every unresolved comment; refresh paginates by the node ``id``
+#   for the rare PR that still has more (#28).
 # contexts stays at first:50 ON PURPOSE: the per-check rows are ranked
 # failure-first CLIENT-side (see check_summary), so truncating the connection
 # could drop a failing check past the cap and render a PR falsely green.
-# rateLimit.cost is requested so the per-query budget can be verified (#23).
-QUERY = """
-query($owner: String!, $repo: String!, $branch: String!) {
-  rateLimit { cost remaining resetAt }
-  repository(owner: $owner, name: $repo) {
-    pullRequests(
-      headRefName: $branch, states: [OPEN, MERGED], first: 3,
-      orderBy: {field: UPDATED_AT, direction: DESC}
-    ) {
+_PR_CONNECTION_FRAGMENT = """
+fragment PRConnection on PullRequestConnection {
+  nodes {
+    id number title url state isDraft merged reviewDecision
+    commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 50) { nodes {
+      __typename
+      ... on CheckRun { name status conclusion detailsUrl }
+      ... on StatusContext { context state targetUrl }
+    } } } } } }
+    reviews(last: 1, states: [COMMENTED]) { nodes { state } }
+    reviewThreads(first: 100) {
+      pageInfo { hasNextPage endCursor }
       nodes {
-        number title url state isDraft merged reviewDecision
-        commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 50) { nodes {
-          __typename
-          ... on CheckRun { name status conclusion detailsUrl }
-          ... on StatusContext { context state targetUrl }
-        } } } } } }
-        reviews(last: 1, states: [COMMENTED]) { nodes { state } }
-        reviewThreads(first: 20) { nodes {
+        isResolved path line
+        comments(first: 1) { nodes { author { login } bodyText url } }
+      }
+    }
+  }
+}
+"""
+
+# One aliased ``pullRequests`` field. ``{i}`` is the index; the doubled braces are
+# GraphQL literals that survive ``str.format``. rateLimit.cost (one per batched
+# query) lets the per-query budget be verified (#23).
+_ALIAS_FIELD = """    b{i}: pullRequests(
+      headRefName: $b{i}, states: [OPEN, MERGED], first: 3,
+      orderBy: {{field: UPDATED_AT, direction: DESC}}
+    ) {{ ...PRConnection }}"""
+
+
+def build_query(alias_count: int) -> str:
+    """A single GraphQL document fetching ``alias_count`` branches of one repo,
+    aliased ``b0:``/``b1:``/... over the static PR fragment (#25). Branch names
+    travel as ``$bN`` variables, never interpolated, so the aliases are always
+    valid identifiers and there is no injection or quoting risk. A count of 1 is
+    just one alias, so this is the only rich-query path."""
+    n = max(alias_count, 1)
+    params = ", ".join(["$owner: String!", "$repo: String!", *[f"$b{i}: String!" for i in range(n)]])
+    fields = "\n".join(_ALIAS_FIELD.format(i=i) for i in range(n))
+    return f"""
+query({params}) {{
+  rateLimit {{ cost remaining resetAt }}
+  repository(owner: $owner, name: $repo) {{
+{fields}
+  }}
+}}
+{_PR_CONNECTION_FRAGMENT}"""
+
+
+# Follow-up query for a PR whose reviewThreads exceeded one page (#28): fetch the
+# next page by the PR's node id. The caller bounds the page count so cost stays
+# small (the common PR needs zero follow-ups).
+THREADS_PAGE_QUERY = """
+query($id: ID!, $cursor: String) {
+  rateLimit { cost remaining resetAt }
+  node(id: $id) {
+    ... on PullRequest {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
           isResolved path line
           comments(first: 1) { nodes { author { login } bodyText url } }
-        } }
+        }
       }
     }
   }
@@ -184,24 +230,31 @@ def comment_summary(pr: dict[str, Any]) -> dict[str, Any]:
     return {"unresolved": len(items), "items": items}
 
 
-def normalize_pulls(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """The ``data`` field of a GraphQL response -> trimmed, UI-ready pull dicts.
+def _normalize_pull(pr: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "number": pr.get("number"),
+        "url": pr.get("url"),
+        "title": pr.get("title") or "",
+        "state": pr.get("state"),
+        "draft": bool(pr.get("isDraft", False)),
+        "merged": bool(pr.get("merged", False)),
+        "review_state": review_state(pr),
+        "checks": check_summary(pr),
+        "comments": comment_summary(pr),
+    }
+
+
+def normalize_connection(conn: Any) -> list[dict[str, Any]]:
+    """A ``pullRequests`` connection (the value of one alias in a batched
+    response, or any ``{"nodes": [...]}``) -> trimmed, UI-ready pull dicts.
 
     Shape stays a superset of the REST ``_trim`` output (``number``/``url``/
     ``title``/``state``/``draft``) so ``uistate`` renders either source, plus
-    the rich fields ``merged``/``review_state``/``checks``/``comments``.
+    the rich fields ``merged``/``review_state``/``checks``/``comments``. Total:
+    a missing/malformed connection degrades to ``[]`` rather than raising.
     """
-    return [
-        {
-            "number": pr.get("number"),
-            "url": pr.get("url"),
-            "title": pr.get("title") or "",
-            "state": pr.get("state"),
-            "draft": bool(pr.get("isDraft", False)),
-            "merged": bool(pr.get("merged", False)),
-            "review_state": review_state(pr),
-            "checks": check_summary(pr),
-            "comments": comment_summary(pr),
-        }
-        for pr in _nodes(data, "repository", "pullRequests")
-    ]
+    if not isinstance(conn, dict):
+        return []
+    nodes = conn.get("nodes")
+    pulls = [n for n in nodes if isinstance(n, dict)] if isinstance(nodes, list) else []
+    return [_normalize_pull(pr) for pr in pulls]

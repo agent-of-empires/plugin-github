@@ -3,6 +3,7 @@
 Discovery uses real temp git repos (cheap); GitHub lookups use a MockTransport.
 """
 
+import json
 import time
 import subprocess
 from datetime import datetime
@@ -240,11 +241,24 @@ def _gql_node(number=7, state="OPEN", merged=False, draft=False, decision="APPRO
     }
 
 
-def _rich_transport(nodes, *, etag='W/"v1"', remaining=5000, errors=None, gql=None):
+def _alias_repo(request, by_branch):
+    """Build the batched-query ``repository`` from the posted variables: one
+    aliased connection (``b0``/``b1``/...) per requested branch. ``by_branch`` maps
+    a branch name to its PR nodes; a missing branch yields an empty connection."""
+    variables = json.loads(request.content.decode()).get("variables", {})
+    repo = {}
+    for alias, branch in variables.items():
+        if alias.startswith("b"):
+            repo[alias] = {"nodes": by_branch.get(branch, [])}
+    return repo
+
+
+def _rich_transport(nodes, *, etag='W/"v1"', remaining=5000, errors=None, gql=None, branch="feature"):  # noqa: PLR0913
     """Combined transport for the token path: a REST conditional probe (GET) then
-    a GraphQL query (POST). The REST probe answers 304 when the caller already
-    holds ``etag`` (no change), else 200 with a one-PR list (changed). ``gql`` is
-    an optional capture list for the GraphQL requests."""
+    a batched GraphQL query (POST). The REST probe answers 304 when the caller
+    already holds ``etag`` (no change), else 200 with a one-PR list (changed). The
+    GraphQL response aliases ``nodes`` under whichever branch(es) the query asked
+    for. ``gql`` is an optional capture list for the GraphQL requests."""
 
     def handler(request):
         if str(request.url).endswith("/graphql"):
@@ -255,7 +269,7 @@ def _rich_transport(nodes, *, etag='W/"v1"', remaining=5000, errors=None, gql=No
             body = {
                 "data": {
                     "rateLimit": {"cost": 1, "remaining": remaining, "resetAt": "x"},
-                    "repository": {"pullRequests": {"nodes": nodes}},
+                    "repository": _alias_repo(request, {branch: nodes}),
                 }
             }
             return httpx.Response(200, json=body)
@@ -410,7 +424,7 @@ def test_graphql_keeps_partial_data_with_rate_limit_error(tmp_path):
         body = {
             "data": {
                 "rateLimit": {"cost": 1, "remaining": 10, "resetAt": "x"},
-                "repository": {"pullRequests": {"nodes": [_gql_node(number=99)]}},
+                "repository": _alias_repo(request, {"feature": [_gql_node(number=99)]}),
             },
             "errors": [{"type": "RATE_LIMITED", "message": "slow down"}],
         }
@@ -465,10 +479,12 @@ def test_known_reset_marks_notice_reset_known(tmp_path):
 
     # 200 with data but a near-spent budget and a real resetAt: arms a known reset.
     def handler(request):
+        if not str(request.url).endswith("/graphql"):
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
         body = {
             "data": {
                 "rateLimit": {"remaining": 10, "resetAt": reset_at},
-                "repository": {"pullRequests": {"nodes": [_gql_node(number=7)]}},
+                "repository": _alias_repo(request, {"feature": [_gql_node(number=7)]}),
             }
         }
         return httpx.Response(200, json=body)
