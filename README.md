@@ -33,8 +33,8 @@ From the dashboard (Settings -> Plugins -> Discover) or the CLI:
 aoe plugin install agent-of-empires/plugin-github
 ```
 
-Installing prompts for the plugin's declared capabilities (`net-fetch`) before
-anything is written.
+Installing prompts for the plugin's declared capabilities (`net`,
+`runtime.worker`, `session.read`, `notifications`) before anything is written.
 
 ## What it contributes
 
@@ -109,6 +109,13 @@ GraphQL path has no ETag, so it reads `rateLimit { remaining }` from each
 response and trips a short backoff (serving the last-good cached result) when the
 point budget (5000/hr) runs low or a `403`/`429`/`RATE_LIMITED` is returned; the
 worker's poll cadence (`ui_refresh_secs`) bounds how often it queries.
+
+When a user-initiated refresh (the pane's Refresh action) hits an active backoff,
+the worker raises one in-app `ui.notify` (a warning, "GitHub rate limited") via
+the `notifications` capability, at most once per backoff window. The body shows
+the reset countdown ("Resets in ~Xm (HH:MM)") when the GraphQL `resetAt` is
+known, and a generic message for the REST path, which has no real reset. Background
+polls never notify, so a rate-limited workspace is not nagged on every tick.
 
 Each push is `params: { slot, id, session_id, payload }`. A badge item is
 `{ icon, tone?, href?, tooltip? }` (`icon` is a lucide name, e.g.
