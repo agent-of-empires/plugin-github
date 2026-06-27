@@ -176,11 +176,22 @@ def test_pane_renders_review_checks_and_comments():
     assert comment["kind"] == "comment"
     assert comment["author"] == "al"
     assert comment["href"] == "https://c/1"
-    # Both sections fold; comments start collapsed (verbose), checks start open.
+    # Both sections fold. These checks are failing, so the section stays open;
+    # the comments section is open because there are unresolved comments.
     assert checks_section["collapsible"] is True
     assert "collapsed" not in checks_section
     assert comments_section["collapsible"] is True
-    assert comments_section["collapsed"] is True
+    assert "collapsed" not in comments_section
+
+
+def test_passing_checks_section_starts_collapsed():
+    checks = {"state": "succeeded", "runs": [{"name": "test", "state": "succeeded"}]}
+    pull = _rich_pull(review="approved", checks=checks, comments={"unresolved": 0, "items": []})
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
+        "blocks"
+    ]
+    checks_section = next(b for b in blocks if b.get("kind") == "section" and b["title"].startswith("Checks"))
+    assert checks_section["collapsed"] is True
 
 
 def test_pane_payload_stays_under_host_size_cap():

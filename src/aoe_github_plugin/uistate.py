@@ -195,7 +195,12 @@ def _checks_section(checks: Any) -> dict[str, Any] | None:
     title = f"Checks: {rollup_label}"
     if len(runs) > _MAX_CHECK_ROWS:
         title += f" ({len(runs)} total)"
-    return {"kind": "section", "title": title, "children": children, "collapsible": True}
+    section: dict[str, Any] = {"kind": "section", "title": title, "children": children, "collapsible": True}
+    # Fold when everything passed; stay open when something needs attention
+    # (failing/running/queued/unknown) so the actionable rows are visible.
+    if checks.get("state") == "succeeded":
+        section["collapsed"] = True
+    return section
 
 
 def _comment_block(item: dict[str, Any]) -> dict[str, Any]:
@@ -219,14 +224,13 @@ def _comments_section(comments: Any) -> dict[str, Any] | None:
         return None
     items = comments.get("items") or []
     children = [_comment_block(item) for item in items[:_MAX_COMMENTS]]
-    # Collapsed by default: comment bodies are verbose, so fold them away until
-    # the user wants them; the count stays visible in the title.
+    # Open by default: the section only exists when there are unresolved
+    # comments, so surface them. Still collapsible for the user to fold away.
     return {
         "kind": "section",
         "title": f"Unresolved comments: {comments['unresolved']}",
         "children": children,
         "collapsible": True,
-        "collapsed": True,
     }
 
 
