@@ -64,9 +64,9 @@ description = "Open this checkout's PR (or the create-PR page) in a browser."
 [[settings]]
 key = "ui_refresh_secs"
 label = "GitHub UI refresh interval (seconds)"
-description = "How often the worker re-pushes PR status to its UI slots. 0 disables the background poll (it still pushes on startup and on refresh)."
+description = "How often the worker checks GitHub for PR/CI/review changes (network tick). A cheap conditional check runs each tick; the costly query fires only on a change. 0 disables the background poll (it still pushes on startup and on refresh)."
 type = "integer"
-default = 30
+default = 120
 min = 0
 max = 86400
 advanced = true

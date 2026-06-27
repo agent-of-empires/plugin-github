@@ -133,3 +133,21 @@ def test_background_refresh_emits_no_notify(monkeypatch):
     rt, sent = _runtime_with_snapshot(monkeypatch, {"rate_limit_notice": {"seconds": 1800, "reset_known": True}})
     rt.run_refresh(sessions=[], force=False)
     assert _notifies(sent) == []
+
+
+def test_default_network_interval_is_120():
+    # Network tick default sized for the rate-limit budget (#22). The fast local
+    # session tick is a separate, smaller constant.
+    assert main.DEFAULT_REFRESH_SECS == 120
+    assert main.SESSION_POLL_SECS < main.DEFAULT_REFRESH_SECS
+
+
+def test_network_jitter_is_positive_and_bounded():
+    # Disabled polling: no jitter.
+    assert main._network_jitter(0) == 0.0
+    cap = min(main.NETWORK_JITTER_MAX, 120 * main.NETWORK_JITTER_FRAC)
+    for _ in range(200):
+        j = main._network_jitter(120)
+        assert 0.0 <= j <= cap  # never negative (must not poll faster than configured)
+    # The cap holds for a large interval too (absolute ceiling, not just a fraction).
+    assert main._network_jitter(100000) <= main.NETWORK_JITTER_MAX
