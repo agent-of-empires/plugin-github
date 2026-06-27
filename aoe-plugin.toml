@@ -12,8 +12,13 @@
 id = "agent-of-empires.github"
 name = "GitHub"
 version = "0.1.0"
-# Manifest schema / host API version. Host supports 1..=1.
-api_version = 3
+# Manifest schema / host API version. Host supports 1..=4.
+api_version = 4
+# Host-app compatibility range (different axis from api_version, which is the
+# manifest-schema version). The host refuses install/update outside this range
+# and skips loading if a later aoe upgrade moves out of it. Requires api_version
+# >= 4. Current released aoe is 1.11.3; refuse an untested 2.0.
+aoe_version = ">=1.11.0, <2.0.0"
 description = "GitHub integration for Agent of Empires: surface PR and issue state for your sessions."
 
 # Capability grants are prompted at install and pinned to the manifest hash.
