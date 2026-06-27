@@ -112,13 +112,21 @@ def update_featured_versions(
 
     existing = versions.get(version)
     if existing is not None:
-        if existing != tree_hash_value:
+        if str(existing) != tree_hash_value:
             raise ValueError(
                 f"{plugin_id} {version} already pinned to {existing}, refusing to overwrite with {tree_hash_value}"
             )
         return toml_text, False
 
-    versions[version] = tree_hash_value
+    # Rebuild the inline table rather than mutating it in place: tomlkit drops
+    # the comma separator when appending to an inline table that has trailing
+    # whitespace before its closing brace (the `{ ... }` style this file uses),
+    # producing invalid TOML. A fresh table serializes correctly every time.
+    rebuilt = tomlkit.inline_table()
+    for key, value in versions.items():
+        rebuilt[key] = str(value)
+    rebuilt[version] = tree_hash_value
+    plugins[plugin_id]["versions"] = rebuilt
     return tomlkit.dumps(doc), True
 
 

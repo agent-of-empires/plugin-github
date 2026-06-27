@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 import pytest
+import tomlkit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -86,6 +88,17 @@ def test_update_appends_new_version() -> None:
     assert "1.2.0" in new_text
     assert "agent-of-empires.other" in new_text
     assert "# keep this comment" in new_text
+    # Regression guard: tomlkit drops the comma when appending in place to an
+    # inline table with trailing whitespace, yielding invalid TOML. A
+    # quote-whitespace-quote join (no comma) must never appear.
+    assert not re.search(r'"[ \t]+"', new_text)
+
+
+def test_update_output_round_trips() -> None:
+    new_text, _ = update_featured_versions(FEATURED, GITHUB, "1.3.0", NEW_HASH)
+    versions = tomlkit.parse(new_text)["plugins"][GITHUB]["versions"]
+    assert str(versions["1.3.0"]) == NEW_HASH
+    assert str(versions["1.2.0"]).startswith("sha256:")
 
 
 def test_update_noop_when_present_with_same_hash() -> None:
