@@ -3,6 +3,7 @@
 Discovery uses real temp git repos (cheap); GitHub lookups use a MockTransport.
 """
 
+import json
 import time
 import subprocess
 from datetime import datetime
@@ -197,6 +198,7 @@ def test_no_token_marks_auth_absent(tmp_path):
 
 def _gql_node(number=7, state="OPEN", merged=False, draft=False, decision="APPROVED"):
     return {
+        "id": f"PR_{number}",
         "number": number,
         "title": "t",
         "url": f"https://github.com/o/r/pull/{number}",
@@ -240,11 +242,24 @@ def _gql_node(number=7, state="OPEN", merged=False, draft=False, decision="APPRO
     }
 
 
-def _rich_transport(nodes, *, etag='W/"v1"', remaining=5000, errors=None, gql=None):
+def _alias_repo(request, by_branch):
+    """Build the batched-query ``repository`` from the posted variables: one
+    aliased connection (``b0``/``b1``/...) per requested branch. ``by_branch`` maps
+    a branch name to its PR nodes; a missing branch yields an empty connection."""
+    variables = json.loads(request.content.decode()).get("variables", {})
+    repo = {}
+    for alias, branch in variables.items():
+        if alias.startswith("b"):
+            repo[alias] = {"nodes": by_branch.get(branch, [])}
+    return repo
+
+
+def _rich_transport(nodes, *, etag='W/"v1"', remaining=5000, errors=None, gql=None, branch="feature"):  # noqa: PLR0913
     """Combined transport for the token path: a REST conditional probe (GET) then
-    a GraphQL query (POST). The REST probe answers 304 when the caller already
-    holds ``etag`` (no change), else 200 with a one-PR list (changed). ``gql`` is
-    an optional capture list for the GraphQL requests."""
+    a batched GraphQL query (POST). The REST probe answers 304 when the caller
+    already holds ``etag`` (no change), else 200 with a one-PR list (changed). The
+    GraphQL response aliases ``nodes`` under whichever branch(es) the query asked
+    for. ``gql`` is an optional capture list for the GraphQL requests."""
 
     def handler(request):
         if str(request.url).endswith("/graphql"):
@@ -255,7 +270,7 @@ def _rich_transport(nodes, *, etag='W/"v1"', remaining=5000, errors=None, gql=No
             body = {
                 "data": {
                     "rateLimit": {"cost": 1, "remaining": remaining, "resetAt": "x"},
-                    "repository": {"pullRequests": {"nodes": nodes}},
+                    "repository": _alias_repo(request, {branch: nodes}),
                 }
             }
             return httpx.Response(200, json=body)
@@ -410,7 +425,7 @@ def test_graphql_keeps_partial_data_with_rate_limit_error(tmp_path):
         body = {
             "data": {
                 "rateLimit": {"cost": 1, "remaining": 10, "resetAt": "x"},
-                "repository": {"pullRequests": {"nodes": [_gql_node(number=99)]}},
+                "repository": _alias_repo(request, {"feature": [_gql_node(number=99)]}),
             },
             "errors": [{"type": "RATE_LIMITED", "message": "slow down"}],
         }
@@ -465,10 +480,12 @@ def test_known_reset_marks_notice_reset_known(tmp_path):
 
     # 200 with data but a near-spent budget and a real resetAt: arms a known reset.
     def handler(request):
+        if not str(request.url).endswith("/graphql"):
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
         body = {
             "data": {
                 "rateLimit": {"remaining": 10, "resetAt": reset_at},
-                "repository": {"pullRequests": {"nodes": [_gql_node(number=7)]}},
+                "repository": _alias_repo(request, {"feature": [_gql_node(number=7)]}),
             }
         }
         return httpx.Response(200, json=body)
@@ -478,3 +495,249 @@ def test_known_reset_marks_notice_reset_known(tmp_path):
     assert notice is not None
     assert notice["reset_known"] is True
     assert notice["seconds"] > 0
+
+
+# --- cross-key GraphQL batching (#25) ---
+
+
+def _batched_handler(by_branch, *, gql=None, etag='W/"v1"'):
+    """Token-path transport whose GraphQL response aliases per-branch nodes from
+    ``by_branch`` (keyed by branch name), so several same-repo branches resolve
+    from one batched query."""
+
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            if gql is not None:
+                gql.append(request)
+            body = {
+                "data": {
+                    "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                    "repository": _alias_repo(request, by_branch),
+                }
+            }
+            return httpx.Response(200, json=body)
+        if request.headers.get("If-None-Match") == etag:
+            return httpx.Response(304)
+        return httpx.Response(200, headers={"ETag": etag}, json=[_pull()])
+
+    return httpx.MockTransport(handler)
+
+
+def test_same_repo_branches_share_one_graphql_query(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "a", branch="b1")
+    _make_repo(ws / "b", branch="b2")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    gql = []
+    transport = _batched_handler({"b1": [_gql_node(number=1)], "b2": [_gql_node(number=2)]}, gql=gql)
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    # Two branches of one repo collapse into ONE batched GraphQL query, not two,
+    # and each alias normalizes back to its own branch.
+    assert len(gql) == 1
+    nums = sorted(r["pulls"][0]["number"] for r in snap["sessions"][0]["repos"] if r["pulls"])
+    assert nums == [1, 2]
+
+
+def test_partial_alias_failure_isolates_to_its_key(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "a", branch="b1")
+    _make_repo(ws / "b", branch="b2")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    # Seed both branches' rich cache (numbers 1 and 2).
+    refresh.build_snapshot(
+        sessions, env=_Env(), transport=_batched_handler({"b1": [_gql_node(number=1)], "b2": [_gql_node(number=2)]})
+    )
+
+    # Forced refresh where the b2-branch alias (b1, by sorted order) errors via
+    # errors[].path while the b1-branch alias (b0) returns fresh data.
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            body = {
+                "data": {
+                    "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                    "repository": {"b0": {"nodes": [_gql_node(number=11)]}, "b1": None},
+                },
+                "errors": [{"type": "SERVICE", "message": "boom", "path": ["repository", "b1"]}],
+            }
+            return httpx.Response(200, json=body)
+        return httpx.Response(200, headers={"ETag": 'W/"v2"'}, json=[_pull()])
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler), force=True)
+    by_branch = {r["branch"]: r for r in snap["sessions"][0]["repos"]}
+    assert by_branch["b1"]["pulls"][0]["number"] == 11  # good alias refreshed
+    assert by_branch["b2"]["pulls"][0]["number"] == 2  # failed alias kept its stale cache, isolated
+
+
+def test_many_branches_chunk_into_multiple_queries(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    count = refresh.MAX_GRAPHQL_ALIASES + 2
+    for i in range(count):
+        _make_repo(ws / f"r{i}", branch=f"feat{i}")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    gql = []
+    refresh.build_snapshot(sessions, env=_Env(), transport=_batched_handler({}, gql=gql))
+    # More branches than the alias cap split across multiple serial queries.
+    assert len(gql) == 2
+
+
+# --- state-aware staleness (#26) ---
+
+
+def _running_node(number=7):
+    node = _gql_node(number=number, decision=None)
+    node["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {
+        "state": "PENDING",
+        "contexts": {
+            "nodes": [
+                {"__typename": "CheckRun", "name": "ci", "status": "IN_PROGRESS", "conclusion": None, "detailsUrl": "u"}
+            ]
+        },
+    }
+    return node
+
+
+def _age_cache(seconds):
+    for entry in refresh._graphql_cache.values():
+        entry["fetched_at"] -= seconds
+
+
+def test_active_ci_refreshes_before_the_300s_ceiling(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    gql = []
+    transport = _rich_transport([_running_node(7)], gql=gql)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1
+    # Past the short active ceiling but far under 300s; REST still 304. A running
+    # check means the cache is active, so GraphQL re-fires to catch the CI result.
+    _age_cache(refresh.GRAPHQL_ACTIVE_STALE + 1)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 2
+
+
+def test_terminal_state_holds_cache_until_the_300s_ceiling(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    gql = []
+    transport = _rich_transport([_gql_node(number=7)], gql=gql)  # SUCCESS check, approved -> terminal
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1
+    # Same age, but a terminal cache is not active, so the short ceiling does not
+    # apply and a 304 holds the cache (no GraphQL) until the 300s ceiling.
+    _age_cache(refresh.GRAPHQL_ACTIVE_STALE + 1)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1
+
+
+def test_waiting_review_is_not_treated_as_active(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    node = _gql_node(number=7, decision=None)
+    node["commits"]["nodes"] = []  # no checks -> checks is None
+    node["reviewThreads"]["nodes"] = []  # no unresolved threads -> review_state waiting
+    gql = []
+    transport = _rich_transport([node], gql=gql)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1
+    # Awaiting review (no running CI) is NOT active: it must not burn a GraphQL
+    # query every tick, so the short ceiling does not apply.
+    _age_cache(refresh.GRAPHQL_ACTIVE_STALE + 1)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1
+
+
+# --- reviewThreads pagination (#28) ---
+
+
+def _thread(path, body, resolved=False):
+    return {
+        "isResolved": resolved,
+        "path": path,
+        "line": 1,
+        "comments": {"nodes": [{"author": {"login": "al"}, "bodyText": body, "url": f"https://c/{path}"}]},
+    }
+
+
+def test_review_threads_paginate_beyond_the_first_page(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    base = _gql_node(number=7)
+    base["reviewThreads"] = {
+        "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+        "nodes": [_thread("a.py", "first")],
+    }
+
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            query = json.loads(request.content.decode())["query"]
+            if "$id: ID!" in query:  # follow-up page for one PR
+                page = {
+                    "data": {
+                        "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                        "node": {
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                "nodes": [_thread("b.py", "second")],
+                            }
+                        },
+                    }
+                }
+                return httpx.Response(200, json=page)
+            body = {
+                "data": {
+                    "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                    "repository": _alias_repo(request, {"feature": [base]}),
+                }
+            }
+            return httpx.Response(200, json=body)
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
+    comments = snap["sessions"][0]["repos"][0]["pulls"][0]["comments"]
+    # Both pages' unresolved comments surface, not just the first page.
+    assert comments["unresolved"] == 2
+    assert [c["path"] for c in comments["items"]] == ["a.py", "b.py"]
+
+
+def test_thread_pagination_stops_and_backs_off_on_rate_limit(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    base = _gql_node(number=7)
+    base["reviewThreads"] = {
+        "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+        "nodes": [_thread("a.py", "first")],
+    }
+
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            query = json.loads(request.content.decode())["query"]
+            if "$id: ID!" in query:  # follow-up page hits a secondary rate limit
+                return httpx.Response(200, json={"errors": [{"type": "RATE_LIMITED", "message": "slow down"}]})
+            body = {
+                "data": {
+                    "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                    "repository": _alias_repo(request, {"feature": [base]}),
+                }
+            }
+            return httpx.Response(200, json=body)
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
+    comments = snap["sessions"][0]["repos"][0]["pulls"][0]["comments"]
+    # The first page survives (never blanked) and the rate limit arms the backoff.
+    assert comments["unresolved"] == 1
+    assert [c["path"] for c in comments["items"]] == ["a.py"]
+    assert refresh._backoff["until"] > time.monotonic()

@@ -18,8 +18,8 @@ def _pr(decision=None, reviews=(), threads=(), rollup=None):
     }
 
 
-def _data(*prs):
-    return {"repository": {"pullRequests": {"nodes": list(prs)}}}
+def _conn(*prs):
+    return {"nodes": list(prs)}
 
 
 def _rollup(state, contexts):
@@ -100,11 +100,12 @@ def test_excerpt_collapses_and_truncates():
     assert out.endswith("…")
 
 
-def test_normalize_pulls_is_total_on_garbage():
-    assert graphql.normalize_pulls({}) == []
-    assert graphql.normalize_pulls({"repository": None}) == []
-    assert graphql.normalize_pulls({"rateLimit": {"remaining": 1}}) == []  # no repository key
-    pulls = graphql.normalize_pulls(_data(_pr(decision="APPROVED", rollup=_rollup("SUCCESS", []))))
+def test_normalize_connection_is_total_on_garbage():
+    assert graphql.normalize_connection({}) == []
+    assert graphql.normalize_connection(None) == []
+    assert graphql.normalize_connection({"nodes": None}) == []
+    assert graphql.normalize_connection({"nodes": ["junk", 3]}) == []
+    pulls = graphql.normalize_connection(_conn(_pr(decision="APPROVED", rollup=_rollup("SUCCESS", []))))
     assert pulls[0]["review_state"] == "approved"
     assert pulls[0]["checks"]["state"] == "succeeded"
 
@@ -123,7 +124,30 @@ def test_normalize_pull_with_no_commit_or_threads_does_not_raise():
         "reviews": {"nodes": []},
         "reviewThreads": {"nodes": []},
     }
-    out = graphql.normalize_pulls(_data(pr))[0]
+    out = graphql.normalize_connection(_conn(pr))[0]
     assert out["checks"] is None
     assert out["review_state"] == "waiting"
     assert out["comments"] == {"unresolved": 0, "items": []}
+
+
+def test_build_query_aliases_each_branch_with_variables():
+    q = graphql.build_query(3)
+    # One typed variable + one aliased field per branch, sharing the fragment.
+    for i in range(3):
+        assert f"$b{i}: String!" in q
+        assert f"b{i}: pullRequests(" in q
+        assert f"headRefName: $b{i}" in q
+    assert "fragment PRConnection on PullRequestConnection" in q
+    assert "reviewThreads(first: 100)" in q
+    assert "pageInfo { hasNextPage endCursor }" in q
+
+
+def test_build_query_single_alias_is_just_one_branch():
+    q = graphql.build_query(1)
+    assert "$b0: String!" in q
+    assert "$b1" not in q
+
+
+def test_build_query_floors_at_one_alias():
+    # A zero/negative count never yields an empty, malformed document.
+    assert "b0: pullRequests(" in graphql.build_query(0)

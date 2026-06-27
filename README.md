@@ -94,10 +94,13 @@ Beyond answering requests, the worker proactively drives the UI. On startup, on
    limits. With a token the per-branch lookup is a cheap REST conditional check
    first (see "Rate limits" below); only when that reports a change (or on a
    forced refresh, or when the cached rich data has aged out) does it spend a
-   single GraphQL query for the rich state (PR state incl. MERGED,
-   `reviewDecision`, the head commit's check rollup + per-check runs, and review
-   threads with their resolved flag and first comment). Without a token it is the
-   basic REST open-PR lookup only.
+   GraphQL query for the rich state (PR state incl. MERGED, `reviewDecision`, the
+   head commit's check rollup + per-check runs, and every unresolved review
+   thread with its first comment). Branches of the same repo that need a fresh
+   fetch are aliased into one batched GraphQL query rather than one per branch, so
+   a workspace of many worktrees of one repo costs a single query (split into a
+   few once it exceeds the per-query alias cap). Without a token it is the basic
+   REST open-PR lookup only.
 4. Push two `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- one
    colored, clickable PR icon per repo with an OPEN/draft PR; merged-only repos
    are omitted, since the badge is an actionable indicator) and a `pane`
@@ -113,22 +116,27 @@ can. A REST conditional request (ETag / `If-None-Match`) is the primary poll: a
 `304 Not Modified` means nothing changed and does NOT count against the primary
 rate limit, so a steady state where nothing changed costs ~0. GraphQL (which has
 no `304`) fires only when the conditional check reports a change, on a forced
-refresh, or when the cached rich result is older than a 300s freshness ceiling.
-That ceiling exists because the `/pulls` list ETag does not reliably bump when a
-CI check completes or a review thread changes, so CI/review state could otherwise
-go stale indefinitely between PR-list changes; with it, that state refreshes
-within ~5 min (or immediately when you click Refresh). The GraphQL query reads
-`rateLimit { cost remaining resetAt }` and trips a short backoff (serving the
-last-good cached result, honoring `resetAt`) when the budget runs low or a
-`403`/`429`/`RATE_LIMITED` is returned.
+refresh, or when the cached rich result is older than its freshness ceiling. That
+ceiling exists because the `/pulls` list ETag does not reliably bump when a CI
+check completes or a review thread changes, so CI/review state could otherwise go
+stale indefinitely between PR-list changes. It is state-aware: a branch whose
+cached state is active (a CI check running or queued) uses a short ceiling so a
+finishing CI run shows up on the next tick, while a terminal or awaiting-review
+branch uses the 300s ceiling (awaiting review can sit idle for days, so polling it
+every tick would waste budget). Either way a click on Refresh updates immediately.
+The GraphQL query reads `rateLimit { cost remaining resetAt }` and trips a short
+backoff (serving the last-good cached result, honoring `resetAt`) when the budget
+runs low or a `403`/`429`/`RATE_LIMITED` is returned.
 
-Worst-case math (every key changes every tick, so each spends one REST + one
-GraphQL query): for N unique `(owner, repo, branch)` keys at a T-second network
-tick, that is `N * 3600 / T` of each per hour. At the 120s default, a 20-key
-workspace tops out around 600 REST req/hr and ~600 GraphQL queries/hr (the
-trimmed query costs a low single-digit `rateLimit.cost`), both a small fraction
-of 5000/hr. The realistic steady state is far cheaper: most ticks are a `304`, so
-the REST cost is ~0 and no GraphQL fires. The fast local session tick (a couple
+Worst-case math (every key changes every tick, so each spends one REST request,
+and same-repo branches batch into one GraphQL query per repo): for N unique
+`(owner, repo, branch)` keys at a T-second network tick, that is `N * 3600 / T`
+REST req/hr; the GraphQL queries scale with the number of distinct repos (each
+capped at `MAX_GRAPHQL_ALIASES` branches per query), not N. At the 120s default,
+a 20-worktree single-repo workspace tops out around 600 REST req/hr but only ~60
+GraphQL queries/hr (two batched queries per tick), both a small fraction of
+5000/hr. The realistic steady state is far cheaper: most ticks are a `304`, so the
+REST cost is ~0 and no GraphQL fires. The fast local session tick (a couple
 seconds, no network) is separate and unaffected by `ui_refresh_secs`.
 
 When a user-initiated refresh (the pane's Refresh action) hits an active backoff,
