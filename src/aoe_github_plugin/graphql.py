@@ -21,12 +21,23 @@ from typing import Any
 # the head ref NAME, so a merged PR still resolves after its remote branch is
 # deleted (unlike ref(qualifiedName:), which would be null). Connections are
 # capped so a pathological PR cannot blow past the host's 8KB/entry payload cap.
+#
+# Counts are sized to what the pane actually renders (#23), to keep the GraphQL
+# point cost low now that this query fires only on a detected change (#21):
+# - pullRequests first:3 (a branch rarely has more than one open + one merged PR);
+# - reviews last:1, states:[COMMENTED] (review_state only needs to know whether a
+#   COMMENTED review exists; APPROVED/CHANGES_REQUESTED come from reviewDecision);
+# - reviewThreads first:20 (the pane caps unresolved comments at 10).
+# contexts stays at first:50 ON PURPOSE: the per-check rows are ranked
+# failure-first CLIENT-side (see check_summary), so truncating the connection
+# could drop a failing check past the cap and render a PR falsely green.
+# rateLimit.cost is requested so the per-query budget can be verified (#23).
 QUERY = """
 query($owner: String!, $repo: String!, $branch: String!) {
-  rateLimit { remaining resetAt }
+  rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $repo) {
     pullRequests(
-      headRefName: $branch, states: [OPEN, MERGED], first: 5,
+      headRefName: $branch, states: [OPEN, MERGED], first: 3,
       orderBy: {field: UPDATED_AT, direction: DESC}
     ) {
       nodes {
@@ -36,8 +47,8 @@ query($owner: String!, $repo: String!, $branch: String!) {
           ... on CheckRun { name status conclusion detailsUrl }
           ... on StatusContext { context state targetUrl }
         } } } } } }
-        reviews(last: 20, states: [COMMENTED, APPROVED, CHANGES_REQUESTED]) { nodes { state } }
-        reviewThreads(first: 50) { nodes {
+        reviews(last: 1, states: [COMMENTED]) { nodes { state } }
+        reviewThreads(first: 20) { nodes {
           isResolved path line
           comments(first: 1) { nodes { author { login } bodyText url } }
         } }
