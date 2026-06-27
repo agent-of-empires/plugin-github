@@ -11,7 +11,7 @@
 
 id = "agent-of-empires.github"
 name = "GitHub"
-version = "1.1.0"
+version = "1.2.0"
 # Manifest schema / host API version. Host supports 1..=4.
 api_version = 4
 # Host-app compatibility range (different axis from api_version, which is the
@@ -89,20 +89,28 @@ id = "github_pane"
 # Tier 1 worker: the executable the host spawns and supervises, speaking
 # ndjson JSON-RPC over stdio. The host requires the entrypoint to be
 # plugin-relative so the daemon's PATH never decides whether the worker
-# launches (#2406): the build steps create an in-tree venv and install this
-# package into it (defining the `aoe-github-worker` console script from
-# pyproject.toml [project.scripts]), then `command` launches it from `.venv`.
+# launches (#2406): the build steps create a venv and install this package
+# into it (defining the `aoe-github-worker` console script from
+# pyproject.toml [project.scripts]), then `command` launches it.
 # Build steps run in the user's interactive shell at install/update, where
 # PATH is reliable, so `python3` resolves there. Scoped to posix: the
-# `.venv/bin` layout (and this plugin's testing) is macOS/Linux.
+# `bin/` venv layout (and this plugin's testing) is macOS/Linux.
+#
+# The venv MUST live under `.aoe-build/` (the host's BUILD_OUTPUT_DIR),
+# which the host excludes from the plugin tree_hash. A venv contains
+# symlinks (e.g. bin/python3), and tree_hash hard-errors on symlinks. An
+# earlier `.venv` in the source root passed the install-time featured-pin
+# check (clean downloaded tree) but bricked at load: the load-time re-hash
+# tripped over the symlink, so the manifest no longer verified as Featured
+# and the reserved-namespace gate skipped the plugin.
 [runtime]
 kind = "command"
-command = [".venv/bin/aoe-github-worker"]
+command = [".aoe-build/venv/bin/aoe-github-worker"]
 
 [[runtime.build]]
-command = ["python3", "-m", "venv", ".venv"]
+command = ["python3", "-m", "venv", ".aoe-build/venv"]
 platforms = ["linux", "macos"]
 
 [[runtime.build]]
-command = [".venv/bin/pip", "install", "."]
+command = [".aoe-build/venv/bin/pip", "install", "."]
 platforms = ["linux", "macos"]

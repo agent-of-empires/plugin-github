@@ -47,6 +47,7 @@ explicit_package_bases = true
 
 [tool.ruff]
 exclude = [
+    ".aoe-build",
     ".bzr",
     ".direnv",
     ".eggs",
