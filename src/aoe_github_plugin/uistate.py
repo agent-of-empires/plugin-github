@@ -177,7 +177,7 @@ def _review_row(review: Any) -> dict[str, Any] | None:
 def _checks_section(checks: Any) -> dict[str, Any] | None:
     if not isinstance(checks, dict):
         return None
-    _, _, rollup_label = _CHECK_VISUAL.get(checks.get("state") or "", _CHECK_VISUAL["unknown"])
+    rollup_icon, rollup_tone, rollup_label = _CHECK_VISUAL.get(checks.get("state") or "", _CHECK_VISUAL["unknown"])
     runs = checks.get("runs") or []
     children: list[dict[str, Any]] = []
     for run in runs[:_MAX_CHECK_ROWS]:
@@ -195,7 +195,15 @@ def _checks_section(checks: Any) -> dict[str, Any] | None:
     title = f"Checks: {rollup_label}"
     if len(runs) > _MAX_CHECK_ROWS:
         title += f" ({len(runs)} total)"
-    section: dict[str, Any] = {"kind": "section", "title": title, "children": children, "collapsible": True}
+    # Icon + tone on the title give an at-a-glance rollup state even when folded.
+    section: dict[str, Any] = {
+        "kind": "section",
+        "title": title,
+        "children": children,
+        "collapsible": True,
+        "icon": rollup_icon,
+        "tone": rollup_tone,
+    }
     # Fold when everything passed; stay open when something needs attention
     # (failing/running/queued/unknown) so the actionable rows are visible.
     if checks.get("state") == "succeeded":

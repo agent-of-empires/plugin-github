@@ -171,6 +171,9 @@ def test_pane_renders_review_checks_and_comments():
     checks_section = next(s for s in sections if s["title"].startswith("Checks"))
     assert checks_section["children"][0]["label"] == "test"
     assert checks_section["children"][0]["tone"] == "danger"
+    # The section title carries the rollup's icon + tone for an at-a-glance state.
+    assert checks_section["icon"] == "circle-x"
+    assert checks_section["tone"] == "danger"
     comments_section = next(s for s in sections if s["title"].startswith("Unresolved comments"))
     comment = comments_section["children"][0]
     assert comment["kind"] == "comment"
