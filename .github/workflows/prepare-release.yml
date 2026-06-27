@@ -68,10 +68,16 @@ jobs:
 
       - name: Bump package version
         run: |
-          # Single source of truth: __version__ in the package __init__.
+          # Two version strings must move together: __version__ in the package
+          # __init__ (the pip/dist version, read dynamically by hatch) and the
+          # manifest `version` the host shows at install. Keep them in lockstep
+          # so the displayed install version is not stale (anchor ^version to
+          # avoid touching api_version / aoe_version).
           init="src/aoe_github_plugin/__init__.py"
           sed -i -E "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" "$init"
+          sed -i -E "s/^version = \".*\"/version = \"$VERSION\"/" aoe-plugin.toml
           grep '^__version__' "$init"
+          grep '^version = ' aoe-plugin.toml
 
       - name: Update CHANGELOG.md
         env:
@@ -103,7 +109,7 @@ jobs:
             echo
             echo "- [ ] Version bump is appropriate for the change set"
             echo "- [ ] CI is green"
-            echo "- [ ] Ready to ship — merge to publish"
+            echo "- [ ] Ready to ship; merge to publish"
           } > /tmp/pr-body.md
 
       - name: Commit and push branch
@@ -111,7 +117,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "release-staging/v$VERSION"
-          git add src/aoe_github_plugin/__init__.py CHANGELOG.md
+          git add src/aoe_github_plugin/__init__.py aoe-plugin.toml CHANGELOG.md
           git commit -m "chore: release v$VERSION"
           git push -u origin "release-staging/v$VERSION"
 

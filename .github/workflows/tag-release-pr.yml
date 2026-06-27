@@ -59,6 +59,18 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Verify manifest version matches package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # The manifest `version` is what the host shows at install; it must
+          # track __version__ or installs report a stale number. Catches drift
+          # on any path (automated or hand-rolled release PR).
+          MANIFEST="$(grep -E '^version = ' aoe-plugin.toml | head -1 | sed -E 's/^version = "([^"]+)"/\1/')"
+          if [ "$MANIFEST" != "$VERSION" ]; then
+            echo "::error::aoe-plugin.toml version ($MANIFEST) disagrees with __init__.py ($VERSION). Bump both. Refusing to tag."
+            exit 1
+          fi
+
       - name: Cross-check PR body marker
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
