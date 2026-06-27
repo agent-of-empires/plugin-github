@@ -235,17 +235,20 @@ def _graphql_no_repository(
     return []
 
 
-def _fetch_key_graphql(client: GitHubClient, key: RepoKey) -> list[dict[str, Any]]:
+def _fetch_key_graphql(client: GitHubClient, key: RepoKey, *, force: bool = False) -> list[dict[str, Any]]:
     """Rich PR data for one ``(owner, repo, branch)`` via GraphQL. Serves the
     per-key TTL cache, honors the backoff gate, and prefers any usable response
     data (a GraphQL partial success is kept, not discarded). Raises
-    ``GitHubError`` only when there is nothing to fall back on."""
+    ``GitHubError`` only when there is nothing to fall back on. ``force`` skips
+    the TTL freshness check (a user-initiated refresh wants live CI/review data,
+    not a cache hit) while still respecting the backoff gate and stale fallback,
+    so it never hammers a rate-limited API."""
     owner, repo, branch = key
     now = time.monotonic()
     with _cache_lock:
         cached = _graphql_cache.get(key)
         blocked = now < _backoff["until"]
-    if cached is not None and (now - cached["fetched_at"]) < GRAPHQL_TTL:
+    if not force and cached is not None and (now - cached["fetched_at"]) < GRAPHQL_TTL:
         return cached["pulls"]
     if blocked:
         if cached is not None:
@@ -280,18 +283,22 @@ def _fetch_all(
     keys: set[RepoKey],
     env: TokenEnvironment | None,
     transport: httpx.BaseTransport | None,
+    *,
+    force: bool = False,
 ) -> tuple[dict[RepoKey, dict[str, Any]], bool]:
     """Fetch every unique key concurrently. Returns ``(results, token_present)``
     where results is ``key -> {"pulls": [...]}`` or ``key -> {"error": {...}}``.
     With a token, each key is fetched via the rich GraphQL path; without one we
     keep the REST open-PR path and report ``token_present=False`` so the UI can
-    show the "token needed" banner. httpx.Client is safe to share across the
-    pool threads; none of them touch stdin or host RPCs."""
+    show the "token needed" banner. ``force`` bypasses the GraphQL TTL on the
+    token path (a manual refresh); the REST path always revalidates via ETag so
+    it ignores the flag. httpx.Client is safe to share across the pool threads;
+    none of them touch stdin or host RPCs."""
     if not keys:
         return {}, True
     token = _resolve_optional_token(env)
     present = token is not None
-    fetch = _fetch_key_graphql if present else _fetch_key
+    fetch = (lambda c, k: _fetch_key_graphql(c, k, force=force)) if present else _fetch_key
     with GitHubClient(token=token, transport=transport) as client:
 
         def one(key: RepoKey) -> tuple[RepoKey, dict[str, Any]]:
@@ -310,6 +317,8 @@ def build_snapshot(
     sessions: list[dict[str, Any]],
     env: TokenEnvironment | None = None,
     transport: httpx.BaseTransport | None = None,
+    *,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Assemble the aggregate snapshot from a host ``sessions.list`` result.
 
@@ -317,9 +326,10 @@ def build_snapshot(
     "auth": {"present": bool}}`` where each repo is
     ``{path, name, repo, branch, pulls, error}``. With a token the pulls carry
     rich fields (state/merged/review_state/checks/comments); without one they
-    are the basic REST shape and ``auth.present`` is ``False``. Pure of IO side
-    effects on the host channel; only filesystem + GitHub HTTP. ``env`` and
-    ``transport`` are test seams.
+    are the basic REST shape and ``auth.present`` is ``False``. ``force`` bypasses
+    the GraphQL TTL so a user-initiated refresh fetches live CI/review data. Pure
+    of IO side effects on the host channel; only filesystem + GitHub HTTP. ``env``
+    and ``transport`` are test seams.
     """
     per_session: list[tuple[dict[str, Any], list[str]]] = []
     for session in sessions:
@@ -341,7 +351,7 @@ def build_snapshot(
             if key is not None:
                 keys.add(key)
 
-    fetched, auth_present = _fetch_all(keys, env, transport)
+    fetched, auth_present = _fetch_all(keys, env, transport, force=force)
 
     out_sessions: list[dict[str, Any]] = []
     for session, checkouts in per_session:

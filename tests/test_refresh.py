@@ -304,6 +304,19 @@ def test_graphql_ttl_serves_cache_without_http(tmp_path):
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 7
 
 
+def test_force_bypasses_graphql_ttl(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh.build_snapshot(sessions, env=_Env(), transport=_gql_transport([_gql_node(number=7)]))
+
+    # A user-clicked refresh (force=True) must re-query within the TTL window
+    # and surface the live data, not the cached pull.
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=_gql_transport([_gql_node(number=8)]), force=True)
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 8
+
+
 def test_graphql_rate_limit_serves_stale(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
