@@ -5,6 +5,8 @@ import sys
 import json
 import subprocess
 
+from aoe_github_plugin import main
+
 
 def _run(*lines):
     """Run the worker and return (responses, pushes).
@@ -83,3 +85,51 @@ def test_startup_without_a_host_pushes_nothing():
     # there is no global slot.
     _, pushes = _run()
     assert pushes == []
+
+
+# --- rate-limit notification on forced refresh (issue #20) ---
+
+
+def _runtime_with_snapshot(monkeypatch, snapshot):
+    """A Runtime whose build_snapshot returns ``snapshot`` (when forced) and a
+    capture sink for the messages it sends."""
+    sent = []
+    rt = main.Runtime(send=sent.append)
+
+    def fake_build_snapshot(sessions, force=False):
+        out = {"sessions": [], "auth": {"present": True}}
+        if force and snapshot.get("rate_limit_notice") is not None:
+            out["rate_limit_notice"] = snapshot["rate_limit_notice"]
+        return out
+
+    monkeypatch.setattr(main.refresh, "build_snapshot", fake_build_snapshot)
+    return rt, sent
+
+
+def _notifies(sent):
+    return [m for m in sent if m.get("method") == "ui.notify"]
+
+
+def test_forced_refresh_emits_one_notify_with_countdown(monkeypatch):
+    rt, sent = _runtime_with_snapshot(monkeypatch, {"rate_limit_notice": {"seconds": 1800, "reset_known": True}})
+    rt.run_refresh(sessions=[], force=True)
+    notifies = _notifies(sent)
+    assert len(notifies) == 1
+    params = notifies[0]["params"]
+    assert params["tone"] == "warning"
+    assert params["title"] == "GitHub rate limited"
+    assert "Resets in" in params["body"]
+
+
+def test_forced_refresh_unknown_reset_is_generic(monkeypatch):
+    rt, sent = _runtime_with_snapshot(monkeypatch, {"rate_limit_notice": {"seconds": 60, "reset_known": False}})
+    rt.run_refresh(sessions=[], force=True)
+    notifies = _notifies(sent)
+    assert len(notifies) == 1
+    assert "Resets in" not in notifies[0]["params"]["body"]
+
+
+def test_background_refresh_emits_no_notify(monkeypatch):
+    rt, sent = _runtime_with_snapshot(monkeypatch, {"rate_limit_notice": {"seconds": 1800, "reset_known": True}})
+    rt.run_refresh(sessions=[], force=False)
+    assert _notifies(sent) == []

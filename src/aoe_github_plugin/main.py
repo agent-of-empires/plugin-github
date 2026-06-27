@@ -28,12 +28,15 @@ from __future__ import annotations
 import os
 import sys
 import json
+import math
 import time
 import queue
 import itertools
 import threading
 import contextlib
 from typing import Any
+from datetime import datetime
+from datetime import timedelta
 from collections.abc import Callable
 
 from aoe_github_plugin import refresh
@@ -46,6 +49,7 @@ Sink = Callable[[dict[str, Any]], None]
 
 UI_STATE_SET = "ui.state.set"
 UI_STATE_REMOVE = "ui.state.remove"
+UI_NOTIFY = "ui.notify"
 SESSIONS_LIST = "sessions.list"
 CONFIG_GET = "config.get"
 REFRESH_SETTING_KEY = "ui_refresh_secs"
@@ -108,6 +112,23 @@ def _env_interval() -> int:
         return max(0, int(raw))
     except ValueError:
         return DEFAULT_REFRESH_SECS
+
+
+def _rate_limit_notify_params(notice: dict[str, Any]) -> dict[str, Any]:
+    """``ui.notify`` params for a rate-limit backoff. Global (no ``session``): the
+    limit is token/IP-bound, not per-session. A known GraphQL reset gets a
+    countdown (``ceil`` minutes, clamped to >=1 so an active backoff never shows
+    "~0m", plus the local wall-clock time); the REST fallback has no real reset,
+    so it stays generic rather than quoting the fixed 60s throttle as fact."""
+    params: dict[str, Any] = {"tone": "warning", "title": "GitHub rate limited"}
+    if notice.get("reset_known"):
+        seconds = max(0.0, float(notice.get("seconds", 0.0)))
+        minutes = max(1, math.ceil(seconds / 60))
+        reset_at = datetime.now().astimezone() + timedelta(seconds=seconds)
+        params["body"] = f"Resets in ~{minutes}m ({reset_at.strftime('%H:%M')})."
+    else:
+        params["body"] = "GitHub rate limit hit; showing cached data. Retrying shortly."
+    return params
 
 
 class Runtime:
@@ -211,7 +232,8 @@ class Runtime:
         bad workspace, or a closed pipe never raises. Skips entirely (no prune)
         when the session list is unavailable, so a transient failure cannot wipe
         live UI. ``force`` bypasses the GraphQL TTL so a user-clicked refresh
-        fetches live CI/review data instead of a cache hit."""
+        fetches live CI/review data instead of a cache hit, and a rate-limited
+        forced refresh also emits one ``ui.notify`` with the reset countdown."""
         if sessions is None:
             sessions = self.list_sessions()
         if sessions is None:
@@ -242,6 +264,19 @@ class Runtime:
                         }
                     )
             self.pushed_session_ids = current_ids
+            # A forced refresh that hit a rate limit carries a one-shot notice
+            # (build_snapshot only adds it on force=True). Tell the user why the
+            # refresh showed no change, at most once per backoff window.
+            notice = snapshot.get("rate_limit_notice")
+            if notice:
+                self.send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": next(_outbound_ids),
+                        "method": UI_NOTIFY,
+                        "params": _rate_limit_notify_params(notice),
+                    }
+                )
 
     def resolve_interval(self) -> int:
         """Poll period in seconds. Precedence: the host-persisted
