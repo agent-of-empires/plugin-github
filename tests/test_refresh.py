@@ -5,6 +5,9 @@ Discovery uses real temp git repos (cheap); GitHub lookups use a MockTransport.
 
 import time
 import subprocess
+from datetime import datetime
+from datetime import timezone
+from datetime import timedelta
 
 import httpx
 import pytest
@@ -55,13 +58,14 @@ def _make_repo(path, remote="https://github.com/o/r.git", branch="feature"):
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
-    refresh._etag_cache.clear()
-    refresh._graphql_cache.clear()
-    refresh._backoff["until"] = 0.0
+    def _reset():
+        refresh._etag_cache.clear()
+        refresh._graphql_cache.clear()
+        refresh._backoff.update({"until": 0.0, "reset_known": False, "notified": False})
+
+    _reset()
     yield
-    refresh._etag_cache.clear()
-    refresh._graphql_cache.clear()
-    refresh._backoff["until"] = 0.0
+    _reset()
 
 
 def test_discovery_finds_child_checkouts_not_plain_dirs(tmp_path):
@@ -356,3 +360,62 @@ def test_graphql_keeps_partial_data_with_rate_limit_error(tmp_path):
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 99
     assert refresh._backoff["until"] > time.monotonic()
+
+
+# --- rate-limit notice (issue #20) ---
+
+
+def test_forced_refresh_during_backoff_emits_one_notice(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh.build_snapshot(sessions, env=_Env(), transport=_gql_transport([_gql_node(number=42)]))
+    _expire_graphql_cache()
+    # A GraphQL secondary rate limit on a forced refresh: serve stale + announce.
+    rl = _gql_transport([], errors=[{"type": "RATE_LIMITED", "message": "slow down"}])
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=rl, force=True)
+    notice = snap.get("rate_limit_notice")
+    assert notice is not None
+    assert notice["reset_known"] is False  # errors-only response carries no resetAt
+    # A second forced refresh in the same window must not re-announce.
+    snap2 = refresh.build_snapshot(sessions, env=_Env(), transport=rl, force=True)
+    assert "rate_limit_notice" not in snap2
+
+
+def test_background_refresh_never_emits_notice(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh._backoff.update({"until": time.monotonic() + 300, "reset_known": True, "notified": False})
+
+    def boom(request):
+        raise AssertionError("HTTP must not be called during backoff")
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(boom), force=False)
+    assert "rate_limit_notice" not in snap
+
+
+def test_known_reset_marks_notice_reset_known(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    reset_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+
+    # 200 with data but a near-spent budget and a real resetAt: arms a known reset.
+    def handler(request):
+        body = {
+            "data": {
+                "rateLimit": {"remaining": 10, "resetAt": reset_at},
+                "repository": {"pullRequests": {"nodes": [_gql_node(number=7)]}},
+            }
+        }
+        return httpx.Response(200, json=body)
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler), force=True)
+    notice = snap.get("rate_limit_notice")
+    assert notice is not None
+    assert notice["reset_known"] is True
+    assert notice["seconds"] > 0
