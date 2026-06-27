@@ -219,11 +219,11 @@ def test_passing_checks_section_starts_collapsed():
 
 
 def test_pane_payload_stays_under_host_size_cap():
-    # A many-repo workspace with long comments would blow the 8KB/entry host cap;
+    # A many-repo workspace with long comments would blow the 64KB/entry host cap;
     # the pane must trim to fit (and keep the heading + refresh action).
     big_comment = {
         "unresolved": 1,
-        "items": [{"author": "a", "body": "x" * 300, "path": "p.py", "line": 1, "resolved": False}],
+        "items": [{"author": "a", "body": "x" * 2000, "path": "p.py", "line": 1, "resolved": False}],
     }
     repos = [_repo(name=f"r{i}", repo=f"o/r{i}", pulls=[_rich_pull(comments=big_comment)]) for i in range(40)]
     pane = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos))))

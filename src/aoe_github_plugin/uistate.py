@@ -69,13 +69,15 @@ _CHECK_VISUAL: dict[str, tuple[str, str, str]] = {
     "unknown": ("circle-help", "neutral", "unknown"),
 }
 
-# Per-PR caps so one pathological PR cannot blow past the host's 8KB/entry limit.
+# Per-PR caps so one pathological PR cannot blow past the host's 64KB/entry limit.
 _MAX_CHECK_ROWS = 20
-_MAX_COMMENTS = 10
-# Whole-pane block budget (bytes of JSON), under the host's 8KB/entry cap. A pane
-# that would exceed it (a many-repo workspace) is trimmed to fit rather than
-# rejected wholesale by the host, which would blank the pane.
-_PANE_BUDGET = 7000
+# Generous cap: send every unresolved comment in practice, but keep a backstop
+# against a pathological PR. _fit_to_budget is the real size guard.
+_MAX_COMMENTS = 500
+# Whole-pane block budget (bytes of JSON), under the host's 64KB/entry cap (with
+# headroom). A pane that would exceed it (a many-repo workspace) is trimmed to
+# fit rather than rejected wholesale by the host, which would blank the pane.
+_PANE_BUDGET = 60000
 
 
 def _is_merged(pull: dict[str, Any]) -> bool:
