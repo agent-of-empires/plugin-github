@@ -67,7 +67,12 @@ _etag_cache: dict[RepoKey, dict[str, Any]] = {}  # key -> {"etag", "pulls"}
 # TTL window and is the stale fallback while rate-limited.
 _graphql_cache: dict[RepoKey, dict[str, Any]] = {}
 # Mutable holder (not a bare module float) so updating it needs no `global`.
-_backoff = {"until": 0.0}  # time.monotonic() seconds; HTTP is skipped until then
+#   until        - time.monotonic() seconds; HTTP is skipped until then.
+#   reset_known  - True iff `until` came from a parsed GraphQL `resetAt` (so the
+#                  countdown is real); False for the fixed REST fallback.
+#   notified     - whether this window's user-facing notice has been emitted, so
+#                  a user-initiated refresh announces a backoff at most once.
+_backoff: dict[str, Any] = {"until": 0.0, "reset_known": False, "notified": False}
 
 
 def _git(path: str, *args: str) -> str | None:
@@ -171,10 +176,50 @@ def _reset_to_monotonic(reset_at: Any) -> float | None:
 def _set_backoff(reset_at: Any = None) -> None:
     """Arm the shared backoff gate. Prefers the GraphQL response's ``resetAt``
     (so we wait exactly until the budget refills); falls back to a fixed window
-    for the REST path, which has no usable reset."""
+    for the REST path, which has no usable reset.
+
+    A fresh window (the previous one already expired) clears the ``notified``
+    flag so the next user-initiated refresh announces it once. Re-arming an
+    already-active window only extends the deadline and upgrades ``reset_known``;
+    it never shortens the wait, downgrades a real reset to the fallback, or
+    re-opens the notice (the fan-out threads call this repeatedly per window)."""
     until = _reset_to_monotonic(reset_at)
+    now = time.monotonic()
+    new_until = until if until is not None else now + BACKOFF_SECS
+    new_known = until is not None
     with _cache_lock:
-        _backoff["until"] = until if until is not None else time.monotonic() + BACKOFF_SECS
+        if now >= _backoff["until"]:  # fresh window
+            _backoff["until"] = new_until
+            _backoff["reset_known"] = new_known
+            _backoff["notified"] = False
+        else:  # extend the live window; never downgrade
+            _backoff["until"] = max(_backoff["until"], new_until)
+            _backoff["reset_known"] = _backoff["reset_known"] or new_known
+
+
+def _consume_rate_limit_notice() -> dict[str, Any] | None:
+    """Claim this backoff window's one user-facing notice. Returns
+    ``{"seconds", "reset_known"}`` the first time it is called while a backoff is
+    active and unannounced (then marks the window announced), else ``None``. Only
+    a user-initiated (forced) refresh consumes it; background ticks never do, so a
+    rate-limited workspace is not nagged on every poll."""
+    now = time.monotonic()
+    with _cache_lock:
+        until = _backoff["until"]
+        if now >= until or _backoff["notified"]:
+            return None
+        _backoff["notified"] = True
+        return {"seconds": until - now, "reset_known": _backoff["reset_known"]}
+
+
+def _forced_rate_limit_notice(*, force: bool) -> dict[str, Any]:
+    """The ``rate_limit_notice`` snapshot fragment for a forced refresh: a single
+    ``{"rate_limit_notice": {...}}`` when a backoff is active and unannounced,
+    else ``{}``. Background refreshes (``force=False``) never announce."""
+    if not force:
+        return {}
+    notice = _consume_rate_limit_notice()
+    return {"rate_limit_notice": notice} if notice is not None else {}
 
 
 def _fetch_key(client: GitHubClient, key: RepoKey) -> list[dict[str, Any]]:
@@ -327,7 +372,9 @@ def build_snapshot(
     ``{path, name, repo, branch, pulls, error}``. With a token the pulls carry
     rich fields (state/merged/review_state/checks/comments); without one they
     are the basic REST shape and ``auth.present`` is ``False``. ``force`` bypasses
-    the GraphQL TTL so a user-initiated refresh fetches live CI/review data. Pure
+    the GraphQL TTL so a user-initiated refresh fetches live CI/review data, and a
+    forced refresh that is rate-limited adds a one-shot ``rate_limit_notice``
+    (``{"seconds", "reset_known"}``) for the main loop to surface (issue #20). Pure
     of IO side effects on the host channel; only filesystem + GitHub HTTP. ``env``
     and ``transport`` are test seams.
     """
@@ -379,4 +426,11 @@ def build_snapshot(
                 "repos": repos,
             }
         )
-    return {"sessions": out_sessions, "auth": {"present": auth_present}}
+    # A forced refresh that is rate-limited carries a one-shot notice so the main
+    # loop can tell the user why nothing changed (issue #20); background ticks
+    # stay silent. See _forced_rate_limit_notice.
+    return {
+        "sessions": out_sessions,
+        "auth": {"present": auth_present},
+        **_forced_rate_limit_notice(force=force),
+    }

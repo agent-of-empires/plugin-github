@@ -33,9 +33,12 @@ description = "GitHub integration for Agent of Empires: surface PR and issue sta
 #                   published; runtime.worker is the closest mapping (events.*
 #                   and config.get use it). Re-pin on rebase if D9 names a
 #                   dedicated capability.
-# Both are in aoe_plugin_api::KNOWN_CAPABILITIES. Add later as the surface grows:
+#   notifications - the worker raises in-app notices via the `ui.notify` host
+#                   RPC: on a user-initiated refresh that is rate-limited it
+#                   warns the user, with the reset countdown (#20).
+# All are in aoe_plugin_api::KNOWN_CAPABILITIES. Add later as the surface grows:
 #   session.read  to correlate PRs/issues with active sessions
-capabilities = ["net", "runtime.worker", "session.read"]
+capabilities = ["net", "runtime.worker", "session.read", "notifications"]
 
 # Commands the plugin contributes (palette / CLI), namespaced by the host as
 # plugin.agent-of-empires.github.<id>. The command-id -> worker RPC mapping
