@@ -176,6 +176,11 @@ def test_pane_renders_review_checks_and_comments():
     assert comment["kind"] == "comment"
     assert comment["author"] == "al"
     assert comment["href"] == "https://c/1"
+    # Both sections fold; comments start collapsed (verbose), checks start open.
+    assert checks_section["collapsible"] is True
+    assert "collapsed" not in checks_section
+    assert comments_section["collapsible"] is True
+    assert comments_section["collapsed"] is True
 
 
 def test_pane_payload_stays_under_host_size_cap():

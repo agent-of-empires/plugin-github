@@ -195,7 +195,7 @@ def _checks_section(checks: Any) -> dict[str, Any] | None:
     title = f"Checks: {rollup_label}"
     if len(runs) > _MAX_CHECK_ROWS:
         title += f" ({len(runs)} total)"
-    return {"kind": "section", "title": title, "children": children}
+    return {"kind": "section", "title": title, "children": children, "collapsible": True}
 
 
 def _comment_block(item: dict[str, Any]) -> dict[str, Any]:
@@ -219,7 +219,15 @@ def _comments_section(comments: Any) -> dict[str, Any] | None:
         return None
     items = comments.get("items") or []
     children = [_comment_block(item) for item in items[:_MAX_COMMENTS]]
-    return {"kind": "section", "title": f"Unresolved comments: {comments['unresolved']}", "children": children}
+    # Collapsed by default: comment bodies are verbose, so fold them away until
+    # the user wants them; the count stays visible in the title.
+    return {
+        "kind": "section",
+        "title": f"Unresolved comments: {comments['unresolved']}",
+        "children": children,
+        "collapsible": True,
+        "collapsed": True,
+    }
 
 
 def _pull_detail_blocks(pull: dict[str, Any]) -> list[dict[str, Any]]:
