@@ -69,12 +69,14 @@ def test_check_summary_maps_runs_and_rollup():
     summary = graphql.check_summary(_pr(rollup=rollup))
     assert summary["state"] == "failing"
     states = [(r["name"], r["state"]) for r in summary["runs"]]
+    # Sorted failing -> running -> queued -> succeeded; GitHub's order is kept
+    # within a group (lint before legacy, both running).
     assert states == [
-        ("build", "succeeded"),
         ("test", "failing"),
         ("lint", "running"),
-        ("deploy", "queued"),
         ("legacy", "running"),
+        ("deploy", "queued"),
+        ("build", "succeeded"),
     ]
 
 

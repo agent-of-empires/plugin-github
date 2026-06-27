@@ -112,6 +112,9 @@ _STATUS_STATE = {
     "PENDING": "running",
     "EXPECTED": "running",
 }
+# Display order for the per-check rows: failing first (most actionable), then
+# in-flight, then done; anything unmapped sinks to the bottom.
+_STATE_RANK = {"failing": 0, "running": 1, "queued": 2, "succeeded": 3, "unknown": 4}
 
 
 def _context_state(ctx: dict[str, Any]) -> str:
@@ -143,6 +146,9 @@ def check_summary(pr: dict[str, Any]) -> dict[str, Any] | None:
             runs.append(
                 {"name": ctx.get("context") or "check", "state": _context_state(ctx), "url": ctx.get("targetUrl")}
             )
+    # Stable sort by state rank keeps GitHub's order within each group while
+    # surfacing failures at the top.
+    runs.sort(key=lambda r: _STATE_RANK.get(r["state"], 5))
     return {"state": _STATUS_STATE.get(rollup.get("state") or "", "unknown"), "runs": runs}
 
 
