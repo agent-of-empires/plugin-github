@@ -1,0 +1,106 @@
+name: Tag Release PR
+
+# Post-merge tagger for release-staging PRs (mirrors AoE core).
+#
+# Fires when a PR labeled `release-staging` from a `release-staging/v*` head
+# branch is merged into main. Checks out the merge commit, reads __version__
+# from the package, cross-checks it against the PR body's
+# `<!-- release-version: X.Y.Z -->` marker, and pushes an annotated `vX.Y.Z`
+# tag at github.event.pull_request.merge_commit_sha. The tag push triggers
+# release.yml.
+#
+# Why pull_request_target is OK here: the workflow does not execute PR code.
+# It checks out the already-merged commit on main and only reads __init__.py
+# and the PR body. No build steps run PR-authored content.
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  tag:
+    name: Tag merged release PR
+    if: >
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      startsWith(github.event.pull_request.head.ref, 'release-staging/v') &&
+      contains(github.event.pull_request.labels.*.name, 'release-staging')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          # PAT so the tag push triggers release.yml (a tag pushed with the
+          # default GITHUB_TOKEN does not fire downstream workflows).
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Extract version from __init__.py
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION="$(python3 - <<'PY'
+          import re
+          src = open("src/aoe_github_plugin/__init__.py").read()
+          m = re.search(r'^__version__ = "([^"]+)"', src, re.M)
+          assert m, "no __version__ found in src/aoe_github_plugin/__init__.py"
+          print(m.group(1))
+          PY
+          )"
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "::error::Invalid __init__.py version: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-check PR body marker
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # Marker shape: <!-- release-version: X.Y.Z -->
+          MARKER="$(printf '%s' "$PR_BODY" | grep -oE 'release-version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -1 | awk '{print $2}')"
+          if [ -z "$MARKER" ]; then
+            echo "::warning::No release-version marker in PR body; trusting __init__.py ($VERSION)"
+            exit 0
+          fi
+          if [ "$MARKER" != "$VERSION" ]; then
+            echo "::error::PR body marker ($MARKER) disagrees with __init__.py ($VERSION). Refusing to tag."
+            exit 1
+          fi
+
+      - name: Check remote tag does not exist
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists; aborting"
+            exit 1
+          fi
+
+      - name: Warn if main advanced after merge
+        run: |
+          MERGE_SHA="${{ github.event.pull_request.merge_commit_sha }}"
+          git fetch origin main
+          MAIN_SHA="$(git rev-parse origin/main)"
+          echo "Release merge SHA: $MERGE_SHA"
+          echo "Current origin/main: $MAIN_SHA"
+          if [ "$MERGE_SHA" != "$MAIN_SHA" ]; then
+            echo "::warning::main advanced after release PR merge; tagging $MERGE_SHA, not origin/main"
+          fi
+
+      - name: Create and push tag
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          SHA="${{ github.event.pull_request.merge_commit_sha }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" "$SHA" -m "Release $TAG"
+          git push origin "refs/tags/$TAG"
+          echo "Pushed $TAG -> $SHA"
+          echo "release.yml will pick this up via the v* tag trigger"

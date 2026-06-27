@@ -1,27 +1,38 @@
 name: Prepare Release
 
+# Opens a release-staging PR (mirrors AoE core's release-PR flow). A maintainer
+# dispatches this with a version; it bumps __version__, regenerates CHANGELOG.md,
+# and opens a PR on `release-staging/vX.Y.Z` labeled `release-staging`. Merging
+# that PR fires tag-release-pr.yml, which tags the merge commit and triggers
+# release.yml. Nothing is tagged or pushed to main here.
+
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g., 0.2.0) - without the "v" prefix'
+        description: 'Version to release (e.g., 1.1.0) - without the "v" prefix'
         required: true
         type: string
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
-  prepare:
-    name: Bump Version & Tag
+  open-pr:
+    name: Open release PR
     runs-on: ubuntu-latest
     # Required-reviewer gate: the `release` environment pauses the run until a
     # maintainer approves in the Actions UI, mirroring AoE core.
     environment: release
-    permissions:
-      contents: write
     # Hoist the input out of the shell bodies so it lands via $VERSION rather
     # than expanding inline (template-injection foot-gun).
     env:
       VERSION: ${{ github.event.inputs.version }}
     steps:
+      # RELEASE_TOKEN (a PAT) is used so the branch push + PR open come from a
+      # real user, which is what triggers checks.yml on the release PR. A PR
+      # opened with the default GITHUB_TOKEN would not fire `pull_request` runs.
       - uses: actions/checkout@v7
         with:
           ref: main
@@ -29,15 +40,10 @@ jobs:
           # git-cliff walks tag history, so fetch everything.
           fetch-depth: 0
 
-      - name: Install git-cliff
-        uses: taiki-e/install-action@v2.82.0
-        with:
-          tool: git-cliff
-
       - name: Validate version format
         run: |
           if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
-            echo "::error::Invalid version format: '$VERSION'. Expected semver like 0.2.0"
+            echo "::error::Invalid version format: '$VERSION'. Expected semver like 1.1.0"
             exit 1
           fi
 
@@ -47,6 +53,18 @@ jobs:
             echo "::error::Tag v$VERSION already exists"
             exit 1
           fi
+
+      - name: Check staging branch does not exist upstream
+        run: |
+          if git ls-remote --exit-code --heads origin "release-staging/v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Branch release-staging/v$VERSION already exists upstream; merge or delete it first"
+            exit 1
+          fi
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2.82.0
+        with:
+          tool: git-cliff
 
       - name: Bump package version
         run: |
@@ -66,13 +84,49 @@ jobs:
             echo "::error::git-cliff skipped commits due to parse errors. Fix the offending commit messages or extend cliff.toml's catch-all parser."
             exit 1
           fi
+          rm -f cliff-stderr.log
 
-      - name: Commit, tag, push
+      - name: Build PR body
+        run: |
+          # The release-version marker is cross-checked by tag-release-pr.yml.
+          {
+            echo "<!-- release-version: $VERSION -->"
+            echo
+            echo "Automated release-staging PR. **Merging this PR tags \`v$VERSION\` and publishes the release.**"
+            echo
+            echo "- Bumps \`__version__\` to \`$VERSION\`"
+            echo "- Regenerates \`CHANGELOG.md\` via git-cliff"
+            echo
+            echo "The \`release-version\` marker above must match \`__init__.py\`; the tagger refuses to tag on mismatch."
+            echo
+            echo "## Maintainer checklist"
+            echo
+            echo "- [ ] Version bump is appropriate for the change set"
+            echo "- [ ] CI is green"
+            echo "- [ ] Ready to ship — merge to publish"
+          } > /tmp/pr-body.md
+
+      - name: Commit and push branch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "release-staging/v$VERSION"
           git add src/aoe_github_plugin/__init__.py CHANGELOG.md
-          git commit -m "chore: bump version to $VERSION"
-          git tag "v$VERSION"
-          git push origin main "v$VERSION"
-          echo "Pushed commit and tag v$VERSION; the release workflow will trigger."
+          git commit -m "chore: release v$VERSION"
+          git push -u origin "release-staging/v$VERSION"
+
+      - name: Open PR + label
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          # Create the label on first run of a fresh repo so the PR open never fails.
+          gh label create release-staging \
+            --color "d93f0b" \
+            --description "Release-staging PRs auto-tagged on merge" \
+            --force >/dev/null 2>&1 || true
+          gh pr create \
+            --base main \
+            --head "release-staging/v$VERSION" \
+            --title "chore: release v$VERSION" \
+            --body-file /tmp/pr-body.md \
+            --label release-staging
