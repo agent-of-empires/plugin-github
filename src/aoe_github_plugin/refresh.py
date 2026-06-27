@@ -368,14 +368,23 @@ def _paginate_threads(client: GitHubClient, pull_node: dict[str, Any]) -> None:
     cursor = page.get("endCursor")
     try:
         while page.get("hasNextPage") and isinstance(cursor, str) and len(nodes) < MAX_REVIEW_THREADS:
+            with _cache_lock:
+                if time.monotonic() < _backoff["until"]:
+                    return  # the budget gate tripped (e.g. the batched query armed it); stop here
             data = client.post_graphql(graphql.THREADS_PAGE_QUERY, {"id": node_id, "cursor": cursor})
+            if _graphql_rate_limited(data):
+                _set_backoff(((data.get("data") or {}).get("rateLimit") or {}).get("resetAt"))
+                return
             conn = ((data.get("data") or {}).get("node") or {}).get("reviewThreads") or {}
             more = [n for n in (conn.get("nodes") or []) if isinstance(n, dict)]
             if not more:
                 break
-            nodes.extend(more)
+            nodes.extend(more[: MAX_REVIEW_THREADS - len(nodes)])  # never overshoot the cap on a full last page
             page = conn.get("pageInfo") or {}
             cursor = page.get("endCursor")
+    except RateLimitedError:
+        _set_backoff()
+        return
     except GitHubError:
         return
 

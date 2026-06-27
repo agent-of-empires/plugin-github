@@ -708,3 +708,36 @@ def test_review_threads_paginate_beyond_the_first_page(tmp_path):
     # Both pages' unresolved comments surface, not just the first page.
     assert comments["unresolved"] == 2
     assert [c["path"] for c in comments["items"]] == ["a.py", "b.py"]
+
+
+def test_thread_pagination_stops_and_backs_off_on_rate_limit(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    base = _gql_node(number=7)
+    base["reviewThreads"] = {
+        "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+        "nodes": [_thread("a.py", "first")],
+    }
+
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            query = json.loads(request.content.decode())["query"]
+            if "$id: ID!" in query:  # follow-up page hits a secondary rate limit
+                return httpx.Response(200, json={"errors": [{"type": "RATE_LIMITED", "message": "slow down"}]})
+            body = {
+                "data": {
+                    "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                    "repository": _alias_repo(request, {"feature": [base]}),
+                }
+            }
+            return httpx.Response(200, json=body)
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
+    comments = snap["sessions"][0]["repos"][0]["pulls"][0]["comments"]
+    # The first page survives (never blanked) and the rate limit arms the backoff.
+    assert comments["unresolved"] == 1
+    assert [c["path"] for c in comments["items"]] == ["a.py"]
+    assert refresh._backoff["until"] > time.monotonic()
