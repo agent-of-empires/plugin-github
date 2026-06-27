@@ -47,10 +47,13 @@ Installing prompts for the plugin's declared capabilities (`net`,
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
 At install/update the host runs the manifest's `[[runtime.build]]` steps in the
-plugin directory: create an in-tree `.venv` and `pip install .` into it. The
-worker then launches from the plugin-relative `.venv/bin/aoe-github-worker`, so
-the daemon's PATH never decides whether it starts (#2406). Build steps are
-scoped to macOS/Linux.
+plugin directory: create a venv under `.aoe-build/` and `pip install .` into it.
+The worker then launches from the plugin-relative
+`.aoe-build/venv/bin/aoe-github-worker`, so the daemon's PATH never decides
+whether it starts (#2406). The venv lives under `.aoe-build/` because the host
+excludes that directory from the plugin tree_hash; a venv contains symlinks,
+which tree_hash rejects, so building into the source root breaks the load-time
+hash check. Build steps are scoped to macOS/Linux.
 
 ### Methods
 
