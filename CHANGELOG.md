@@ -4,6 +4,21 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.2.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.2.0) - 2026-06-27
+
+
+
+### Bug Fixes
+
+- **runtime:** Build venv into .aoe-build, not the source root ([`44408f7`](https://github.com/agent-of-empires/plugin-github/commit/44408f713aee8444ac3b6c01a7e6ad372058c5fd))
+
+
+### Features
+
+- **refresh:** Batch same-repo GraphQL queries, state-aware staleness, surface all comments in [#32](https://github.com/agent-of-empires/plugin-github/pull/32) by [@Seluj78](https://github.com/Seluj78) ([`b7ffd5e`](https://github.com/agent-of-empires/plugin-github/commit/b7ffd5ea9115de37c414205c00b2ca47b3c9fed8))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v1.1.0...v1.2.0
 ## [1.1.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.1.0) - 2026-06-27
 
 
