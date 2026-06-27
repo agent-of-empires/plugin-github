@@ -89,11 +89,15 @@ Beyond answering requests, the worker proactively drives the UI. On startup, on
    worktree's `.git` is a file, so discovery asks `git rev-parse --show-toplevel`
    rather than looking for a `.git` directory).
 3. Resolve each checkout to `(owner, repo, branch)`, deduplicate (a branch shared
-   across workspaces is fetched once), and look up its PRs concurrently. With a
-   token the lookup is a single GitHub GraphQL query per branch that returns the
-   rich state (PR state incl. MERGED, `reviewDecision`, the head commit's check
-   rollup + per-check runs, and review threads with their resolved flag and first
-   comment). Without a token it falls back to the basic REST open-PR lookup.
+   across workspaces is fetched once), and look up its PRs. Lookups run serially
+   (no concurrent fan-out) to stay clear of GitHub's secondary/concurrency
+   limits. With a token the per-branch lookup is a cheap REST conditional check
+   first (see "Rate limits" below); only when that reports a change (or on a
+   forced refresh, or when the cached rich data has aged out) does it spend a
+   single GraphQL query for the rich state (PR state incl. MERGED,
+   `reviewDecision`, the head commit's check rollup + per-check runs, and review
+   threads with their resolved flag and first comment). Without a token it is the
+   basic REST open-PR lookup only.
 4. Push two `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- one
    colored, clickable PR icon per repo with an OPEN/draft PR; merged-only repos
    are omitted, since the badge is an actionable indicator) and a `pane`
@@ -103,12 +107,29 @@ Beyond answering requests, the worker proactively drives the UI. On startup, on
    activity-bar button). The pane ends with an `action` block ("Refresh") whose
    click POSTs back to the host, which forwards `github.refresh` to this worker.
 
-Rate limits: the REST fallback uses conditional requests (ETag / `If-None-Match`;
-a `304` does not count) to stay under the 60 req/hr unauthenticated ceiling. The
-GraphQL path has no ETag, so it reads `rateLimit { remaining }` from each
-response and trips a short backoff (serving the last-good cached result) when the
-point budget (5000/hr) runs low or a `403`/`429`/`RATE_LIMITED` is returned; the
-worker's poll cadence (`ui_refresh_secs`) bounds how often it queries.
+Rate limits: the user token's budgets (REST 5000 req/hr, GraphQL 5000 points/hr)
+are shared with the user's own `gh` usage, so the worker spends as little as it
+can. A REST conditional request (ETag / `If-None-Match`) is the primary poll: a
+`304 Not Modified` means nothing changed and does NOT count against the primary
+rate limit, so a steady state where nothing changed costs ~0. GraphQL (which has
+no `304`) fires only when the conditional check reports a change, on a forced
+refresh, or when the cached rich result is older than a 300s freshness ceiling.
+That ceiling exists because the `/pulls` list ETag does not reliably bump when a
+CI check completes or a review thread changes, so CI/review state could otherwise
+go stale indefinitely between PR-list changes; with it, that state refreshes
+within ~5 min (or immediately when you click Refresh). The GraphQL query reads
+`rateLimit { cost remaining resetAt }` and trips a short backoff (serving the
+last-good cached result, honoring `resetAt`) when the budget runs low or a
+`403`/`429`/`RATE_LIMITED` is returned.
+
+Worst-case math (every key changes every tick, so each spends one REST + one
+GraphQL query): for N unique `(owner, repo, branch)` keys at a T-second network
+tick, that is `N * 3600 / T` of each per hour. At the 120s default, a 20-key
+workspace tops out around 600 REST req/hr and ~600 GraphQL queries/hr (the
+trimmed query costs a low single-digit `rateLimit.cost`), both a small fraction
+of 5000/hr. The realistic steady state is far cheaper: most ticks are a `304`, so
+the REST cost is ~0 and no GraphQL fires. The fast local session tick (a couple
+seconds, no network) is separate and unaffected by `ui_refresh_secs`.
 
 When a user-initiated refresh (the pane's Refresh action) hits an active backoff,
 the worker raises one in-app `ui.notify` (a warning, "GitHub rate limited") via
@@ -135,11 +156,11 @@ literals so it can never carry arbitrary CSS. When no token is present the pane
 prepends a warn `note` telling the user a token unlocks review/CI/comments/merged.
 The host replies on stdin; the worker ignores the reply (a push is best-effort).
 
-The poll interval comes from the `ui_refresh_secs` setting, which the worker
-reads at startup via the `config.get` host RPC (`agent-of-empires#2399`).
+The network poll interval comes from the `ui_refresh_secs` setting, which the
+worker reads at startup via the `config.get` host RPC (`agent-of-empires#2399`).
 Precedence: the setting, else the `AOE_GITHUB_UI_REFRESH_SECS` env override,
-else 30s; `0` disables the background poll (startup and refresh pushes still
-happen). Unlike a push, the startup `config.get` blocks for its reply, which is
+else 120s (sized for the rate-limit budget above); `0` disables the background
+poll (startup and refresh pushes still happen). Unlike a push, the startup `config.get` blocks for its reply, which is
 safe: the host always answers a worker call (an unknown method comes back as an
 error, not silence).
 

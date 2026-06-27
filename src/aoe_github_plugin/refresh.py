@@ -8,13 +8,21 @@ it is handed the session list and returns a plain-dict snapshot. Everything is
 fail-soft: a bad workspace, a detached HEAD, a non-github checkout, or an API
 error degrades that one repo's entry, never the whole refresh.
 
-Efficiency, for GitHub's 60 req/hr unauthenticated ceiling:
+Efficiency, against the user token's shared budget (REST 5000 req/hr, GraphQL
+5000 points/hr):
 - repos are deduplicated by ``(owner, repo, branch)`` so a branch shared across
   sessions/workspaces is fetched once per refresh;
-- lookups use conditional requests (ETag / ``If-None-Match``); a ``304`` does
-  not count against the primary rate limit;
-- a ``403``/``429`` trips a short global backoff, during which cached (stale)
-  values are served instead of hammering the API.
+- a cheap REST conditional request (ETag / ``If-None-Match``) is the PRIMARY
+  poll; a ``304`` does not count against the primary rate limit, so a steady
+  state where nothing changed costs ~0;
+- the expensive rich GraphQL query fires only when that conditional check
+  reports a change, on an explicit (forced) refresh, or when the cached rich
+  result has aged past ``GRAPHQL_MAX_STALE`` (a freshness ceiling, so CI/review
+  state cannot lie indefinitely between PR-list changes);
+- requests are issued serially (no concurrent fan-out) to stay clear of the
+  secondary/concurrency limits;
+- a ``403``/``429``/``RATE_LIMITED`` trips a short global backoff, during which
+  cached (stale) values are served instead of hammering the API.
 """
 
 from __future__ import annotations
@@ -27,7 +35,6 @@ from typing import Any
 from pathlib import Path
 from datetime import datetime
 from datetime import timezone
-from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
@@ -41,14 +48,15 @@ from aoe_github_plugin.handlers import _resolve_optional_token
 from aoe_github_plugin.utils.gitctx import parse_owner_repo
 
 GIT_TIMEOUT = 2.0
-MAX_WORKERS = 10
 # Back off proactively once the GraphQL point budget (5000/hr) is nearly spent,
 # so a busy workspace degrades to stale data rather than hard rate-limit errors.
 RATELIMIT_FLOOR = 50
-# GraphQL has no ETag/304, so a per-key TTL is its only conditional mechanism: a
-# key re-queried within this window serves its cached result instead of spending
-# points. Floors the cost even if the poll cadence is set aggressively low.
-GRAPHQL_TTL = 60.0
+# Freshness ceiling for the rich (GraphQL) cache. The REST conditional check
+# gates GraphQL on a detected change, but the ``/pulls`` ETag does not reliably
+# bump on a CI check completing or a review thread changing, so a rich result
+# this old is refreshed even on a ``304``. Bounds how stale CI/review state can
+# get (a user-clicked refresh forces it immediately regardless).
+GRAPHQL_MAX_STALE = 300.0
 # Fixed fallback backoff when no precise reset is known (REST 403/429, which
 # classify_status discards the reset for). The GraphQL path prefers the
 # response's rateLimit.resetAt; see _set_backoff.
@@ -222,17 +230,20 @@ def _forced_rate_limit_notice(*, force: bool) -> dict[str, Any]:
     return {"rate_limit_notice": notice} if notice is not None else {}
 
 
-def _fetch_key(client: GitHubClient, key: RepoKey) -> list[dict[str, Any]]:
-    """Open PRs for one ``(owner, repo, branch)``. Uses the ETag cache and
-    honors the backoff gate. Raises ``GitHubError`` only when there is no cached
-    value to fall back on."""
+def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str, Any]]]:
+    """Cheap REST conditional check for one ``(owner, repo, branch)``: returns
+    ``(changed, pulls)`` where ``changed`` is ``False`` on a ``304`` (the open-PR
+    list is unchanged, the request was free against the primary limit). Uses the
+    ETag cache and honors the backoff gate; a blocked or rate-limited probe with
+    a cached value reports ``changed=False`` and serves the cache, and only
+    raises ``GitHubError`` when there is nothing to fall back on."""
     owner, repo, branch = key
     with _cache_lock:
         cached = _etag_cache.get(key)
         blocked = time.monotonic() < _backoff["until"]
     if blocked:
         if cached is not None:
-            return cached["pulls"]
+            return False, cached["pulls"]
         raise RateLimitedError
     etag = cached["etag"] if cached else None
     params = {"state": "open", "head": f"{owner}:{branch}", "per_page": "10"}
@@ -241,13 +252,21 @@ def _fetch_key(client: GitHubClient, key: RepoKey) -> list[dict[str, Any]]:
     except RateLimitedError:
         _set_backoff()
         if cached is not None:
-            return cached["pulls"]
+            return False, cached["pulls"]
         raise
     if status == 304 and cached is not None:
-        return cached["pulls"]
+        return False, cached["pulls"]
     pulls = _trim(raw or [])
     with _cache_lock:
         _etag_cache[key] = {"etag": new_etag, "pulls": pulls}
+    return True, pulls
+
+
+def _fetch_key(client: GitHubClient, key: RepoKey) -> list[dict[str, Any]]:
+    """Open PRs for one ``(owner, repo, branch)`` via the basic REST path (no
+    token). The conditional probe is the whole job here; the change flag only
+    matters on the token path, which gates GraphQL on it."""
+    _, pulls = _rest_probe(client, key)
     return pulls
 
 
@@ -280,21 +299,17 @@ def _graphql_no_repository(
     return []
 
 
-def _fetch_key_graphql(client: GitHubClient, key: RepoKey, *, force: bool = False) -> list[dict[str, Any]]:
-    """Rich PR data for one ``(owner, repo, branch)`` via GraphQL. Serves the
-    per-key TTL cache, honors the backoff gate, and prefers any usable response
-    data (a GraphQL partial success is kept, not discarded). Raises
-    ``GitHubError`` only when there is nothing to fall back on. ``force`` skips
-    the TTL freshness check (a user-initiated refresh wants live CI/review data,
-    not a cache hit) while still respecting the backoff gate and stale fallback,
-    so it never hammers a rate-limited API."""
+def _fetch_key_graphql(client: GitHubClient, key: RepoKey) -> list[dict[str, Any]]:
+    """Rich PR data for one ``(owner, repo, branch)`` via GraphQL. Honors the
+    backoff gate and prefers any usable response data (a GraphQL partial success
+    is kept, not discarded). Raises ``GitHubError`` only when there is nothing to
+    fall back on. The decision of *whether* to spend a GraphQL query (vs serving
+    the cache) belongs to ``_fetch_key_rich_gated``, which gates on the cheap
+    REST conditional check; this only runs once that gate has decided to fetch."""
     owner, repo, branch = key
-    now = time.monotonic()
     with _cache_lock:
         cached = _graphql_cache.get(key)
-        blocked = now < _backoff["until"]
-    if not force and cached is not None and (now - cached["fetched_at"]) < GRAPHQL_TTL:
-        return cached["pulls"]
+        blocked = time.monotonic() < _backoff["until"]
     if blocked:
         if cached is not None:
             return cached["pulls"]
@@ -324,6 +339,34 @@ def _fetch_key_graphql(client: GitHubClient, key: RepoKey, *, force: bool = Fals
     return pulls
 
 
+def _fetch_key_rich_gated(client: GitHubClient, key: RepoKey, *, force: bool = False) -> list[dict[str, Any]]:
+    """Rich PR data for one key, with the cheap REST conditional check as the
+    primary gate (#21). Fires the expensive GraphQL query only when ``force`` (a
+    user refresh / first load), the REST probe reports a change, there is no rich
+    cache yet, or the cached rich result has aged past ``GRAPHQL_MAX_STALE``;
+    otherwise it serves the cached rich pulls for ~0 rate-limit cost. Fail-soft:
+    if GraphQL fails it falls back to the rich cache, then the basic REST pulls,
+    so a transient rich-path failure never blanks a PR."""
+    now = time.monotonic()
+    with _cache_lock:
+        rich = _graphql_cache.get(key)
+    try:
+        changed, basic = _rest_probe(client, key)
+    except GitHubError:
+        if rich is not None:
+            return rich["pulls"]
+        raise
+    stale = rich is None or (now - rich["fetched_at"]) >= GRAPHQL_MAX_STALE
+    if not force and not changed and not stale and rich is not None:
+        return rich["pulls"]
+    try:
+        return _fetch_key_graphql(client, key)
+    except GitHubError:
+        if rich is not None:
+            return rich["pulls"]
+        return basic
+
+
 def _fetch_all(
     keys: set[RepoKey],
     env: TokenEnvironment | None,
@@ -331,31 +374,36 @@ def _fetch_all(
     *,
     force: bool = False,
 ) -> tuple[dict[RepoKey, dict[str, Any]], bool]:
-    """Fetch every unique key concurrently. Returns ``(results, token_present)``
+    """Fetch every unique key SERIALLY. Returns ``(results, token_present)``
     where results is ``key -> {"pulls": [...]}`` or ``key -> {"error": {...}}``.
-    With a token, each key is fetched via the rich GraphQL path; without one we
-    keep the REST open-PR path and report ``token_present=False`` so the UI can
-    show the "token needed" banner. ``force`` bypasses the GraphQL TTL on the
-    token path (a manual refresh); the REST path always revalidates via ETag so
-    it ignores the flag. httpx.Client is safe to share across the pool threads;
-    none of them touch stdin or host RPCs."""
+    With a token, each key goes through the REST-conditional-gated rich path
+    (``_fetch_key_rich_gated``); without one we keep the basic REST open-PR path
+    and report ``token_present=False`` so the UI can show the "token needed"
+    banner. ``force`` (a manual refresh) bypasses the staleness gate on the token
+    path. Requests are serialized (sorted for determinism) rather than fanned
+    out, to stay under GitHub's secondary/concurrency limits (#22); none of this
+    touches stdin or host RPCs."""
     if not keys:
         return {}, True
     token = _resolve_optional_token(env)
     present = token is not None
-    fetch = (lambda c, k: _fetch_key_graphql(c, k, force=force)) if present else _fetch_key
+    fetch = (lambda c, k: _fetch_key_rich_gated(c, k, force=force)) if present else _fetch_key
+
+    def one(client: GitHubClient, key: RepoKey) -> dict[str, Any]:
+        """Fail-soft per repo: a typed error or any surprise becomes an error
+        entry for that one key, never aborting the whole refresh."""
+        try:
+            return {"pulls": fetch(client, key)}
+        except GitHubError as exc:
+            return {"error": {"kind": exc.kind, "hint": str(exc)}}
+        except Exception as exc:  # noqa: BLE001 - fail-soft per repo, never abort the refresh
+            return {"error": {"kind": "internal", "hint": f"refresh failed: {exc}"}}
+
+    results: dict[RepoKey, dict[str, Any]] = {}
     with GitHubClient(token=token, transport=transport) as client:
-
-        def one(key: RepoKey) -> tuple[RepoKey, dict[str, Any]]:
-            try:
-                return key, {"pulls": fetch(client, key)}
-            except GitHubError as exc:
-                return key, {"error": {"kind": exc.kind, "hint": str(exc)}}
-            except Exception as exc:  # noqa: BLE001 - fail-soft per repo, never abort the refresh
-                return key, {"error": {"kind": "internal", "hint": f"refresh failed: {exc}"}}
-
-        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(keys))) as ex:
-            return dict(ex.map(one, keys)), present
+        for key in sorted(keys):
+            results[key] = one(client, key)
+    return results, present
 
 
 def build_snapshot(

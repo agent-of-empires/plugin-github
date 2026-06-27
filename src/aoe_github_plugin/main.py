@@ -31,6 +31,7 @@ import json
 import math
 import time
 import queue
+import random
 import itertools
 import threading
 import contextlib
@@ -53,7 +54,14 @@ UI_NOTIFY = "ui.notify"
 SESSIONS_LIST = "sessions.list"
 CONFIG_GET = "config.get"
 REFRESH_SETTING_KEY = "ui_refresh_secs"
-DEFAULT_REFRESH_SECS = 30
+# Default NETWORK poll interval. Sized so worst-case (every key changes every
+# tick, so each spends a REST + a GraphQL query) stays well under the user's
+# shared 5000/hr budgets: at 120s a 20-key workspace tops out around 600 REST
+# req/hr and ~600 GraphQL queries/hr, a small fraction of either limit. In the
+# common steady state the REST conditional check returns 304 (free) and no
+# GraphQL fires, so the real cost is far lower. The fast local session tick
+# (SESSION_POLL_SECS) stays separate and unthrottled. See refresh.py and README.
+DEFAULT_REFRESH_SECS = 120
 # A wedged host must never freeze the worker: outbound host RPCs time out and
 # the caller falls back (default interval, empty session list).
 HOST_RPC_TIMEOUT = 10.0
@@ -62,6 +70,12 @@ HOST_RPC_TIMEOUT = 10.0
 # timeout so a wedged host stalls one tick, not the loop.
 SESSION_POLL_SECS = 2.0
 SESSION_LIST_TIMEOUT = 0.5
+# Positive, bounded jitter added to each network deadline so independently
+# started workers do not align their ticks into synchronized bursts against the
+# API. Capped, and never negative: the worker must not poll faster than the
+# configured interval.
+NETWORK_JITTER_FRAC = 0.1
+NETWORK_JITTER_MAX = 30.0
 
 # End-of-stdin sentinel placed on the queue by the reader thread.
 _EOF = object()
@@ -129,6 +143,15 @@ def _rate_limit_notify_params(notice: dict[str, Any]) -> dict[str, Any]:
     else:
         params["body"] = "GitHub rate limit hit; showing cached data. Retrying shortly."
     return params
+
+
+def _network_jitter(interval: int) -> float:
+    """Positive, bounded jitter for a network deadline. Zero when polling is
+    disabled (interval 0); otherwise up to ``NETWORK_JITTER_FRAC`` of the
+    interval, capped at ``NETWORK_JITTER_MAX`` seconds."""
+    if interval <= 0:
+        return 0.0
+    return random.uniform(0.0, min(NETWORK_JITTER_MAX, interval * NETWORK_JITTER_FRAC))  # noqa: S311 - not crypto
 
 
 class Runtime:
@@ -280,7 +303,8 @@ class Runtime:
 
     def resolve_interval(self) -> int:
         """Poll period in seconds. Precedence: the host-persisted
-        ``ui_refresh_secs`` setting (``config.get``) > the env override > 300."""
+        ``ui_refresh_secs`` setting (``config.get``) > the env override >
+        ``DEFAULT_REFRESH_SECS``."""
         if self.stopped:
             return _env_interval()
         result = self.call_host(CONFIG_GET, {"key": REFRESH_SETTING_KEY})
@@ -296,7 +320,7 @@ class Runtime:
         self.run_refresh(sessions, force=force)
         self._seen_ids = set(self.pushed_session_ids)
         if self._next_network is not None:
-            self._next_network = time.monotonic() + self._interval
+            self._next_network = time.monotonic() + self._interval + _network_jitter(self._interval)
 
     def _service_ticks(self) -> None:
         """Run whichever refresh is due: an inbound github.refresh, a fast local
@@ -325,7 +349,7 @@ class Runtime:
         # still push); otherwise a fast local tick notices session changes and a
         # slower network tick catches external PR/state changes.
         now = time.monotonic()
-        self._next_network = now + self._interval if self._interval > 0 else None
+        self._next_network = now + self._interval + _network_jitter(self._interval) if self._interval > 0 else None
         self._next_poll = now + SESSION_POLL_SECS if self._interval > 0 else None
         while not self.stopped:
             wakes = [t for t in (self._next_network, self._next_poll) if t is not None]
