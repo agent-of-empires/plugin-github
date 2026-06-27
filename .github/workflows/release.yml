@@ -4,6 +4,12 @@ name: Release
 # distributable, and publishes a GitHub Release whose notes are the git-cliff
 # section for this tag. The release archive sha256 is the interim integrity pin
 # for the featured index until the host's tree_hash lands (#2364).
+#
+# After a successful publish, the `featured-pr` job opens a PR on
+# agent-of-empires/agent-of-empires that pins this version's source tree hash in
+# plugins/featured.toml, closing the manual gap (#35). It needs the
+# AOE_FEATURED_PR_TOKEN secret (cross-repo PR write) and runs behind the
+# required-reviewer `release` environment.
 
 on:
   push:
@@ -77,3 +83,164 @@ jobs:
             "${{ steps.build.outputs.archive }}" dist/* \
             --title "$tag" \
             --notes-file RELEASE_NOTES.md
+
+  featured-pr:
+    name: Open AoE featured-index PR
+    needs: release
+    runs-on: ubuntu-latest
+    # The required-reviewer `release` environment guards AOE_FEATURED_PR_TOKEN
+    # (a cross-repo write credential) the same way it guards the release PR.
+    environment: release
+    # The default GITHUB_TOKEN only needs to read this repo; the cross-repo
+    # write goes through the PAT below, not GITHUB_TOKEN.
+    permissions:
+      contents: read
+    steps:
+      - name: Skip when cross-repo token is unset
+        id: gate
+        env:
+          TOKEN: ${{ secrets.AOE_FEATURED_PR_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::AOE_FEATURED_PR_TOKEN not set; skipping featured-index PR"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout plugin-github at the released tag
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        if: steps.gate.outputs.skip == 'false'
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        if: steps.gate.outputs.skip == 'false'
+        run: uv python install 3.10
+
+      - name: Sync dependencies
+        if: steps.gate.outputs.skip == 'false'
+        run: uv sync
+
+      - name: Compute released tree hash
+        id: hash
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          # The aoe binary lives in the AoE release; the token reads it.
+          GH_TOKEN: ${{ secrets.AOE_FEATURED_PR_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "::error::Unexpected release tag: $tag"
+            exit 1
+          fi
+
+          # Canonical hash: download the latest agent-of-empires release binary
+          # and run `aoe plugin hash`, so this never has to track the host's
+          # hashing algorithm.
+          asset="aoe-linux-amd64"
+          bindir="$(mktemp -d)"
+          gh release download --repo agent-of-empires/agent-of-empires \
+            --pattern "${asset}.tar.gz" --dir "$bindir"
+          tar -xzf "${bindir}/${asset}.tar.gz" -C "$bindir"
+          chmod +x "${bindir}/${asset}"
+
+          # Hash the released commit's tracked tree (git archive strips .git and
+          # untracked build output), matching the host's clone-then-strip fetch.
+          work="$(mktemp -d)"
+          git archive --format=tar HEAD | tar -x -C "$work"
+          tree_hash="$("${bindir}/${asset}" plugin hash "$work")"
+          if ! echo "$tree_hash" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::Bad tree hash: $tree_hash"
+            exit 1
+          fi
+          {
+            echo "version=${tag#v}"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "tree_hash=$tree_hash"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout agent-of-empires
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/checkout@v7
+        with:
+          repository: agent-of-empires/agent-of-empires
+          token: ${{ secrets.AOE_FEATURED_PR_TOKEN }}
+          path: aoe
+          fetch-depth: 0
+
+      - name: Open or update featured-index PR
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.AOE_FEATURED_PR_TOKEN }}
+          VERSION: ${{ steps.hash.outputs.version }}
+          COMMIT: ${{ steps.hash.outputs.commit }}
+          TREE_HASH: ${{ steps.hash.outputs.tree_hash }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          plugin_id="agent-of-empires.github"
+          featured="plugins/featured.toml"
+          branch="featured/github-v${VERSION}"
+          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+
+          # Edit AoE's trust root through the tomlkit-based updater. It exits
+          # nonzero (changing nothing) if this version is already pinned to a
+          # different hash, which would signal a retag, tamper, or algo drift.
+          status="$(uv run python scripts/featured_index.py update \
+            "aoe/${featured}" "$plugin_id" "$VERSION" "$TREE_HASH")"
+
+          if [ "$status" = "unchanged" ]; then
+            echo "::notice::${plugin_id} ${VERSION} already pinned; nothing to do"
+            exit 0
+          fi
+
+          cd aoe
+          # Defense in depth: only featured.toml may have changed.
+          dirty="$(git status --porcelain --untracked-files=no | grep -v "^ M ${featured}\$" || true)"
+          if [ -n "$dirty" ]; then
+            echo "::error::unexpected changes in AoE checkout"
+            git status --porcelain
+            exit 1
+          fi
+
+          # Idempotent: if the deterministic branch already exists upstream,
+          # ensure a PR points at it rather than force-pushing over it.
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            open_pr="$(gh pr list --head "$branch" --base main --state open --json number --jq '.[0].number // ""')"
+            if [ -z "$open_pr" ]; then
+              echo "::warning::branch $branch exists upstream with no open PR; inspect manually, not force-updating"
+            else
+              echo "::notice::PR for $branch already open (#$open_pr)"
+            fi
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add "$featured"
+          git commit -m "chore(plugins): pin agent-of-empires.github ${VERSION}"
+          git push -u origin "$branch"
+
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "chore(plugins): pin agent-of-empires.github ${VERSION}" \
+            --body "$(printf '%s\n' \
+              "Automated by plugin-github release CI (closes the manual featured-index step)." \
+              "" \
+              "Pins \`${plugin_id}\` \`${VERSION}\` in \`${featured}\`." \
+              "" \
+              "- Version: ${VERSION}" \
+              "- Tree hash: \`${TREE_HASH}\`" \
+              "- Hash algorithm: aoe-plugin-tree-hash-v1" \
+              "- Source commit: ${COMMIT}" \
+              "- Release: ${release_url}")"
