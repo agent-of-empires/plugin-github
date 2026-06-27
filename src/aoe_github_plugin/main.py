@@ -54,6 +54,13 @@ UI_NOTIFY = "ui.notify"
 SESSIONS_LIST = "sessions.list"
 CONFIG_GET = "config.get"
 REFRESH_SETTING_KEY = "ui_refresh_secs"
+# Boolean plugin setting -> session-row chip category it enables (#36). Each
+# defaults on, so the row shows every chip unless the user opts a category out.
+CHIP_SETTING_KEYS = {
+    "show_review_status": "review",
+    "show_ci_status": "ci",
+    "show_comment_status": "comments",
+}
 # Default NETWORK poll interval. Sized so worst-case (every key changes every
 # tick, so each spends a REST + a GraphQL query) stays well under the user's
 # shared 5000/hr budgets: at 120s a 20-key workspace tops out around 600 REST
@@ -172,6 +179,9 @@ class Runtime:
         # tick, the resolved poll interval, and the next-fire monotonic deadlines.
         self._seen_ids: set[str] = set()
         self._interval = 0
+        # Enabled session-row chip categories; resolved from settings in run(),
+        # all-on until then so the startup push is never accidentally empty.
+        self._chip_flags: frozenset[str] = frozenset(CHIP_SETTING_KEYS.values())
         self._next_network: float | None = None
         self._next_poll: float | None = None
 
@@ -264,7 +274,7 @@ class Runtime:
         with contextlib.suppress(Exception):
             snapshot = refresh.build_snapshot(sessions, force=force)
             current_ids: set[str] = set()
-            for params in uistate.snapshot_ui_state_params(snapshot):
+            for params in uistate.snapshot_ui_state_params(snapshot, chips_on=self._chip_flags):
                 sid = params.get("session_id")
                 if isinstance(sid, str):
                     current_ids.add(sid)
@@ -315,6 +325,21 @@ class Runtime:
                 return value
         return _env_interval()
 
+    def resolve_chip_flags(self) -> frozenset[str]:
+        """Enabled session-row chip categories from the boolean plugin settings
+        (``config.get``). Each defaults on, so a missing/unanswered setting keeps
+        the chip visible rather than silently hiding state the user did not opt
+        out of."""
+        return frozenset(category for key, category in CHIP_SETTING_KEYS.items() if self._setting_on(key))
+
+    def _setting_on(self, key: str) -> bool:
+        if self.stopped:
+            return True
+        result = self.call_host(CONFIG_GET, {"key": key})
+        if isinstance(result, dict) and isinstance(result.get("value"), bool):
+            return bool(result["value"])
+        return True
+
     def _refresh_and_reset(self, sessions: list[dict[str, Any]] | None = None, *, force: bool = False) -> None:
         """Refresh, re-baseline the seen-id set, and push the network tick out."""
         self.run_refresh(sessions, force=force)
@@ -341,6 +366,9 @@ class Runtime:
 
     def run(self) -> None:
         threading.Thread(target=self._read_stdin, daemon=True).start()
+        # Resolve chip-visibility settings before the first push so the startup
+        # row reflects the user's choices, not the all-on default.
+        self._chip_flags = self.resolve_chip_flags()
         # Proactive refresh on startup so slots populate before any user action.
         self.run_refresh()
         self._seen_ids = set(self.pushed_session_ids)

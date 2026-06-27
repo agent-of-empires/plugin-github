@@ -320,6 +320,48 @@ def test_badge_chip_tooltips_name_repo_and_state():
     assert "CI failing" in tips[2]
 
 
+# --- chip-visibility settings (#36 follow-up): per-category toggles ---
+
+
+def _badge_icons_with(repos, chips_on, sid="s1"):
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(session_id=sid, repos=repos)), chips_on=chips_on)
+    return [i["icon"] for i in _badge(params, sid)["payload"]["items"]]
+
+
+def _column_with(repos, chips_on, sid="s1"):
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(session_id=sid, repos=repos)), chips_on=chips_on)
+    return _column(params, sid)["payload"]
+
+
+def test_ci_toggle_off_hides_ci_chip():
+    checks = {"state": "failing", "runs": []}
+    repos = [_repo(pulls=[_rich_pull(review="approved", checks=checks)])]
+    assert "circle-x" in _badge_icons_with(repos, frozenset({"review", "ci", "comments"}))
+    assert _badge_icons_with(repos, frozenset({"review", "comments"})) == ["git-pull-request-arrow", "badge-check"]
+
+
+def test_review_toggle_off_hides_review_chip():
+    repos = [_repo(pulls=[_rich_pull(review="changes-requested")])]
+    assert _badge_icons_with(repos, frozenset({"ci", "comments"})) == ["git-pull-request-arrow"]
+
+
+def test_comments_toggle_off_hides_comment_chip():
+    comments = {"unresolved": 2, "items": [{"author": "a", "body": "x", "resolved": False}]}
+    repos = [_repo(pulls=[_rich_pull(review="approved", comments=comments)])]
+    icons = _badge_icons_with(repos, frozenset({"review", "ci"}))
+    assert "message-square" not in icons
+    assert icons == ["git-pull-request-arrow", "badge-check"]
+
+
+def test_column_skips_disabled_category_and_falls_through():
+    checks = {"state": "failing", "runs": []}
+    repos = [_repo(pulls=[_rich_pull(review="changes-requested", checks=checks)])]
+    # review off, ci on: the changes-requested signal is skipped, CI failing wins.
+    assert _column_with(repos, frozenset({"ci"}))["text"] == "CI failing"
+    # everything off: no rich signal survives, so it degrades to healthy open.
+    assert _column_with(repos, frozenset())["text"] == "open PR"
+
+
 def test_column_summarizes_top_attention_with_text_and_tone():
     payload = _column_payload([_repo(pulls=[_rich_pull(review="changes-requested")])])
     assert payload["text"] == "changes requested"

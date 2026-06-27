@@ -71,6 +71,30 @@ min = 0
 max = 86400
 advanced = true
 
+# Session-row chip toggles (#36). Each defaults on; turning one off hides that
+# chip from every session row (and drops it from the row's status summary), while
+# the GitHub pane still shows the full detail.
+[[settings]]
+key = "show_review_status"
+label = "Show review status in session row"
+description = "Show the PR review-state chip (approved / changes requested / awaiting review) on each session row. The GitHub pane still shows review state when this is off."
+type = "boolean"
+default = true
+
+[[settings]]
+key = "show_ci_status"
+label = "Show CI status in session row"
+description = "Show the CI check chip (passing / failing / running) on each session row. The GitHub pane still shows checks when this is off."
+type = "boolean"
+default = true
+
+[[settings]]
+key = "show_comment_status"
+label = "Show unresolved-comment status in session row"
+description = "Show the unresolved-review-comment chip on each session row. The GitHub pane still lists the comments when this is off."
+type = "boolean"
+default = true
+
 # UI extension points. The host renders each slot; the worker pushes display
 # state through the `ui.state.set` host RPC (wired by #2366). Two per-session
 # surfaces: a `row-badge` that shows one colored PR icon per repo with an open

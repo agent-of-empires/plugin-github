@@ -25,7 +25,7 @@ def _fake_params(monkeypatch, session_ids):
     monkeypatch.setattr(
         uistate,
         "snapshot_ui_state_params",
-        lambda _snap: [
+        lambda _snap, **_kwargs: [
             {"slot": slot, "id": slot_id, "session_id": sid, "payload": {}}
             for sid in session_ids
             for slot, slot_id in (uistate.ROW_BADGE_SLOT, uistate.PANE_SLOT)
