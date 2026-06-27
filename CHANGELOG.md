@@ -4,6 +4,22 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.1.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.1.0) - 2026-06-27
+
+
+
+### Features
+
+- **refresh:** Notify in-app when a forced refresh is rate-limited in [#24](https://github.com/agent-of-empires/plugin-github/pull/24) by [@Seluj78](https://github.com/Seluj78) ([`265694f`](https://github.com/agent-of-empires/plugin-github/commit/265694f03bbc301fc889cc01a6b5d7f5f20f2285))
+- **uistate:** Send full unresolved-comment list under new 64KB pane cap in [#30](https://github.com/agent-of-empires/plugin-github/pull/30) by [@Seluj78](https://github.com/Seluj78) ([`7b530fd`](https://github.com/agent-of-empires/plugin-github/commit/7b530fdb05b3339d2353c4945e337e4f4bb39494))
+
+
+### Performance
+
+- **refresh:** Conditional REST polling to cut GitHub rate-limit usage in [#27](https://github.com/agent-of-empires/plugin-github/pull/27) by [@Seluj78](https://github.com/Seluj78) ([`fcb2159`](https://github.com/agent-of-empires/plugin-github/commit/fcb21599d5e7da4eebd882112863b60c82280b3e))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v1.0.0...v1.1.0
 ## [1.0.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.0.0) - 2026-06-27
 
 
