@@ -150,6 +150,57 @@ def test_resolve_chip_flags_respects_disabled_setting():
     assert rt.resolve_chip_flags() == frozenset({"review", "comments"})
 
 
+# --- archived/snoozed sessions are skipped (issue #41) ---
+
+
+def _list_sessions_with(reply):
+    """list_sessions over a stubbed host reply."""
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: reply
+    return rt.list_sessions()
+
+
+def test_list_sessions_drops_archived_and_snoozed():
+    # Archived and snoozed are inactive; only active sessions survive so the
+    # network refresh never spends GitHub quota on them.
+    reply = {
+        "sessions": [
+            {"id": "active", "project_path": "/a"},
+            {"id": "arch", "project_path": "/b", "archived": True, "snoozed": False},
+            {"id": "snoozed", "project_path": "/c", "archived": False, "snoozed": True},
+        ]
+    }
+    assert [s["id"] for s in _list_sessions_with(reply)] == ["active"]
+
+
+def test_list_sessions_keeps_sessions_when_flags_absent():
+    # A host that predates the flags (#2504) omits them; every session is polled
+    # as before, no accidental pruning.
+    reply = {"sessions": [{"id": "s1", "project_path": "/a"}, {"id": "s2", "project_path": "/b"}]}
+    assert [s["id"] for s in _list_sessions_with(reply)] == ["s1", "s2"]
+
+
+def test_archived_session_never_reaches_build_snapshot(monkeypatch):
+    # End-to-end: an archived session in the host reply triggers zero network
+    # work, it is filtered before build_snapshot, which is what does the HTTP.
+    seen_sessions = []
+
+    def spy_build_snapshot(sessions, force=False):
+        seen_sessions.append([s.get("id") for s in sessions])
+        return {"sessions": [], "auth": {"present": True}}
+
+    monkeypatch.setattr(main.refresh, "build_snapshot", spy_build_snapshot)
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: {
+        "sessions": [
+            {"id": "active", "project_path": "/a"},
+            {"id": "arch", "project_path": "/b", "archived": True},
+        ]
+    }
+    rt.run_refresh()
+    assert seen_sessions == [["active"]]
+
+
 def test_default_network_interval_is_120():
     # Network tick default sized for the rate-limit budget (#22). The fast local
     # session tick is a separate, smaller constant.

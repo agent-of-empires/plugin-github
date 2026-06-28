@@ -248,10 +248,21 @@ class Runtime:
             self.refresh_due = True
 
     def list_sessions(self, timeout: float = HOST_RPC_TIMEOUT) -> list[dict[str, Any]] | None:
-        """Authoritative session list, or ``None`` if the host did not answer
-        with one. ``None`` (timeout/error/garbage) is distinct from an empty
-        list: a transient failure must never be read as "no sessions", which
-        would prune every session's UI."""
+        """Active session list, or ``None`` if the host did not answer with one.
+        ``None`` (timeout/error/garbage) is distinct from an empty list: a
+        transient failure must never be read as "no sessions", which would prune
+        every session's UI.
+
+        Archived and snoozed sessions are dropped here, the single chokepoint
+        every consumer reads (#41): they are inactive by definition, so polling
+        them only burns the user's GitHub quota. Filtering at the source (not just
+        in the snapshot) keeps the fast local session tick consistent, it compares
+        these ids against the pushed set, so a snapshot-only filter would diff the
+        archived session forever and refresh every tick. A previously-pushed
+        session that becomes archived simply drops out of the list and the refresh
+        reconcile removes its UI slots, same path as a vanished session. The
+        ``archived``/``snoozed`` flags are additive (host #2504); a host that omits
+        them polls every session as before."""
         result = self.call_host(SESSIONS_LIST, {}, timeout=timeout)
         sessions = result.get("sessions") if isinstance(result, dict) else None
         if not isinstance(sessions, list):
@@ -261,7 +272,7 @@ class Runtime:
         # pruning live UI; treat a garbage list as "no answer" instead.
         if not all(isinstance(s, dict) and isinstance(s.get("id"), str) for s in sessions):
             return None
-        return sessions
+        return [s for s in sessions if not s.get("archived") and not s.get("snoozed")]
 
     def run_refresh(self, sessions: list[dict[str, Any]] | None = None, *, force: bool = False) -> None:
         """Build the aggregate snapshot from the session list and reconcile UI
