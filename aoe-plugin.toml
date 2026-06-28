@@ -12,8 +12,10 @@
 id = "agent-of-empires.github"
 name = "GitHub"
 version = "1.3.0"
-# Manifest schema / host API version. Host supports 1..=4.
-api_version = 4
+# Manifest schema / host API version. Host supports 1..=5. api_version 5 adds
+# the [[screenshots]] list (declared below); a pre-5 host rejects it with
+# "screenshots require api_version >= 5" rather than a confusing unknown-field.
+api_version = 5
 # Host-app compatibility range (different axis from api_version, which is the
 # manifest-schema version). The host refuses install/update outside this range
 # and skips loading if a later aoe upgrade moves out of it. Requires api_version
@@ -39,6 +41,26 @@ description = "GitHub integration for Agent of Empires: surface PR and issue sta
 # All are in aoe_plugin_api::KNOWN_CAPABILITIES. Add later as the surface grows:
 #   session.read  to correlate PRs/issues with active sessions
 capabilities = ["net", "runtime.worker", "session.read", "notifications"]
+
+# Marketplace screenshots, rendered in the plugin detail modal above the
+# description (api_version 5, schema: Screenshot in aoe-plugin-api/src/manifest.rs).
+# Each `path` is repository-relative; the detail endpoint resolves it to a
+# raw.githubusercontent.com URL against the installed ref (else HEAD), so the
+# assets must live in this repo. `alt` is required (content, not decoration).
+[[screenshots]]
+path = "assets/screenshots/session-rows.png"
+alt = "Two session rows, each showing a colored PR icon for an attached open pull request."
+caption = "Open-PR badges on session rows."
+
+[[screenshots]]
+path = "assets/screenshots/ci.png"
+alt = "The GitHub pane showing CI check results for a session's pull request."
+caption = "CI results in the GitHub pane."
+
+[[screenshots]]
+path = "assets/screenshots/comments.png"
+alt = "The GitHub pane showing a CodeRabbit review with unresolved comments on a pull request."
+caption = "Review comments in the GitHub pane."
 
 # Commands the plugin contributes (palette / CLI), namespaced by the host as
 # plugin.agent-of-empires.github.<id>. The command-id -> worker RPC mapping
