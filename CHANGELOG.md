@@ -4,13 +4,25 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
-## [1.2.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.2.0) - 2026-06-27
+## [1.3.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.3.0) - 2026-06-28
 
 
 
 ### Bug Fixes
 
-- **runtime:** Build venv into .aoe-build, not the source root ([`44408f7`](https://github.com/agent-of-empires/plugin-github/commit/44408f713aee8444ac3b6c01a7e6ad372058c5fd))
+- **graphql:** Collapse same-named check runs to latest per name in [#38](https://github.com/agent-of-empires/plugin-github/pull/38) by [@Seluj78](https://github.com/Seluj78) ([`1176e3a`](https://github.com/agent-of-empires/plugin-github/commit/1176e3a4c78edf9920a95f6b5c92fd159ce66b79))
+- **refresh:** Skip archived and snoozed sessions in proactive refresh in [#43](https://github.com/agent-of-empires/plugin-github/pull/43) by [@Seluj78](https://github.com/Seluj78) ([`417cb4b`](https://github.com/agent-of-empires/plugin-github/commit/417cb4b609ef168b80e1020fa37b54e6e99acc0c))
+
+
+### Features
+
+- **ci:** Open AoE featured-index PR after release in [#40](https://github.com/agent-of-empires/plugin-github/pull/40) by [@Seluj78](https://github.com/Seluj78) ([`cdc3cca`](https://github.com/agent-of-empires/plugin-github/commit/cdc3cca46e7b857163b40173b4eb6c4d344b3f48))
+- **uistate:** Surface PR attention state in session rows in [#39](https://github.com/agent-of-empires/plugin-github/pull/39) by [@Seluj78](https://github.com/Seluj78) ([`f951aac`](https://github.com/agent-of-empires/plugin-github/commit/f951aac85f2304f5bef01f27726fc5f80e1de599))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v1.2.0...v1.3.0
+## [1.2.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.2.0) - 2026-06-27
+
 
 
 ### Features
