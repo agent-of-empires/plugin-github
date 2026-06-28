@@ -86,7 +86,9 @@ raises a typed error only when the checkout has no github.com remote.
 Beyond answering requests, the worker proactively drives the UI. On startup, on
 `github.refresh`, and on a background poll it runs one refresh:
 
-1. `sessions.list` (host RPC) -> every session and its workspace `project_path`.
+1. `sessions.list` (host RPC) -> every active session and its workspace
+   `project_path`. Archived and snoozed sessions are skipped: they are inactive,
+   so polling them would only spend GitHub quota for no UI change.
 2. For each workspace, discover the git checkouts: the workspace root plus each
    immediate child directory that is its own checkout (worktree-safe -- a
    worktree's `.git` is a file, so discovery asks `git rev-parse --show-toplevel`
