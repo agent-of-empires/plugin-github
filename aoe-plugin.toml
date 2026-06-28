@@ -11,7 +11,7 @@
 
 id = "agent-of-empires.github"
 name = "GitHub"
-version = "1.3.0"
+version = "1.4.0"
 # Manifest schema / host API version. Host supports 1..=5. api_version 5 adds
 # the [[screenshots]] list (declared below); a pre-5 host rejects it with
 # "screenshots require api_version >= 5" rather than a confusing unknown-field.

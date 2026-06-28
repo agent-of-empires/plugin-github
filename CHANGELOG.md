@@ -4,6 +4,16 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.4.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.4.0) - 2026-06-28
+
+
+
+### Features
+
+- **manifest:** Marketplace screenshots (api_version 5) in [#44](https://github.com/agent-of-empires/plugin-github/pull/44) by [@Seluj78](https://github.com/Seluj78) ([`2d1ed6f`](https://github.com/agent-of-empires/plugin-github/commit/2d1ed6fdcb36cca124a292d97cd43305cf8fa41d))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v1.3.0...v1.4.0
 ## [1.3.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.3.0) - 2026-06-28
 
 
