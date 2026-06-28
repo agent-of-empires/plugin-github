@@ -4,6 +4,17 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.5.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.5.0) - 2026-06-28
+
+
+
+### Features
+
+- **refresh:** Scope a manual github.refresh to the clicked session in [#48](https://github.com/agent-of-empires/plugin-github/pull/48) by [@Seluj78](https://github.com/Seluj78) ([`880a46b`](https://github.com/agent-of-empires/plugin-github/commit/880a46be5192b252a10857730b8141304da3ea34))
+- **commands:** Open_pr command + keybind to open the active session's PR in [#49](https://github.com/agent-of-empires/plugin-github/pull/49) by [@Seluj78](https://github.com/Seluj78) ([`b6cc62b`](https://github.com/agent-of-empires/plugin-github/commit/b6cc62b88e3ebcccaf5cbb757fd3d3d8170892df))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v1.4.0...v1.5.0
 ## [1.4.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.4.0) - 2026-06-28
 
 
