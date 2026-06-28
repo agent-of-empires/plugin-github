@@ -217,3 +217,62 @@ def test_network_jitter_is_positive_and_bounded():
         assert 0.0 <= j <= cap  # never negative (must not poll faster than configured)
     # The cap holds for a large interval too (absolute ceiling, not just a fraction).
     assert main._network_jitter(100000) <= main.NETWORK_JITTER_MAX
+
+
+def _fake_per_session_params(monkeypatch):
+    """build_snapshot + snapshot_ui_state_params stubs that emit one row-badge +
+    pane per session in the list passed to build_snapshot, so a test can assert
+    exactly which sessions were refreshed."""
+    monkeypatch.setattr(main.refresh, "build_snapshot", lambda sessions, **_k: {"sessions": sessions})
+    monkeypatch.setattr(
+        main.uistate,
+        "snapshot_ui_state_params",
+        lambda snap, **_k: [
+            {"slot": slot, "id": slot_id, "session_id": s["id"], "payload": {}}
+            for s in snap["sessions"]
+            for slot, slot_id in (main.uistate.ROW_BADGE_SLOT, main.uistate.PANE_SLOT)
+        ],
+    )
+
+
+def test_github_refresh_captures_session_target():
+    rt = main.Runtime(send=lambda _m: None)
+    rt.handle_inbound({"method": "github.refresh", "params": {"session_id": "s1"}})
+    assert rt.refresh_due is True
+    assert rt._refresh_target == "s1"
+    # No / non-string session id falls back to a full refresh.
+    rt.handle_inbound({"method": "github.refresh", "params": {}})
+    assert rt._refresh_target is None
+    rt.handle_inbound({"method": "github.refresh", "params": {"session_id": 5}})
+    assert rt._refresh_target is None
+
+
+def test_scoped_refresh_targets_only_the_clicked_session(monkeypatch):
+    sent: list = []
+    rt = main.Runtime(send=sent.append)
+    rt.pushed_session_ids = {"s1", "s2"}
+    _fake_per_session_params(monkeypatch)
+
+    rt.run_refresh(sessions=[{"id": "s1"}, {"id": "s2"}], force=True, only_session="s1")
+
+    sets = {x["params"]["session_id"] for x in sent if x["method"] == "ui.state.set"}
+    removes = [x for x in sent if x["method"] == "ui.state.remove"]
+    # Only the clicked session is fetched and pushed; the other is untouched, not
+    # pruned, so its slots keep showing.
+    assert sets == {"s1"}
+    assert removes == []
+    assert rt.pushed_session_ids == {"s1", "s2"}
+
+
+def test_full_refresh_still_prunes_vanished(monkeypatch):
+    # The unscoped path is unchanged: a session that drops out is pruned.
+    sent: list = []
+    rt = main.Runtime(send=sent.append)
+    rt.pushed_session_ids = {"s1", "gone"}
+    _fake_per_session_params(monkeypatch)
+
+    rt.run_refresh(sessions=[{"id": "s1"}], force=True)
+
+    removes = {x["params"]["session_id"] for x in sent if x["method"] == "ui.state.remove"}
+    assert removes == {"gone"}
+    assert rt.pushed_session_ids == {"s1"}

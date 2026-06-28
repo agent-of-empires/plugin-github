@@ -60,7 +60,9 @@ hash check. Build steps are scoped to macOS/Linux.
 `github.status` is a live, single-checkout lookup, fail-soft: it always returns
 a structured result, never a JSON-RPC error, so a caller always has something to
 render. `github.refresh` returns `{ "accepted": true }` immediately and triggers
-a full multi-session UI refresh (below).
+a UI refresh (below). When its params carry a `session_id` (a clicked pane is
+one session), the refresh is scoped to that session; without one it covers every
+session.
 
 ```jsonc
 {
@@ -84,7 +86,10 @@ raises a typed error only when the checkout has no github.com remote.
 ### Multi-session refresh
 
 Beyond answering requests, the worker proactively drives the UI. On startup, on
-`github.refresh`, and on a background poll it runs one refresh:
+`github.refresh`, and on a background poll it runs one refresh. A `github.refresh`
+that names a `session_id` refreshes only that session and pushes additively (it
+never prunes another session's slots); startup, background polls, and a
+session-less `github.refresh` cover every session and prune vanished ones:
 
 1. `sessions.list` (host RPC) -> every active session and its workspace
    `project_path`. Archived and snoozed sessions are skipped: they are inactive,
