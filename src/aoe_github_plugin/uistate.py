@@ -508,12 +508,21 @@ def snapshot_ui_state_params(
         if sid is None:
             continue
         repos = session.get("repos") or []
+        # The row-badge also carries a top-level href: the highest-attention PR's
+        # url. The host's `open_pr` command (open-ui-link) opens it, so the badge
+        # is the always-present anchor (unlike the row-column, which the
+        # show_status_text toggle can clear). Reuse the column's winner so the
+        # icon, the words, and the opened PR all agree.
+        badge_payload: dict[str, Any] = {"items": _badge_items(repos, chips_on)}
+        primary_href = _status_column(repos, chips_on).get("href")
+        if primary_href:
+            badge_payload["href"] = primary_href
         params.append(
             {
                 "slot": ROW_BADGE_SLOT[0],
                 "id": ROW_BADGE_SLOT[1],
                 "session_id": sid,
-                "payload": {"items": _badge_items(repos, chips_on)},
+                "payload": badge_payload,
             }
         )
         params.append(

@@ -90,6 +90,28 @@ def test_badge_items_empty_when_no_prs():
     assert items == []
 
 
+def test_badge_carries_top_level_href_to_primary_pr():
+    # The `open_pr` command (open-ui-link on the row-badge) opens this href.
+    session = _session(repos=[_repo(name="a", pulls=[_pull(number=7)])])
+    payload = _badge(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]
+    assert payload["href"] == "https://github.com/o/r/pull/7"
+
+
+def test_badge_omits_href_when_no_pr():
+    payload = _badge(uistate.snapshot_ui_state_params(_snapshot(_session(repos=[_repo()]))))["payload"]
+    assert "href" not in payload
+
+
+def test_badge_keeps_href_even_when_status_column_hidden():
+    # show_column=False clears the row-column words, but the badge href (what the
+    # open_pr command opens) must survive, so opening a PR never depends on the
+    # status-text toggle.
+    session = _session(repos=[_repo(name="a", pulls=[_pull(number=7)])])
+    params = uistate.snapshot_ui_state_params(_snapshot(session), show_column=False)
+    assert _badge(params)["payload"]["href"] == "https://github.com/o/r/pull/7"
+    assert _column(params)["payload"] == {}
+
+
 def test_pane_has_heading_and_a_row_per_repo():
     session = _session(repos=[_repo(name="a", pulls=[_pull(number=9, title="Add x")]), _repo(name="b")])
     blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["blocks"]

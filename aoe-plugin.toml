@@ -11,11 +11,13 @@
 
 id = "agent-of-empires.github"
 name = "GitHub"
-version = "1.4.0"
-# Manifest schema / host API version. Host supports 1..=5. api_version 5 adds
-# the [[screenshots]] list (declared below); a pre-5 host rejects it with
-# "screenshots require api_version >= 5" rather than a confusing unknown-field.
-api_version = 5
+version = "1.5.0"
+# Manifest schema / host API version. api_version 5 added the [[screenshots]]
+# list (declared below); 6 lets a command declare a client-executed `action`
+# (the `open_pr` command below uses `open-ui-link`). A host older than 6 rejects
+# this manifest with "api_version 6 is not supported" rather than loading a
+# command it cannot run.
+api_version = 6
 # Host-app compatibility range (different axis from api_version, which is the
 # manifest-schema version). The host refuses install/update outside this range
 # and skips loading if a later aoe upgrade moves out of it. Requires api_version
@@ -40,7 +42,11 @@ description = "GitHub integration for Agent of Empires: surface PR and issue sta
 #                   warns the user, with the reset countdown (#20).
 # All are in aoe_plugin_api::KNOWN_CAPABILITIES. Add later as the surface grows:
 #   session.read  to correlate PRs/issues with active sessions
-capabilities = ["net", "runtime.worker", "session.read", "notifications"]
+#   browser_open  - the `open_pr` command opens the active session's PR href
+#                   (already published into the row-badge slot) in the user's
+#                   browser; the host gates a command's browser-opening action
+#                   on this grant.
+capabilities = ["net", "runtime.worker", "session.read", "notifications", "browser_open"]
 
 # Marketplace screenshots, rendered in the plugin detail modal above the
 # description (api_version 5, schema: Screenshot in aoe-plugin-api/src/manifest.rs).
@@ -79,6 +85,27 @@ description = "Re-fetch the GitHub status for this checkout."
 id = "open"
 title = "GitHub: open"
 description = "Open this checkout's PR (or the create-PR page) in a browser."
+
+# A client-executed command (api_version 6): invoking it opens the active
+# session's PR directly from the row-badge slot's `href`, which the worker
+# already publishes per session. No worker round-trip, so it works from the web
+# command palette (cmd+k) without a popup-blocked async open, and from a keybind.
+# Gated on the `browser_open` capability.
+[[commands]]
+id = "open_pr"
+title = "GitHub: open PR"
+description = "Open the active session's pull request in your browser."
+[commands.action]
+kind = "open-ui-link"
+slot = "row-badge"
+id = "github_pr_badge"
+
+# Default chord for `open_pr`, surfaced in both palettes and bound on both
+# surfaces. Ctrl+Shift+G stays clear of the core bindings (core always wins a
+# collision) and parses on the TUI (which accepts only Ctrl/Shift chords).
+[[keybinds]]
+command = "open_pr"
+key = "Ctrl+Shift+G"
 
 # Settings, rendered generically on the TUI and web settings surfaces and
 # stored under [plugins."agent-of-empires.github".settings]. The worker reads
