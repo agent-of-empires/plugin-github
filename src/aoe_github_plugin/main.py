@@ -175,6 +175,9 @@ class Runtime:
         self.inbox: queue.Queue[Any] = queue.Queue()
         self.stopped = False
         self.refresh_due = False
+        # The session a pending ``github.refresh`` is scoped to, or None for a
+        # full (all-session) refresh. Set by handle_inbound, consumed by the loop.
+        self._refresh_target: str | None = None
         # Session ids we last pushed UI state for, so a vanished session's
         # row-badge + pane can be removed (ui.state.remove) rather than linger.
         self.pushed_session_ids: set[str] = set()
@@ -230,7 +233,8 @@ class Runtime:
 
     def handle_inbound(self, msg: dict[str, Any]) -> None:
         """Service one host->worker message: answer a request, ignore a stray
-        reply. ``github.refresh`` also flags an aggregate refresh for the loop."""
+        reply. ``github.refresh`` also flags an aggregate refresh for the loop,
+        scoped to the firing pane's ``session_id`` when the host forwards one."""
         if "method" not in msg:
             return  # a host reply we are not currently waiting on
         method = msg.get("method", "")
@@ -245,6 +249,12 @@ class Runtime:
         if isinstance(msg_id, int):
             self.send(result_response(msg_id, result))
         if method == "github.refresh":
+            # A clicked pane is one session; refresh just that one. A string id
+            # scopes it; anything else (absent/null/non-string) falls back to a
+            # full refresh, so an older host that forwards no session id behaves
+            # as before.
+            sid = params.get("session_id")
+            self._refresh_target = sid if isinstance(sid, str) else None
             self.refresh_due = True
 
     def list_sessions(self, timeout: float = HOST_RPC_TIMEOUT) -> list[dict[str, Any]] | None:
@@ -274,7 +284,13 @@ class Runtime:
             return None
         return [s for s in sessions if not s.get("archived") and not s.get("snoozed")]
 
-    def run_refresh(self, sessions: list[dict[str, Any]] | None = None, *, force: bool = False) -> None:
+    def run_refresh(
+        self,
+        sessions: list[dict[str, Any]] | None = None,
+        *,
+        force: bool = False,
+        only_session: str | None = None,
+    ) -> None:
         """Build the aggregate snapshot from the session list and reconcile UI
         state: push each current session's row-badge + pane, then remove the
         slots of any session that has since vanished. Fail-soft: a host error, a
@@ -282,11 +298,19 @@ class Runtime:
         when the session list is unavailable, so a transient failure cannot wipe
         live UI. ``force`` bypasses the GraphQL TTL so a user-clicked refresh
         fetches live CI/review data instead of a cache hit, and a rate-limited
-        forced refresh also emits one ``ui.notify`` with the reset countdown."""
+        forced refresh also emits one ``ui.notify`` with the reset countdown.
+
+        ``only_session`` scopes the refresh to one session (a clicked pane's
+        ``Refresh``): the fan-out covers just that session, and the push is
+        additive (no prune), so refreshing one pane never removes another
+        session's slots. Vanished-session cleanup stays the job of the full
+        background refresh. A target no longer in the session list is a no-op."""
         if sessions is None:
             sessions = self.list_sessions()
         if sessions is None:
             return
+        if only_session is not None:
+            sessions = [s for s in sessions if s.get("id") == only_session]
         with contextlib.suppress(Exception):
             snapshot = refresh.build_snapshot(sessions, force=force)
             current_ids: set[str] = set()
@@ -304,17 +328,25 @@ class Runtime:
                         "params": params,
                     }
                 )
-            for sid in self.pushed_session_ids - current_ids:
-                for slot, slot_id in (uistate.ROW_BADGE_SLOT, uistate.PANE_SLOT):
-                    self.send(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": next(_outbound_ids),
-                            "method": UI_STATE_REMOVE,
-                            "params": {"slot": slot, "id": slot_id, "session_id": sid},
-                        }
-                    )
-            self.pushed_session_ids = current_ids
+            if only_session is None:
+                # Full refresh: the snapshot is the whole truth, so a session
+                # that dropped out has vanished and its slots are pruned.
+                for sid in self.pushed_session_ids - current_ids:
+                    for slot, slot_id in (uistate.ROW_BADGE_SLOT, uistate.PANE_SLOT):
+                        self.send(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": next(_outbound_ids),
+                                "method": UI_STATE_REMOVE,
+                                "params": {"slot": slot, "id": slot_id, "session_id": sid},
+                            }
+                        )
+                self.pushed_session_ids = current_ids
+            else:
+                # Scoped refresh: only the target was fetched, so an absence
+                # here means "not refreshed", not "vanished". Add what we pushed
+                # and leave every other session's tracking and slots intact.
+                self.pushed_session_ids |= current_ids
             # A forced refresh that hit a rate limit carries a one-shot notice
             # (build_snapshot only adds it on force=True). Tell the user why the
             # refresh showed no change, at most once per backoff window.
@@ -358,9 +390,17 @@ class Runtime:
             return bool(result["value"])
         return True
 
-    def _refresh_and_reset(self, sessions: list[dict[str, Any]] | None = None, *, force: bool = False) -> None:
-        """Refresh, re-baseline the seen-id set, and push the network tick out."""
-        self.run_refresh(sessions, force=force)
+    def _refresh_and_reset(
+        self,
+        sessions: list[dict[str, Any]] | None = None,
+        *,
+        force: bool = False,
+        only_session: str | None = None,
+    ) -> None:
+        """Refresh, re-baseline the seen-id set, and push the network tick out.
+        A scoped refresh leaves other sessions in ``pushed_session_ids``, so the
+        re-baseline below still covers the whole tracked set."""
+        self.run_refresh(sessions, force=force, only_session=only_session)
         self._seen_ids = set(self.pushed_session_ids)
         if self._next_network is not None:
             self._next_network = time.monotonic() + self._interval + _network_jitter(self._interval)
@@ -371,7 +411,9 @@ class Runtime:
         now = time.monotonic()
         if self.refresh_due:
             self.refresh_due = False
-            self._refresh_and_reset(force=True)
+            target = self._refresh_target
+            self._refresh_target = None
+            self._refresh_and_reset(force=True, only_session=target)
         if self._next_poll is not None and now >= self._next_poll:
             sessions = self.list_sessions(SESSION_LIST_TIMEOUT)
             if sessions is not None:
