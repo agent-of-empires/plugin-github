@@ -34,7 +34,8 @@ aoe plugin install agent-of-empires/plugin-github
 ```
 
 Installing prompts for the plugin's declared capabilities (`net`,
-`runtime.worker`, `session.read`, `notifications`) before anything is written.
+`runtime.worker`, `session.read`, `notifications`, `browser_open`) before
+anything is written.
 
 ## What it contributes
 
@@ -43,8 +44,17 @@ Installing prompts for the plugin's declared capabilities (`net`,
 | Command | `status` -> worker method `github.status`                          |
 | Command | `refresh` -> worker method `github.refresh`                        |
 | Command | `open` (open-in-GitHub) -> worker method `github.open`             |
+| Command | `open_pr` (`GitHub: open PR`) -> client `open-ui-link` action, default chord `Ctrl+Shift+G` |
 | UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
+
+`open_pr` is the command-palette / shortcut way to open the active session's PR
+(requires a host on api_version 6+). It is a client action, not a worker call:
+the host opens the PR `href` the worker already publishes on the `github_pr_badge`
+row-badge slot, synchronously in the keypress or palette click, so it works on a
+remote web dashboard without a popup-blocked async open. The badge href is the
+highest-attention PR and is present whenever an open PR exists, independent of the
+`show_status_text` setting.
 
 At install/update the host runs the manifest's `[[runtime.build]]` steps in the
 plugin directory: create a venv under `.aoe-build/` and `pip install .` into it.
