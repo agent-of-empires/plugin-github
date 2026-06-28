@@ -11,7 +11,7 @@
 
 id = "agent-of-empires.github"
 name = "GitHub"
-version = "1.4.0"
+version = "1.5.0"
 # Manifest schema / host API version. api_version 5 added the [[screenshots]]
 # list (declared below); 6 lets a command declare a client-executed `action`
 # (the `open_pr` command below uses `open-ui-link`). A host older than 6 rejects
