@@ -105,9 +105,11 @@ session-less `github.refresh` cover every session and prune vanished ones:
    `project_path`. Archived and snoozed sessions are skipped: they are inactive,
    so polling them would only spend GitHub quota for no UI change.
 2. For each workspace, discover the git checkouts: the workspace root plus each
-   immediate child directory that is its own checkout (worktree-safe -- a
+   immediate child directory that is its own checkout (worktree-safe, a
    worktree's `.git` is a file, so discovery asks `git rev-parse --show-toplevel`
-   rather than looking for a `.git` directory).
+   rather than looking for a `.git` directory). Immediate child submodules are
+   skipped by default; turn off `ignore_submodules` to include them again. The
+   workspace root is still scanned when it is itself a submodule.
 3. Resolve each checkout to `(owner, repo, branch)`, deduplicate (a branch shared
    across workspaces is fetched once), and look up its PRs. Lookups run serially
    (no concurrent fan-out) to stay clear of GitHub's secondary/concurrency
@@ -203,6 +205,11 @@ else 120s (sized for the rate-limit budget above); `0` disables the background
 poll (startup and refresh pushes still happen). Unlike a push, the startup `config.get` blocks for its reply, which is
 safe: the host always answers a worker call (an unknown method comes back as an
 error, not silence).
+
+`ignore_submodules` defaults on. It removes initialized child submodules from
+workspace discovery so dependency checkouts do not spend GitHub API budget or add
+noise to the session row and pane. Set it to `false` when a workspace intentionally
+tracks PR state for immediate child submodule checkouts.
 
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol

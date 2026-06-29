@@ -64,6 +64,7 @@ CHIP_SETTING_KEYS = {
 # Toggle for the row-column status-text cell (the words summary). Off keeps the
 # badge icons but clears the text. Defaults on.
 STATUS_TEXT_SETTING_KEY = "show_status_text"
+IGNORE_SUBMODULES_SETTING_KEY = "ignore_submodules"
 # Default NETWORK poll interval. Sized so worst-case (every key changes every
 # tick, so each spends a REST + a GraphQL query) stays well under the user's
 # shared 5000/hr budgets: at 120s a 20-key workspace tops out around 600 REST
@@ -190,6 +191,7 @@ class Runtime:
         self._chip_flags: frozenset[str] = frozenset(CHIP_SETTING_KEYS.values())
         # Whether the row-column status text is shown; resolved in run(), on until.
         self._show_status_text = True
+        self._ignore_submodules = True
         self._next_network: float | None = None
         self._next_poll: float | None = None
 
@@ -312,7 +314,8 @@ class Runtime:
         if only_session is not None:
             sessions = [s for s in sessions if s.get("id") == only_session]
         with contextlib.suppress(Exception):
-            snapshot = refresh.build_snapshot(sessions, force=force)
+            self._ignore_submodules = self.resolve_ignore_submodules()
+            snapshot = refresh.build_snapshot(sessions, force=force, ignore_submodules=self._ignore_submodules)
             current_ids: set[str] = set()
             for params in uistate.snapshot_ui_state_params(
                 snapshot, chips_on=self._chip_flags, show_column=self._show_status_text
@@ -380,15 +383,20 @@ class Runtime:
         (``config.get``). Each defaults on, so a missing/unanswered setting keeps
         the chip visible rather than silently hiding state the user did not opt
         out of."""
-        return frozenset(category for key, category in CHIP_SETTING_KEYS.items() if self._setting_on(key))
+        return frozenset(
+            category for key, category in CHIP_SETTING_KEYS.items() if self._setting_bool(key, default=True)
+        )
 
-    def _setting_on(self, key: str) -> bool:
+    def resolve_ignore_submodules(self) -> bool:
+        return self._setting_bool(IGNORE_SUBMODULES_SETTING_KEY, default=self._ignore_submodules)
+
+    def _setting_bool(self, key: str, *, default: bool) -> bool:
         if self.stopped:
-            return True
+            return default
         result = self.call_host(CONFIG_GET, {"key": key})
         if isinstance(result, dict) and isinstance(result.get("value"), bool):
             return bool(result["value"])
-        return True
+        return default
 
     def _refresh_and_reset(
         self,
@@ -429,7 +437,8 @@ class Runtime:
         # Resolve chip-visibility settings before the first push so the startup
         # row reflects the user's choices, not the all-on default.
         self._chip_flags = self.resolve_chip_flags()
-        self._show_status_text = self._setting_on(STATUS_TEXT_SETTING_KEY)
+        self._show_status_text = self._setting_bool(STATUS_TEXT_SETTING_KEY, default=True)
+        self._ignore_submodules = self.resolve_ignore_submodules()
         # Proactive refresh on startup so slots populate before any user action.
         self.run_refresh()
         self._seen_ids = set(self.pushed_session_ids)

@@ -63,6 +63,25 @@ def test_missing_setting_falls_back_to_default(monkeypatch):
     assert _resolve_with(feed)[0] == main.DEFAULT_REFRESH_SECS
 
 
+def test_ignore_submodules_setting_defaults_on():
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: {"value": None}
+    assert rt.resolve_ignore_submodules() is True
+
+
+def test_ignore_submodules_setting_respects_false():
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: {"value": False}
+    assert rt.resolve_ignore_submodules() is False
+
+
+def test_ignore_submodules_setting_keeps_last_value_when_host_unavailable():
+    rt = main.Runtime(send=lambda _m: None)
+    rt._ignore_submodules = False
+    rt.call_host = lambda *_a, **_kw: None
+    assert rt.resolve_ignore_submodules() is False
+
+
 def test_bool_value_is_not_a_valid_interval(monkeypatch):
     monkeypatch.setenv("AOE_GITHUB_UI_REFRESH_SECS", "120")
 

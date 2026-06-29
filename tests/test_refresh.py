@@ -57,6 +57,13 @@ def _make_repo(path, remote="https://github.com/o/r.git", branch="feature"):
     _git(path, "remote", "add", "origin", remote)
 
 
+def _make_submodule(parent, name):
+    source = parent.parent / f"{name}_source"
+    _make_repo(source, remote=f"https://github.com/o/{name}.git")
+    _git(parent, "-c", "protocol.file.allow=always", "submodule", "add", str(source), name)
+    return parent / name
+
+
 @pytest.fixture(autouse=True)
 def _clear_cache():
     def _reset():
@@ -87,6 +94,31 @@ def test_discovery_workspace_root_repo_does_not_report_children(tmp_path):
     (ws / "src").mkdir()
     found = list(refresh.discover_checkouts(str(ws)))
     assert found == [str(ws)]
+
+
+def test_discovery_ignores_child_submodules_when_enabled(tmp_path):
+    ws = tmp_path / "ws"
+    _make_repo(ws)
+    submodule = _make_submodule(ws, "dep")
+    found = set(refresh.discover_checkouts(str(ws), ignore_submodules=True))
+    assert found == {str(ws)}
+    found_with_submodules = set(refresh.discover_checkouts(str(ws), ignore_submodules=False))
+    assert found_with_submodules == {str(ws), str(submodule)}
+
+
+def test_discovery_keeps_normal_child_checkouts_when_ignoring_submodules(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "repo_a")
+    found = {p.rsplit("/", 1)[-1] for p in refresh.discover_checkouts(str(ws), ignore_submodules=True)}
+    assert found == {"repo_a"}
+
+
+def test_discovery_keeps_workspace_root_submodule(tmp_path):
+    superproject = tmp_path / "super"
+    _make_repo(superproject)
+    submodule = _make_submodule(superproject, "ws")
+    assert refresh.discover_checkouts(str(submodule), ignore_submodules=True) == [str(submodule)]
 
 
 def _transport(pulls, etag='W/"v1"', capture=None):

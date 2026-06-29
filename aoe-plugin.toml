@@ -151,6 +151,14 @@ description = "Show the words summary at the end of each session row (e.g. \"CI 
 type = "boolean"
 default = true
 
+[[settings]]
+key = "ignore_submodules"
+label = "Ignore Git submodules"
+description = "Skip Git submodule checkouts discovered under a session workspace. The workspace root itself is still scanned even if it is a submodule."
+type = "boolean"
+default = true
+advanced = true
+
 # UI extension points. The host renders each slot; the worker pushes display
 # state through the `ui.state.set` host RPC (wired by #2366). Two per-session
 # surfaces: a `row-badge` that shows one colored PR icon per repo with an open
