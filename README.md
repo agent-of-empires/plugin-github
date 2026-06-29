@@ -137,9 +137,10 @@ session-less `github.refresh` cover every session and prune vanished ones:
    a `pane`
    (`{title, default_location, icon, blocks: [...]}` -- the in-session GitHub
    tool-window listing, per PR, a headline row, a review-state row, a Checks
-   section, and an unresolved-comments section; `icon` is a lucide name for its
-   activity-bar button). The pane ends with an `action` block ("Refresh") whose
-   click POSTs back to the host, which forwards `github.refresh` to this worker.
+   section, an unresolved-comments section, a last-refresh row, and an `action`
+   block ("Refresh") whose click POSTs back to the host, which forwards
+   `github.refresh` to this worker; `icon` is a lucide name for its activity-bar
+   button).
 
 Rate limits: the user token's budgets (REST 5000 req/hr, GraphQL 5000 points/hr)
 are shared with the user's own `gh` usage, so the worker spends as little as it

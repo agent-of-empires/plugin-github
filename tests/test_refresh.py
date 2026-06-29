@@ -62,6 +62,7 @@ def _clear_cache():
     def _reset():
         refresh._etag_cache.clear()
         refresh._graphql_cache.clear()
+        refresh._session_refresh_cache.clear()
         refresh._backoff.update({"until": 0.0, "reset_known": False, "notified": False})
 
     _reset()
@@ -193,6 +194,59 @@ def test_no_token_marks_auth_absent(tmp_path):
     assert snap["auth"]["present"] is False
 
 
+def test_successful_basic_refresh_records_freshness(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    monkeypatch.setattr(refresh, "_utc_now_iso", lambda: "2026-06-29T14:32:10Z")
+
+    snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull()]))
+
+    assert snap["sessions"][0]["freshness"] == {
+        "refreshed_at": "2026-06-29T14:32:10Z",
+        "stale": False,
+    }
+
+
+def test_unchanged_basic_refresh_advances_freshness(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    times = iter(["2026-06-29T14:00:00Z", "2026-06-29T14:05:00Z"])
+    monkeypatch.setattr(refresh, "_utc_now_iso", lambda: next(times))
+    transport = _transport([_pull(number=99)])
+
+    refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
+    second = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
+
+    assert second["sessions"][0]["freshness"] == {
+        "refreshed_at": "2026-06-29T14:05:00Z",
+        "stale": False,
+    }
+
+
+def test_backoff_cached_basic_refresh_keeps_prior_freshness(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    times = iter(["2026-06-29T14:00:00Z", "2026-06-29T14:05:00Z"])
+    monkeypatch.setattr(refresh, "_utc_now_iso", lambda: next(times))
+
+    refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull(number=5)]))
+    refresh._backoff["until"] = time.monotonic() + 60
+    snap = refresh.build_snapshot(
+        sessions, env=_NoToken(), transport=httpx.MockTransport(lambda _request: httpx.Response(500))
+    )
+
+    assert snap["sessions"][0]["freshness"] == {
+        "refreshed_at": "2026-06-29T14:00:00Z",
+        "stale": True,
+    }
+
+
 # --- rich GraphQL path (token present) ---
 
 
@@ -294,6 +348,24 @@ def test_graphql_path_parses_rich_fields(tmp_path):
     assert pull["checks"]["runs"][0] == {"name": "test", "state": "succeeded", "url": "https://ci/test"}
     assert pull["comments"]["unresolved"] == 1
     assert pull["comments"]["items"][0]["author"] == "al"
+
+
+def test_forced_rich_refresh_advances_freshness_when_data_unchanged(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    times = iter(["2026-06-29T14:00:00Z", "2026-06-29T14:05:00Z"])
+    monkeypatch.setattr(refresh, "_utc_now_iso", lambda: next(times))
+    transport = _rich_transport([_gql_node(number=7)])
+
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    second = refresh.build_snapshot(sessions, env=_Env(), transport=transport, force=True)
+
+    assert second["sessions"][0]["freshness"] == {
+        "refreshed_at": "2026-06-29T14:05:00Z",
+        "stale": False,
+    }
 
 
 def test_graphql_merged_pull_flagged(tmp_path):
@@ -439,11 +511,13 @@ def test_graphql_keeps_partial_data_with_rate_limit_error(tmp_path):
 # --- rate-limit notice (issue #20) ---
 
 
-def test_forced_refresh_during_backoff_emits_one_notice(tmp_path):
+def test_forced_refresh_during_backoff_emits_one_notice(tmp_path, monkeypatch):
     ws = tmp_path / "ws"
     ws.mkdir()
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
+    times = iter(["2026-06-29T14:00:00Z", "2026-06-29T14:05:00Z", "2026-06-29T14:06:00Z"])
+    monkeypatch.setattr(refresh, "_utc_now_iso", lambda: next(times))
     refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=42)]))
     _expire_graphql_cache()
     # A GraphQL secondary rate limit on a forced refresh: serve stale + announce.
@@ -452,6 +526,10 @@ def test_forced_refresh_during_backoff_emits_one_notice(tmp_path):
     notice = snap.get("rate_limit_notice")
     assert notice is not None
     assert notice["reset_known"] is False  # errors-only response carries no resetAt
+    assert snap["sessions"][0]["freshness"] == {
+        "refreshed_at": "2026-06-29T14:00:00Z",
+        "stale": True,
+    }
     # A second forced refresh in the same window must not re-announce.
     snap2 = refresh.build_snapshot(sessions, env=_Env(), transport=rl, force=True)
     assert "rate_limit_notice" not in snap2

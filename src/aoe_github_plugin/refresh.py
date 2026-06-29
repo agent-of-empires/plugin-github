@@ -89,6 +89,9 @@ _etag_cache: dict[RepoKey, dict[str, Any]] = {}  # key -> {"etag", "pulls"}
 # Last-good rich (GraphQL) result per key: {"pulls", "fetched_at"}. Serves the
 # TTL window and is the stale fallback while rate-limited.
 _graphql_cache: dict[RepoKey, dict[str, Any]] = {}
+# Last successful full refresh per session id, scoped to the repo-key set so a
+# changed workspace never inherits a timestamp from unrelated data.
+_session_refresh_cache: dict[str, dict[str, Any]] = {}
 # Mutable holder (not a bare module float) so updating it needs no `global`.
 #   until        - time.monotonic() seconds; HTTP is skipped until then.
 #   reset_known  - True iff `until` came from a parsed GraphQL `resetAt` (so the
@@ -96,6 +99,16 @@ _graphql_cache: dict[RepoKey, dict[str, Any]] = {}
 #   notified     - whether this window's user-facing notice has been emitted, so
 #                  a user-initiated refresh announces a backoff at most once.
 _backoff: dict[str, Any] = {"until": 0.0, "reset_known": False, "notified": False}
+
+
+def _utc_now_iso() -> str:
+    """Current UTC wall-clock time for user-facing freshness metadata."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _pulls_result(pulls: list[dict[str, Any]], *, fresh: bool, stale: bool = False) -> dict[str, Any]:
+    """Per-key result fragment with internal freshness flags for aggregation."""
+    return {"pulls": pulls, "_fresh": fresh, "_stale": stale}
 
 
 def _git(path: str, *args: str) -> str | None:
@@ -245,20 +258,21 @@ def _forced_rate_limit_notice(*, force: bool) -> dict[str, Any]:
     return {"rate_limit_notice": notice} if notice is not None else {}
 
 
-def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str, Any]]]:
+def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str, Any]], bool]:
     """Cheap REST conditional check for one ``(owner, repo, branch)``: returns
-    ``(changed, pulls)`` where ``changed`` is ``False`` on a ``304`` (the open-PR
-    list is unchanged, the request was free against the primary limit). Uses the
+    ``(changed, pulls, fresh)`` where ``changed`` is ``False`` on a ``304`` (the
+    open-PR list is unchanged, the request was free against the primary limit).
+    A ``304`` is still fresh for the basic REST representation. Uses the
     ETag cache and honors the backoff gate; a blocked or rate-limited probe with
-    a cached value reports ``changed=False`` and serves the cache, and only
-    raises ``GitHubError`` when there is nothing to fall back on."""
+    a cached value reports ``fresh=False`` because it serves stale fallback, and
+    only raises ``GitHubError`` when there is nothing to fall back on."""
     owner, repo, branch = key
     with _cache_lock:
         cached = _etag_cache.get(key)
         blocked = time.monotonic() < _backoff["until"]
     if blocked:
         if cached is not None:
-            return False, cached["pulls"]
+            return False, cached["pulls"], False
         raise RateLimitedError
     etag = cached["etag"] if cached else None
     params = {"state": "open", "head": f"{owner}:{branch}", "per_page": "10"}
@@ -267,33 +281,34 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
     except RateLimitedError:
         _set_backoff()
         if cached is not None:
-            return False, cached["pulls"]
+            return False, cached["pulls"], False
         raise
     if status == 304 and cached is not None:
-        return False, cached["pulls"]
+        return False, cached["pulls"], True
     pulls = _trim(raw or [])
     with _cache_lock:
         _etag_cache[key] = {"etag": new_etag, "pulls": pulls}
-    return True, pulls
+    return True, pulls, True
 
 
-def _fetch_key(client: GitHubClient, key: RepoKey) -> list[dict[str, Any]]:
+def _fetch_key(client: GitHubClient, key: RepoKey) -> tuple[list[dict[str, Any]], bool]:
     """Open PRs for one ``(owner, repo, branch)`` via the basic REST path (no
     token). The conditional probe is the whole job here; the change flag only
     matters on the token path, which gates GraphQL on it."""
-    _, pulls = _rest_probe(client, key)
-    return pulls
+    _, pulls, fresh = _rest_probe(client, key)
+    return pulls, fresh
 
 
 def _fetch_one_basic(client: GitHubClient, key: RepoKey) -> dict[str, Any]:
     """Fail-soft no-token result for one key: a typed error or any surprise
     becomes an error entry for that key, never aborting the whole refresh."""
     try:
-        return {"pulls": _fetch_key(client, key)}
+        pulls, fresh = _fetch_key(client, key)
+        return _pulls_result(pulls, fresh=fresh, stale=not fresh)
     except GitHubError as exc:
         return _error_entry(exc)
     except Exception as exc:  # noqa: BLE001 - fail-soft per repo, never abort the refresh
-        return {"error": {"kind": "internal", "hint": f"refresh failed: {exc}"}}
+        return {"error": {"kind": "internal", "hint": f"refresh failed: {exc}"}, "_fresh": False, "_stale": True}
 
 
 def _graphql_rate_limited(data: dict[str, Any]) -> bool:
@@ -305,7 +320,7 @@ def _graphql_rate_limited(data: dict[str, Any]) -> bool:
 
 def _error_entry(exc: GitHubError) -> dict[str, Any]:
     """A typed error rendered as the per-key result fragment the UI mapper reads."""
-    return {"error": {"kind": exc.kind, "hint": str(exc)}}
+    return {"error": {"kind": exc.kind, "hint": str(exc)}, "_fresh": False, "_stale": True}
 
 
 def _is_active(pulls: list[dict[str, Any]]) -> bool:
@@ -394,7 +409,7 @@ def _fallback_pulls(pending: dict[str, Any]) -> dict[str, Any]:
     rich cache if present, else the basic REST open-PR pulls. Never an error and
     never accidentally empty, preserving the fail-soft per-key contract."""
     rich = pending["rich"]
-    return {"pulls": rich["pulls"] if rich is not None else pending["basic"]}
+    return _pulls_result(rich["pulls"] if rich is not None else pending["basic"], fresh=False, stale=True)
 
 
 def _chunk_fallback(
@@ -421,11 +436,11 @@ def _resolve_null_repository(
     for key in chunk:
         rich = pending[key]["rich"]
         if rich is not None:
-            out[key] = {"pulls": rich["pulls"]}
+            out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True)
         elif errored:
-            out[key] = {"pulls": pending[key]["basic"]}
+            out[key] = _pulls_result(pending[key]["basic"], fresh=False, stale=True)
         else:
-            out[key] = {"pulls": []}
+            out[key] = _pulls_result([], fresh=True)
 
 
 def _apply_aliases(
@@ -453,7 +468,7 @@ def _apply_aliases(
         pulls = graphql.normalize_connection(conn)
         with _cache_lock:
             _graphql_cache[key] = {"pulls": pulls, "fetched_at": now}
-        out[key] = {"pulls": pulls}
+        out[key] = _pulls_result(pulls, fresh=True)
 
 
 def _fetch_chunk(
@@ -517,12 +532,12 @@ def _fetch_rich(client: GitHubClient, keys: list[RepoKey], *, force: bool) -> di
         with _cache_lock:
             rich = _graphql_cache.get(key)
         try:
-            changed, basic = _rest_probe(client, key)
+            changed, basic, _fresh = _rest_probe(client, key)
         except GitHubError as exc:
-            out[key] = {"pulls": rich["pulls"]} if rich is not None else _error_entry(exc)
+            out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True) if rich is not None else _error_entry(exc)
             continue
         if rich is not None and not force and not changed and not _rich_stale(rich, now):
-            out[key] = {"pulls": rich["pulls"]}
+            out[key] = _pulls_result(rich["pulls"], fresh=False)
             continue
         pending[key] = {"basic": basic, "rich": rich}
 
@@ -537,8 +552,46 @@ def _fetch_rich(client: GitHubClient, keys: list[RepoKey], *, force: bool) -> di
                 _fetch_chunk(client, chunk, pending, out)
             except Exception as exc:  # noqa: BLE001 - fail-soft per repo, never abort the refresh
                 for key in chunk:
-                    out.setdefault(key, {"error": {"kind": "internal", "hint": f"refresh failed: {exc}"}})
+                    out.setdefault(
+                        key,
+                        {
+                            "error": {"kind": "internal", "hint": f"refresh failed: {exc}"},
+                            "_fresh": False,
+                            "_stale": True,
+                        },
+                    )
     return out
+
+
+def _session_fingerprint(keys: list[RepoKey]) -> tuple[RepoKey, ...]:
+    """Stable identity for the GitHub data a session pane displays."""
+    return tuple(sorted(set(keys)))
+
+
+def _session_freshness(
+    session_id: Any,
+    fingerprint: tuple[RepoKey, ...],
+    results: list[dict[str, Any]],
+    refreshed_at: str,
+) -> dict[str, Any] | None:
+    """Freshness metadata for one session, conservative on partial failure."""
+    if not isinstance(session_id, str) or not fingerprint:
+        return None
+    all_fresh = all(result.get("_fresh") is True and not result.get("error") for result in results)
+    stale = any(
+        result.get("_stale") is True
+        or result.get("error") is not None
+        or (result.get("_fresh") is not True and not result.get("pulls"))
+        for result in results
+    )
+    with _cache_lock:
+        cached = _session_refresh_cache.get(session_id)
+        if all_fresh:
+            _session_refresh_cache[session_id] = {"fingerprint": fingerprint, "refreshed_at": refreshed_at}
+            return {"refreshed_at": refreshed_at, "stale": False}
+        if cached and cached.get("fingerprint") == fingerprint:
+            return {"refreshed_at": cached["refreshed_at"], "stale": stale}
+    return None
 
 
 def _fetch_all(
@@ -613,10 +666,12 @@ def build_snapshot(
                 keys.add(key)
 
     fetched, auth_present = _fetch_all(keys, env, transport, force=force)
+    refreshed_at = _utc_now_iso()
 
     out_sessions: list[dict[str, Any]] = []
     for session, checkouts in per_session:
         repos: list[dict[str, Any]] = []
+        session_keys: list[RepoKey] = []
         for checkout in checkouts:
             repo_str, key = ident[os.path.realpath(checkout)]
             entry: dict[str, Any] = {
@@ -628,18 +683,27 @@ def build_snapshot(
                 "error": None,
             }
             if key is not None:
+                session_keys.append(key)
                 result = fetched.get(key, {})
                 entry["pulls"] = result.get("pulls", [])
                 entry["error"] = result.get("error")
             repos.append(entry)
-        out_sessions.append(
-            {
-                "session_id": session.get("id"),
-                "title": session.get("title") or "",
-                "project_path": session.get("project_path"),
-                "repos": repos,
-            }
+        fingerprint = _session_fingerprint(session_keys)
+        freshness = _session_freshness(
+            session.get("id"),
+            fingerprint,
+            [fetched.get(key, {}) for key in fingerprint],
+            refreshed_at,
         )
+        out_session = {
+            "session_id": session.get("id"),
+            "title": session.get("title") or "",
+            "project_path": session.get("project_path"),
+            "repos": repos,
+        }
+        if freshness is not None:
+            out_session["freshness"] = freshness
+        out_sessions.append(out_session)
     # A forced refresh that is rate-limited carries a one-shot notice so the main
     # loop can tell the user why nothing changed (issue #20); background ticks
     # stay silent. See _forced_rate_limit_notice.
