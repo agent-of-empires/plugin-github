@@ -46,13 +46,28 @@ def _column(params, sid="s1"):
     return next(p for p in params if p["slot"] == "row-column" and p["session_id"] == sid)
 
 
+def _sort_key(params):
+    return next(p for p in params if p["slot"] == "sort-key")
+
+
+def _rows(blocks):
+    rows = []
+    for block in blocks:
+        if block.get("kind") == "row":
+            rows.append(block)
+        if block.get("kind") == "section":
+            rows.extend(child for child in block.get("children", []) if child.get("kind") == "row")
+    return rows
+
+
 def test_each_session_gets_a_badge_and_a_pane_with_session_id():
     params = uistate.snapshot_ui_state_params(_snapshot(_session("s1"), _session("s2")))
     badges = {p["session_id"] for p in params if p["slot"] == "row-badge"}
     panes = {p["session_id"] for p in params if p["slot"] == "pane"}
     assert badges == {"s1", "s2"}
     assert panes == {"s1", "s2"}
-    assert all("session_id" in p for p in params)
+    assert all("session_id" in p for p in params if p["slot"] != "sort-key")
+    assert "session_id" not in _sort_key(params)
 
 
 def test_no_global_status_bar():
@@ -109,18 +124,20 @@ def test_badge_keeps_href_even_when_status_column_hidden():
     session = _session(repos=[_repo(name="a", pulls=[_pull(number=7)])])
     params = uistate.snapshot_ui_state_params(_snapshot(session), show_column=False)
     assert _badge(params)["payload"]["href"] == "https://github.com/o/r/pull/7"
-    assert _column(params)["payload"] == {}
+    assert _column(params)["payload"] == {"text": "", "sort_value": uistate._ATTENTION_VISUAL["open"][0]}
 
 
 def test_pane_has_heading_and_a_row_per_repo():
-    session = _session(repos=[_repo(name="a", pulls=[_pull(number=9, title="Add x")]), _repo(name="b")])
+    session = _session(repos=[_repo(name="b"), _repo(name="a", pulls=[_pull(number=9, title="Add x")])])
     blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["blocks"]
     assert blocks[0] == {"kind": "heading", "text": "GitHub"}
-    rows = [b for b in blocks if b["kind"] == "row"]
+    rows = _rows(blocks)
     assert [r["label"] for r in rows] == ["a", "b"]
     assert rows[0]["value"] == "PR #9 Add x"
     assert rows[0]["href"] == "https://github.com/o/r/pull/9"
     assert rows[1]["value"] == "no open PR"
+    section = next(b for b in blocks if b.get("kind") == "section" and b.get("title") == "Repos without open PRs (1)")
+    assert section["collapsed"] is True
 
 
 def test_pane_ends_with_a_refresh_action():
@@ -181,8 +198,26 @@ def test_empty_snapshot_yields_no_pushes():
     assert uistate.snapshot_ui_state_params({}) == []
 
 
+def test_empty_sessions_snapshot_emits_sort_key_only():
+    params = uistate.snapshot_ui_state_params({"sessions": []})
+    assert params == [
+        {
+            "slot": uistate.SORT_KEY_SLOT[0],
+            "id": uistate.SORT_KEY_SLOT[1],
+            "payload": uistate.SORT_KEY_PAYLOAD,
+        }
+    ]
+
+
 def test_session_without_id_is_skipped():
-    assert uistate.snapshot_ui_state_params(_snapshot(_session(session_id=None))) == []
+    params = uistate.snapshot_ui_state_params(_snapshot(_session(session_id=None)))
+    assert params == [
+        {
+            "slot": uistate.SORT_KEY_SLOT[0],
+            "id": uistate.SORT_KEY_SLOT[1],
+            "payload": uistate.SORT_KEY_PAYLOAD,
+        }
+    ]
 
 
 # --- rich (token) rendering ---
@@ -283,6 +318,29 @@ def test_passing_checks_section_starts_collapsed():
     assert checks_section["collapsed"] is True
 
 
+def test_pane_keeps_no_pr_repos_direct_when_nothing_is_actionable():
+    blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(_session(repos=[_repo(name="a"), _repo(name="b")]))))[
+        "payload"
+    ]["blocks"]
+    rows = _rows(blocks)
+    assert [r["label"] for r in rows] == ["a", "b"]
+    assert not [b for b in blocks if b.get("title") == "Repos without open PRs (2)"]
+
+
+def test_pane_treats_merged_only_repo_as_no_open_pr_for_ordering():
+    session = _session(
+        repos=[
+            _repo(name="merged", pulls=[_rich_pull(state="MERGED", merged=True)]),
+            _repo(name="open", pulls=[_pull(number=1)]),
+        ]
+    )
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(session)))["payload"]["blocks"]
+    rows = _rows(blocks)
+    assert [r["label"] for r in rows] == ["open", "merged"]
+    section = next(b for b in blocks if b.get("title") == "Repos without open PRs (1)")
+    assert section["collapsed"] is True
+
+
 def test_pane_payload_stays_under_host_size_cap():
     # A many-repo workspace with long comments would blow the 64KB/entry host cap;
     # the pane must trim to fit (and keep the heading + refresh action).
@@ -326,6 +384,15 @@ def test_each_session_gets_a_row_column():
     params = uistate.snapshot_ui_state_params(_snapshot(_session("s1"), _session("s2")))
     cols = {p["session_id"] for p in params if p["slot"] == "row-column"}
     assert cols == {"s1", "s2"}
+
+
+def test_snapshot_emits_global_sort_key():
+    params = uistate.snapshot_ui_state_params(_snapshot(_session()))
+    assert _sort_key(params) == {
+        "slot": uistate.SORT_KEY_SLOT[0],
+        "id": uistate.SORT_KEY_SLOT[1],
+        "payload": uistate.SORT_KEY_PAYLOAD,
+    }
 
 
 def test_badge_emits_pr_review_ci_comment_chip_sequence():
@@ -426,8 +493,8 @@ def test_column_skips_disabled_category_and_falls_through():
 def test_show_column_false_clears_status_text_but_keeps_badge():
     repos = [_repo(pulls=[_rich_pull(review="changes-requested")])]
     params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos)), show_column=False)
-    # The row-column is still pushed (to clear) but empty; the badge still has chips.
-    assert _column(params)["payload"] == {}
+    # The row-column hides words but keeps the sort scalar; the badge still has chips.
+    assert _column(params)["payload"] == {"text": "", "sort_value": uistate._ATTENTION_VISUAL["changes-requested"][0]}
     assert _badge(params)["payload"]["items"]
 
 
@@ -435,8 +502,9 @@ def test_column_summarizes_top_attention_with_text_and_tone():
     payload = _column_payload([_repo(pulls=[_rich_pull(review="changes-requested")])])
     assert payload["text"] == "changes requested"
     assert payload["tone"] == "danger"
-    assert payload["icon"] == "circle-x"
-    assert payload["href"] == "https://github.com/o/r/pull/5"
+    assert "icon" not in payload
+    assert "href" not in payload
+    assert payload["sort_value"] == uistate._ATTENTION_VISUAL["changes-requested"][0]
 
 
 def test_column_picks_most_urgent_repo_across_workspace():
@@ -466,7 +534,8 @@ def test_column_surfaces_repo_error():
     payload = _column_payload([_repo(error={"kind": "rate_limited", "hint": "rate limited"})])
     assert payload["text"] == "error"
     assert payload["tone"] == "danger"
-    assert payload["icon"] == "circle-alert"
+    assert "icon" not in payload
+    assert payload["sort_value"] == uistate._ATTENTION_VISUAL["error"][0]
 
 
 def test_row_degrades_without_token():

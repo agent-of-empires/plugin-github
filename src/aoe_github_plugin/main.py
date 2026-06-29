@@ -335,7 +335,7 @@ class Runtime:
                 # Full refresh: the snapshot is the whole truth, so a session
                 # that dropped out has vanished and its slots are pruned.
                 for sid in self.pushed_session_ids - current_ids:
-                    for slot, slot_id in (uistate.ROW_BADGE_SLOT, uistate.PANE_SLOT):
+                    for slot, slot_id in (uistate.ROW_BADGE_SLOT, uistate.ROW_COLUMN_SLOT, uistate.PANE_SLOT):
                         self.send(
                             {
                                 "jsonrpc": "2.0",

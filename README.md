@@ -45,7 +45,7 @@ anything is written.
 | Command | `refresh` -> worker method `github.refresh`                        |
 | Command | `open` (open-in-GitHub) -> worker method `github.open`             |
 | Command | `open_pr` (`GitHub: open PR`) -> client `open-ui-link` action, default chord `Ctrl+Shift+G` |
-| UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), and a `pane` tool-window (`github_pane`) |
+| UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
 `open_pr` is the command-palette / shortcut way to open the active session's PR
@@ -123,7 +123,7 @@ session-less `github.refresh` cover every session and prune vanished ones:
    a workspace of many worktrees of one repo costs a single query (split into a
    few once it exceeds the per-query alias cap). Without a token it is the basic
    REST open-PR lookup only.
-4. Push three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
+4. Push one global `sort-key` and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
    chip sequence per open PR: a clickable PR icon, then review-state, CI-rollup,
    and unresolved-comment chips, each shown only when a token supplies that field,
    concatenated across the workspace's repos, plus an error marker per failed
@@ -132,10 +132,12 @@ session-less `github.refresh` cover every session and prune vanished ones:
    distinguishing a broken PR from a healthy one at a glance; a draft shows the PR
    chip alone and merged-only repos are omitted, since the badge is an actionable
    indicator), a `row-column`
-   (`{text, tone, icon, tooltip, href?}`, or `{}` to clear -- one deterministic
+   (`{text, tone, tooltip, sort_value?}`, or `{}` to clear -- one deterministic
    words summary of the session's most-urgent PR signal so the list is scannable
    without hovering the badge; a multi-repo workspace collapses to its single
-   highest-attention candidate, with the pane keeping the per-repo breakdown), and
+   highest-attention candidate, with the pane keeping the per-repo breakdown;
+   `sort_value` lets the dashboard sort sessions by GitHub PR attention, even
+   when `show_status_text` hides the visible words), and
    a `pane`
    (`{title, default_location, icon, blocks: [...]}` -- the in-session GitHub
    tool-window listing, per PR, a headline row, a review-state row, a Checks

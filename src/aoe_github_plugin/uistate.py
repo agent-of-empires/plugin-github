@@ -1,8 +1,12 @@
 """Turn a refresh snapshot into host ``ui.state.set`` params (pure, no IO).
 
 The host renders the slots; the worker only pushes typed display state. From one
-aggregate snapshot (see ``refresh.build_snapshot``) this produces, per session,
-three pushes:
+aggregate snapshot (see ``refresh.build_snapshot``) this produces one global
+sort option plus three pushes per session:
+
+- a global ``sort-key`` whose payload points at the ``github_pr_status``
+  ``row-column`` and sorts by the same PR attention rank the row already uses.
+  The host keeps the sorting client-side over the pushed scalar values.
 
 - a ``row-badge`` whose payload is ``{"items": [...]}`` -- a chip sequence per
   open PR (a PR affordance, then review-state, CI-rollup, and unresolved-comment
@@ -13,11 +17,12 @@ three pushes:
   (#36). A draft shows the PR chip alone; merged-only repos are omitted, since the
   badge is an actionable indicator. Every chip's href opens that PR; the pane
   carries the full detail.
-- a ``row-column`` whose payload is ``{"text", "tone", "icon", "tooltip",
-  "href"?}`` (or ``{}`` to clear) -- one deterministic words summary of the
-  session's most-urgent PR signal, so the list is scannable without hovering the
-  badge or opening the pane. Multi-repo workspaces collapse to their single
-  highest-attention candidate; the pane keeps the per-repo breakdown.
+- a ``row-column`` whose payload is ``{"text", "tone", "tooltip",
+  "sort_value"?}`` (or ``{}`` to clear) -- one deterministic words
+  summary of the session's most-urgent PR signal, so the list is scannable
+  without hovering the badge or opening the pane. Multi-repo workspaces collapse
+  to their single highest-attention candidate; the pane keeps the per-repo
+  breakdown.
 - a ``pane`` (the in-session GitHub tool-window, opened in the right dock by
   default via ``default_location``) whose payload is a flexible
   ``{"title", "blocks": [...]}`` block list. Per PR the pane shows a headline
@@ -52,6 +57,8 @@ ROW_BADGE_SLOT = ("row-badge", "github_pr_badge")
 # the session list is scannable without opening the pane. The badge (per repo)
 # carries the icon; this carries the words.
 ROW_COLUMN_SLOT = ("row-column", "github_pr_status")
+SORT_KEY_SLOT = ("sort-key", "github_pr_attention")
+SORT_KEY_PAYLOAD = {"label": "GitHub PR attention", "column": ROW_COLUMN_SLOT[1], "direction": "asc"}
 PANE_SLOT = ("pane", "github_pane")
 # Dock the GitHub pane opens in by default; the user can move it after.
 PANE_DEFAULT_LOCATION = "right"
@@ -252,35 +259,55 @@ def _badge_items(repos: list[dict[str, Any]], chips_on: frozenset[str]) -> list[
     return items
 
 
-def _status_column(repos: list[dict[str, Any]], chips_on: frozenset[str]) -> dict[str, Any]:
-    """A single per-session summary cell: the highest-attention PR (or repo error)
-    across the workspace, as ``{text, tone, icon, tooltip, href?}``. Returns ``{}``
-    when there is nothing worth showing (no open PR, no error), which clears any
-    stale row state on the next push. A disabled category (``chips_on``) is skipped
-    here too, so a hidden chip never resurfaces as the column text.
-
-    ponytail: one winning candidate, not per-repo detail. A multi-repo workspace
-    collapses to its single most-urgent signal here; the pane keeps the full
-    breakdown. Add per-repo cells only if multi-repo rows prove confusing.
-    """
-    best: tuple[int, dict[str, Any]] | None = None
+def _status_candidate(
+    repos: list[dict[str, Any]], chips_on: frozenset[str]
+) -> tuple[int, dict[str, Any], str | None] | None:
+    """Highest-attention row-column payload plus the PR href the badge opens."""
+    best: tuple[int, dict[str, Any], str | None] | None = None
     for repo in repos:
         tooltip = _badge_tooltip(repo, chips_on)
+        href: str | None = None
         if repo.get("error"):
-            rank, icon, tone, label = _ATTENTION_VISUAL["error"]
-            cell: dict[str, Any] = {"text": label, "tone": tone, "icon": icon, "tooltip": tooltip}
+            rank, _icon, tone, label = _ATTENTION_VISUAL["error"]
+            cell: dict[str, Any] = {"text": label, "tone": tone, "tooltip": tooltip, "sort_value": rank}
         else:
             top = _top_attention_pull(repo, chips_on)
             if top is None:
                 continue
             pull, kind = top
-            rank, icon, tone, label = _ATTENTION_VISUAL[kind]
-            cell = {"text": label, "tone": tone, "icon": icon, "tooltip": tooltip}
-            if pull.get("url"):
-                cell["href"] = pull["url"]
+            rank, _icon, tone, label = _ATTENTION_VISUAL[kind]
+            cell = {"text": label, "tone": tone, "tooltip": tooltip, "sort_value": rank}
+            href = pull.get("url") if isinstance(pull.get("url"), str) else None
         if best is None or rank < best[0]:
-            best = (rank, cell)
-    return best[1] if best else {}
+            best = (rank, cell, href)
+    return best
+
+
+def _status_column(repos: list[dict[str, Any]], chips_on: frozenset[str], *, show_text: bool = True) -> dict[str, Any]:
+    """A single per-session summary cell: the highest-attention PR (or repo error)
+    across the workspace, as ``{text, tone, tooltip, sort_value}``. Returns ``{}``
+    when there is nothing worth showing (no open PR, no error), which clears any
+    stale row state on the next push. A disabled category (``chips_on``) is skipped
+    here too, so a hidden chip never resurfaces as the column text. When
+    ``show_text`` is false, keep an empty text field plus the sort scalar so the
+    host validates the row-column payload and the sidebar sort still works without
+    rendering words.
+
+    ponytail: one winning candidate, not per-repo detail. A multi-repo workspace
+    collapses to its single most-urgent signal here; the pane keeps the full
+    breakdown. Add per-repo cells only if multi-repo rows prove confusing.
+    """
+    candidate = _status_candidate(repos, chips_on)
+    if candidate is None:
+        return {}
+    if show_text:
+        return candidate[1]
+    return {"text": "", "sort_value": candidate[0]}
+
+
+def _status_href(repos: list[dict[str, Any]], chips_on: frozenset[str]) -> str | None:
+    candidate = _status_candidate(repos, chips_on)
+    return candidate[2] if candidate else None
 
 
 def _pull_visual(pull: dict[str, Any]) -> tuple[str, str | None, str | None]:
@@ -434,6 +461,50 @@ def _pane_repo_blocks(repo: dict[str, Any]) -> list[dict[str, Any]]:
     return blocks
 
 
+def _pane_repo_attention_rank(repo: dict[str, Any]) -> int | None:
+    """Rank for actionable repos in the pane. ``None`` means no open PR signal."""
+    if repo.get("error"):
+        return _ATTENTION_VISUAL["error"][0]
+    top = _top_attention_pull(repo, _ALL_CHIPS)
+    if top is None:
+        return None
+    return _ATTENTION_VISUAL[top[1]][0]
+
+
+def _pane_repo_blocks_ordered(repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    indexed = list(enumerate(repos))
+    active: list[tuple[int, int, dict[str, Any]]] = []
+    inactive: list[tuple[int, dict[str, Any]]] = []
+    for index, repo in indexed:
+        rank = _pane_repo_attention_rank(repo)
+        if rank is None:
+            inactive.append((index, repo))
+        else:
+            active.append((rank, index, repo))
+
+    blocks: list[dict[str, Any]] = []
+    for _, _, repo in sorted(active, key=lambda item: (item[0], item[1])):
+        blocks.extend(_pane_repo_blocks(repo))
+
+    inactive_blocks: list[dict[str, Any]] = []
+    for _, repo in inactive:
+        inactive_blocks.extend(_pane_repo_blocks(repo))
+    if inactive_blocks and active and len(repos) > 1:
+        blocks.append(
+            {
+                "kind": "section",
+                "title": f"Repos without open PRs ({len(inactive)})",
+                "children": inactive_blocks,
+                "collapsible": True,
+                "collapsed": True,
+                "tone": "neutral",
+            }
+        )
+    else:
+        blocks.extend(inactive_blocks)
+    return blocks
+
+
 # A button the host renders in the pane; clicking it forwards github.refresh to
 # this worker (host POST /api/plugins/{id}/action -> stdin notification), which
 # re-fetches and re-pushes. The worker already handles github.refresh.
@@ -517,9 +588,7 @@ def _pane_blocks(repos: list[dict[str, Any]], *, auth_present: bool, freshness: 
     if not repos:
         middle = [{"kind": "note", "text": "no repos in this workspace", "tone": "neutral"}]
     else:
-        middle = []
-        for repo in repos:
-            middle.extend(_pane_repo_blocks(repo))
+        middle = _pane_repo_blocks_ordered(repos)
     return _fit_to_budget(head, middle, tail)
 
 
@@ -528,15 +597,20 @@ def snapshot_ui_state_params(
 ) -> list[dict[str, Any]]:
     """``ui.state.set`` params for a refresh snapshot: per session, a ``row-badge``
     (a chip sequence per PR), a ``row-column`` (the status summary), and a ``pane``
-    (the GitHub tool-window). No global slot. ``chips_on`` is the set of enabled
-    chip categories (``review``/``ci``/``comments``); a disabled one is hidden from
-    both the badge and the column. ``show_column`` False pushes an empty row-column
-    (clearing it) so the user can drop the status text and keep only the icons.
-    Pure and total: a missing/partial snapshot yields no pushes rather than raising.
+    (the GitHub tool-window), plus one global ``sort-key``. ``chips_on`` is the set
+    of enabled chip categories (``review``/``ci``/``comments``); a disabled one is
+    hidden from both the badge and the column. ``show_column`` False hides the
+    words while preserving the sort scalar. Pure and total: a missing/partial
+    snapshot yields no pushes rather than raising.
     """
-    sessions = snapshot.get("sessions") or []
+    raw_sessions = snapshot.get("sessions")
+    if not isinstance(raw_sessions, list):
+        return []
+    sessions = raw_sessions
     auth_present = bool((snapshot.get("auth") or {}).get("present", True))
-    params: list[dict[str, Any]] = []
+    params: list[dict[str, Any]] = [
+        {"slot": SORT_KEY_SLOT[0], "id": SORT_KEY_SLOT[1], "payload": dict(SORT_KEY_PAYLOAD)}
+    ]
     for session in sessions:
         sid = session.get("session_id")
         if sid is None:
@@ -548,7 +622,8 @@ def snapshot_ui_state_params(
         # show_status_text toggle can clear). Reuse the column's winner so the
         # icon, the words, and the opened PR all agree.
         badge_payload: dict[str, Any] = {"items": _badge_items(repos, chips_on)}
-        primary_href = _status_column(repos, chips_on).get("href")
+        status_payload = _status_column(repos, chips_on, show_text=show_column)
+        primary_href = _status_href(repos, chips_on)
         if primary_href:
             badge_payload["href"] = primary_href
         params.append(
@@ -564,7 +639,7 @@ def snapshot_ui_state_params(
                 "slot": ROW_COLUMN_SLOT[0],
                 "id": ROW_COLUMN_SLOT[1],
                 "session_id": sid,
-                "payload": _status_column(repos, chips_on) if show_column else {},
+                "payload": status_payload,
             }
         )
         params.append(
