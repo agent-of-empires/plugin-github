@@ -1,3 +1,3 @@
 """Agent of Empires GitHub integration plugin."""
 
-__version__ = "1.6.0"
+__version__ = "1.5.0"
