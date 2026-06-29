@@ -75,6 +75,13 @@ def test_ignore_submodules_setting_respects_false():
     assert rt.resolve_ignore_submodules() is False
 
 
+def test_ignore_submodules_setting_keeps_last_value_when_host_unavailable():
+    rt = main.Runtime(send=lambda _m: None)
+    rt._ignore_submodules = False
+    rt.call_host = lambda *_a, **_kw: None
+    assert rt.resolve_ignore_submodules() is False
+
+
 def test_bool_value_is_not_a_valid_interval(monkeypatch):
     monkeypatch.setenv("AOE_GITHUB_UI_REFRESH_SECS", "120")
 
