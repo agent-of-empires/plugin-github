@@ -521,7 +521,12 @@ def test_required_check_mode_uses_separate_rich_cache(tmp_path):
     default_snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
     assert len(gql) == 1
     assert default_snap["sessions"][0]["repos"][0]["pulls"][0]["checks"]["state"] == "failing"
-    required_snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport, required_checks_only=True)
+    required_snap = refresh.build_snapshot(
+        sessions,
+        env=_Env(),
+        transport=transport,
+        settings=refresh.SnapshotSettings(required_checks_only=True),
+    )
     assert len(gql) == 2
     assert required_snap["sessions"][0]["repos"][0]["pulls"][0]["checks"]["state"] == "succeeded"
 

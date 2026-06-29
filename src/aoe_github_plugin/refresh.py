@@ -36,6 +36,7 @@ from pathlib import Path
 from datetime import datetime
 from datetime import timezone
 from collections import defaultdict
+from dataclasses import dataclass
 
 import httpx
 
@@ -82,6 +83,15 @@ MAX_BACKOFF_SECS = 3600.0
 
 RepoKey = tuple[str, str, str]  # (owner, repo, branch)
 RichCacheKey = tuple[str, str, str, bool]
+
+
+@dataclass(frozen=True)
+class SnapshotSettings:
+    ignore_submodules: bool = True
+    required_checks_only: bool = False
+
+
+DEFAULT_SNAPSHOT_SETTINGS = SnapshotSettings()
 
 # Cross-refresh ETag cache and a single rate-limit backoff gate. The HTTP
 # fan-out threads read/write both, so guard with a lock.
@@ -656,8 +666,7 @@ def build_snapshot(
     transport: httpx.BaseTransport | None = None,
     *,
     force: bool = False,
-    ignore_submodules: bool = True,
-    required_checks_only: bool = False,
+    settings: SnapshotSettings = DEFAULT_SNAPSHOT_SETTINGS,
 ) -> dict[str, Any]:
     """Assemble the aggregate snapshot from a host ``sessions.list`` result.
 
@@ -676,7 +685,9 @@ def build_snapshot(
     for session in sessions:
         path = session.get("project_path")
         checkouts = (
-            discover_checkouts(path, ignore_submodules=ignore_submodules) if isinstance(path, str) and path else []
+            discover_checkouts(path, ignore_submodules=settings.ignore_submodules)
+            if isinstance(path, str) and path
+            else []
         )
         per_session.append((session, checkouts))
 
@@ -694,7 +705,13 @@ def build_snapshot(
             if key is not None:
                 keys.add(key)
 
-    fetched, auth_present = _fetch_all(keys, env, transport, force=force, required_checks_only=required_checks_only)
+    fetched, auth_present = _fetch_all(
+        keys,
+        env,
+        transport,
+        force=force,
+        required_checks_only=settings.required_checks_only,
+    )
     refreshed_at = _utc_now_iso()
 
     out_sessions: list[dict[str, Any]] = []

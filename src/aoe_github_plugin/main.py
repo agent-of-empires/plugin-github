@@ -323,8 +323,10 @@ class Runtime:
             snapshot = refresh.build_snapshot(
                 sessions,
                 force=force,
-                ignore_submodules=self._ignore_submodules,
-                required_checks_only=self._required_checks_only,
+                settings=refresh.SnapshotSettings(
+                    ignore_submodules=self._ignore_submodules,
+                    required_checks_only=self._required_checks_only,
+                ),
             )
             current_ids: set[str] = set()
             for params in uistate.snapshot_ui_state_params(
