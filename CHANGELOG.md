@@ -4,6 +4,19 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.6.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.6.0) - 2026-06-29
+
+
+
+### Features
+
+- **refresh:** Show GitHub pane refresh freshness in [#53](https://github.com/agent-of-empires/plugin-github/pull/53) by [@Seluj78](https://github.com/Seluj78) ([`8d2170b`](https://github.com/agent-of-empires/plugin-github/commit/8d2170b27954567bd0503bdfe24e47cfaf2f17f4))
+- **refresh:** Ignore git submodules by default in [#52](https://github.com/agent-of-empires/plugin-github/pull/52) by [@Seluj78](https://github.com/Seluj78) ([`14eff7c`](https://github.com/agent-of-empires/plugin-github/commit/14eff7c217ab36863f27fd8de0c7edb90936cdbd))
+- **uistate:** Sort sessions by github pr attention in [#54](https://github.com/agent-of-empires/plugin-github/pull/54) by [@Seluj78](https://github.com/Seluj78) ([`4a7c290`](https://github.com/agent-of-empires/plugin-github/commit/4a7c290f93338203eefbbb6cf99229b7d75a7af6))
+- **github:** Gate ci rollup on required checks in [#55](https://github.com/agent-of-empires/plugin-github/pull/55) by [@Seluj78](https://github.com/Seluj78) ([`ab23b24`](https://github.com/agent-of-empires/plugin-github/commit/ab23b24f3a10a48bba0510e2ace624f99dc42a86))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v1.5.0...v1.6.0
 ## [1.5.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.5.0) - 2026-06-28
 
 
