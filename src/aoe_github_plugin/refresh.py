@@ -117,7 +117,11 @@ def _git(path: str, *args: str) -> str | None:
     return proc.stdout.strip()
 
 
-def discover_checkouts(workspace: str) -> list[str]:
+def _is_submodule_checkout(path: str) -> bool:
+    return bool(_git(path, "rev-parse", "--show-superproject-working-tree"))
+
+
+def discover_checkouts(workspace: str, *, ignore_submodules: bool = True) -> list[str]:
     """Git checkouts in a session workspace: the workspace root and each
     immediate child directory that is its own checkout. Worktree-safe (a
     worktree's ``.git`` is a file, so we ask git, not the filesystem) and
@@ -135,12 +139,15 @@ def discover_checkouts(workspace: str) -> list[str]:
         pass
     out: list[str] = []
     seen: set[str] = set()
+    workspace_real = os.path.realpath(workspace)
     for cand in candidates:
         top = _git(cand, "rev-parse", "--show-toplevel")
         if not top:
             continue
         real = os.path.realpath(top)
         if real != os.path.realpath(cand):
+            continue
+        if ignore_submodules and real != workspace_real and _is_submodule_checkout(cand):
             continue
         if real in seen:
             continue
@@ -578,6 +585,7 @@ def build_snapshot(
     transport: httpx.BaseTransport | None = None,
     *,
     force: bool = False,
+    ignore_submodules: bool = True,
 ) -> dict[str, Any]:
     """Assemble the aggregate snapshot from a host ``sessions.list`` result.
 
@@ -595,7 +603,9 @@ def build_snapshot(
     per_session: list[tuple[dict[str, Any], list[str]]] = []
     for session in sessions:
         path = session.get("project_path")
-        checkouts = discover_checkouts(path) if isinstance(path, str) and path else []
+        checkouts = (
+            discover_checkouts(path, ignore_submodules=ignore_submodules) if isinstance(path, str) and path else []
+        )
         per_session.append((session, checkouts))
 
     # Identity (two git calls) is keyed by real path so a checkout shared across

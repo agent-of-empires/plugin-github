@@ -11,7 +11,7 @@
 
 id = "agent-of-empires.github"
 name = "GitHub"
-version = "1.5.0"
+version = "1.6.0"
 # Manifest schema / host API version. api_version 5 added the [[screenshots]]
 # list (declared below); 6 lets a command declare a client-executed `action`
 # (the `open_pr` command below uses `open-ui-link`). A host older than 6 rejects
@@ -150,6 +150,14 @@ label = "Show PR status summary text in session row"
 description = "Show the words summary at the end of each session row (e.g. \"CI failing\", \"approved\"). Turn off to keep only the PR status icons. The GitHub pane is unaffected."
 type = "boolean"
 default = true
+
+[[settings]]
+key = "ignore_submodules"
+label = "Ignore Git submodules"
+description = "Skip Git submodule checkouts discovered under a session workspace. The workspace root itself is still scanned even if it is a submodule."
+type = "boolean"
+default = true
+advanced = true
 
 # UI extension points. The host renders each slot; the worker pushes display
 # state through the `ui.state.set` host RPC (wired by #2366). Two per-session
