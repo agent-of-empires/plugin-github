@@ -11,7 +11,7 @@
 
 id = "agent-of-empires.github"
 name = "GitHub"
-version = "1.5.0"
+version = "1.6.0"
 # Manifest schema / host API version. api_version 5 added the [[screenshots]]
 # list (declared below); 6 lets a command declare a client-executed `action`
 # (the `open_pr` command below uses `open-ui-link`). A host older than 6 rejects
@@ -152,12 +152,11 @@ type = "boolean"
 default = true
 
 # UI extension points. The host renders each slot; the worker pushes display
-# state through the `ui.state.set` host RPC (wired by #2366). Two per-session
-# surfaces: a `row-badge` that shows one colored PR icon per repo with an open
-# PR (click opens it), and a `pane` GitHub tool-window (in the right dock by
-# default) listing each repo's PR / review / CI state. Both are driven by one
-# push each per session (a list payload), so a multi-repo workspace needs no
-# per-repo slot ids. Slot must be one of the host's known UiSlot variants.
+# state through the `ui.state.set` host RPC (wired by #2366). Per-session
+# surfaces include a `row-badge` that shows colored PR icons, a `row-column`
+# status cell, and a `pane` GitHub tool-window. The global `sort-key` lets the
+# dashboard sort sessions by the same GitHub PR attention rank the row shows.
+# Slot must be one of the host's known UiSlot variants.
 [[ui]]
 slot = "row-badge"
 id = "github_pr_badge"
@@ -175,6 +174,10 @@ id = "github_pane"
 [[ui]]
 slot = "row-column"
 id = "github_pr_status"
+
+[[ui]]
+slot = "sort-key"
+id = "github_pr_attention"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking
 # ndjson JSON-RPC over stdio. The host requires the entrypoint to be

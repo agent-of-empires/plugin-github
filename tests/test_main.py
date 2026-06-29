@@ -230,7 +230,7 @@ def _fake_per_session_params(monkeypatch):
         lambda snap, **_k: [
             {"slot": slot, "id": slot_id, "session_id": s["id"], "payload": {}}
             for s in snap["sessions"]
-            for slot, slot_id in (main.uistate.ROW_BADGE_SLOT, main.uistate.PANE_SLOT)
+            for slot, slot_id in (main.uistate.ROW_BADGE_SLOT, main.uistate.ROW_COLUMN_SLOT, main.uistate.PANE_SLOT)
         ],
     )
 

@@ -28,7 +28,7 @@ def _fake_params(monkeypatch, session_ids):
         lambda _snap, **_kwargs: [
             {"slot": slot, "id": slot_id, "session_id": sid, "payload": {}}
             for sid in session_ids
-            for slot, slot_id in (uistate.ROW_BADGE_SLOT, uistate.PANE_SLOT)
+            for slot, slot_id in (uistate.ROW_BADGE_SLOT, uistate.ROW_COLUMN_SLOT, uistate.PANE_SLOT)
         ],
     )
 
@@ -44,8 +44,12 @@ def test_run_refresh_pushes_current_and_prunes_vanished(monkeypatch):
     removes = [x for x in sent if x["method"] == "ui.state.remove"]
     assert {x["params"]["session_id"] for x in sets} == {"s1"}
     assert {x["params"]["session_id"] for x in removes} == {"old"}
-    # Both slots are removed for the vanished session.
-    assert {x["params"]["slot"] for x in removes} == {uistate.ROW_BADGE_SLOT[0], uistate.PANE_SLOT[0]}
+    # Every per-session slot is removed for the vanished session.
+    assert {x["params"]["slot"] for x in removes} == {
+        uistate.ROW_BADGE_SLOT[0],
+        uistate.ROW_COLUMN_SLOT[0],
+        uistate.PANE_SLOT[0],
+    }
     assert rt.pushed_session_ids == {"s1"}
 
 
