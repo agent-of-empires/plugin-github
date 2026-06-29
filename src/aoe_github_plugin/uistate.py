@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from datetime import datetime
+from datetime import timezone
 
 from aoe_github_plugin.graphql import MERGED_COLOR
 
@@ -452,6 +454,34 @@ _TOKEN_NOTE = {
 }
 
 
+def _format_refreshed_at(value: Any) -> str | None:
+    """ISO UTC timestamp to compact pane text."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc).strftime("%H:%M UTC")
+
+
+def _freshness_block(freshness: Any) -> dict[str, Any] | None:
+    """Pane row describing when the displayed GitHub data was last refreshed."""
+    if not isinstance(freshness, dict):
+        return None
+    value = _format_refreshed_at(freshness.get("refreshed_at"))
+    if value is None:
+        return None
+    stale = freshness.get("stale") is True
+    return {
+        "kind": "row",
+        "label": "Last successful refresh" if stale else "Last refreshed",
+        "value": value,
+        "icon": "clock",
+        "tone": "warn" if stale else "neutral",
+    }
+
+
 def _fit_to_budget(
     head: list[dict[str, Any]], middle: list[dict[str, Any]], tail: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -474,12 +504,16 @@ def _fit_to_budget(
     return head + kept + tail
 
 
-def _pane_blocks(repos: list[dict[str, Any]], *, auth_present: bool) -> list[dict[str, Any]]:
+def _pane_blocks(repos: list[dict[str, Any]], *, auth_present: bool, freshness: Any = None) -> list[dict[str, Any]]:
     head: list[dict[str, Any]] = [{"kind": "heading", "text": "GitHub"}]
     # Only nag when there is actually a GitHub repo whose detail the token gates.
     if not auth_present and any(repo.get("repo") for repo in repos):
         head.append(dict(_TOKEN_NOTE))
-    tail = [{"kind": "divider"}, dict(_REFRESH_ACTION)]
+    tail = [{"kind": "divider"}]
+    freshness_row = _freshness_block(freshness)
+    if freshness_row is not None:
+        tail.append(freshness_row)
+    tail.append(dict(_REFRESH_ACTION))
     if not repos:
         middle = [{"kind": "note", "text": "no repos in this workspace", "tone": "neutral"}]
     else:
@@ -542,7 +576,7 @@ def snapshot_ui_state_params(
                     "title": "GitHub",
                     "default_location": PANE_DEFAULT_LOCATION,
                     "icon": PANE_ICON,
-                    "blocks": _pane_blocks(repos, auth_present=auth_present),
+                    "blocks": _pane_blocks(repos, auth_present=auth_present, freshness=session.get("freshness")),
                 },
             }
         )

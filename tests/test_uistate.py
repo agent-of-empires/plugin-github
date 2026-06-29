@@ -131,6 +131,45 @@ def test_pane_ends_with_a_refresh_action():
     assert action["label"] == "Refresh"
 
 
+def test_pane_shows_freshness_before_refresh_action():
+    session = _session(repos=[_repo()])
+    session["freshness"] = {"refreshed_at": "2026-06-29T14:32:10Z", "stale": False}
+    blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["blocks"]
+
+    assert blocks[-2] == {
+        "kind": "row",
+        "label": "Last refreshed",
+        "value": "14:32 UTC",
+        "icon": "clock",
+        "tone": "neutral",
+    }
+    assert blocks[-1]["method"] == "github.refresh"
+
+
+def test_pane_marks_stale_freshness_before_refresh_action():
+    session = _session(repos=[_repo()])
+    session["freshness"] = {"refreshed_at": "2026-06-29T14:20:03Z", "stale": True}
+    blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["blocks"]
+
+    assert blocks[-2] == {
+        "kind": "row",
+        "label": "Last successful refresh",
+        "value": "14:20 UTC",
+        "icon": "clock",
+        "tone": "warn",
+    }
+    assert blocks[-1]["method"] == "github.refresh"
+
+
+def test_pane_omits_freshness_without_timestamp():
+    session = _session(repos=[_repo()])
+    session["freshness"] = {"stale": False}
+    blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["blocks"]
+
+    assert not any(b.get("label") == "Last refreshed" for b in blocks)
+    assert blocks[-1]["method"] == "github.refresh"
+
+
 def test_pane_payload_carries_title_and_default_location():
     pane = _pane(uistate.snapshot_ui_state_params(_snapshot(_session())))
     assert pane["payload"]["title"] == "GitHub"
