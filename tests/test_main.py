@@ -95,6 +95,7 @@ def _runtime_with_snapshot(monkeypatch, snapshot):
     capture sink for the messages it sends."""
     sent = []
     rt = main.Runtime(send=sent.append)
+    rt.call_host = lambda *_a, **_kw: {"value": True}
 
     def fake_build_snapshot(sessions, force=False, **_kwargs):
         out = {"sessions": [], "auth": {"present": True}}
@@ -211,6 +212,7 @@ def test_run_refresh_passes_ignore_submodules_setting(monkeypatch):
     monkeypatch.setattr(main.refresh, "build_snapshot", spy_build_snapshot)
     rt = main.Runtime(send=lambda _m: None)
     rt._ignore_submodules = False
+    rt.call_host = lambda *_a, **_kw: {"value": False}
     rt.run_refresh(sessions=[])
     assert seen == [False]
 
@@ -265,6 +267,7 @@ def test_scoped_refresh_targets_only_the_clicked_session(monkeypatch):
     sent: list = []
     rt = main.Runtime(send=sent.append)
     rt.pushed_session_ids = {"s1", "s2"}
+    rt.call_host = lambda *_a, **_kw: {"value": True}
     _fake_per_session_params(monkeypatch)
 
     rt.run_refresh(sessions=[{"id": "s1"}, {"id": "s2"}], force=True, only_session="s1")
@@ -283,6 +286,7 @@ def test_full_refresh_still_prunes_vanished(monkeypatch):
     sent: list = []
     rt = main.Runtime(send=sent.append)
     rt.pushed_session_ids = {"s1", "gone"}
+    rt.call_host = lambda *_a, **_kw: {"value": True}
     _fake_per_session_params(monkeypatch)
 
     rt.run_refresh(sessions=[{"id": "s1"}], force=True)

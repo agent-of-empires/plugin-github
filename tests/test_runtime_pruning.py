@@ -17,7 +17,9 @@ def _const(value):
 
 def _runtime():
     sent: list = []
-    return m.Runtime(send=sent.append), sent
+    rt = m.Runtime(send=sent.append)
+    rt.call_host = _const({"value": True})
+    return rt, sent
 
 
 def _fake_params(monkeypatch, session_ids):

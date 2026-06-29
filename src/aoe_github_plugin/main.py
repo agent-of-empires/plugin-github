@@ -314,6 +314,7 @@ class Runtime:
         if only_session is not None:
             sessions = [s for s in sessions if s.get("id") == only_session]
         with contextlib.suppress(Exception):
+            self._ignore_submodules = self.resolve_ignore_submodules()
             snapshot = refresh.build_snapshot(sessions, force=force, ignore_submodules=self._ignore_submodules)
             current_ids: set[str] = set()
             for params in uistate.snapshot_ui_state_params(
@@ -387,7 +388,7 @@ class Runtime:
         )
 
     def resolve_ignore_submodules(self) -> bool:
-        return self._setting_bool(IGNORE_SUBMODULES_SETTING_KEY, default=True)
+        return self._setting_bool(IGNORE_SUBMODULES_SETTING_KEY, default=self._ignore_submodules)
 
     def _setting_bool(self, key: str, *, default: bool) -> bool:
         if self.stopped:
