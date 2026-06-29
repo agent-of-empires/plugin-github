@@ -151,6 +151,21 @@ def test_resolve_chip_flags_respects_disabled_setting():
     assert rt.resolve_chip_flags() == frozenset({"review", "comments"})
 
 
+def test_required_checks_setting_reaches_refresh(monkeypatch):
+    seen = []
+
+    def spy_build_snapshot(sessions, **kwargs):
+        seen.append(kwargs["required_checks_only"])
+        return {"sessions": [], "auth": {"present": True}}
+
+    monkeypatch.setattr(main.refresh, "build_snapshot", spy_build_snapshot)
+    rt = main.Runtime(send=lambda _m: None)
+    rt._required_checks_only = True
+    rt.call_host = lambda *_a, **_kw: {"value": True}
+    rt.run_refresh(sessions=[])
+    assert seen == [True]
+
+
 # --- archived/snoozed sessions are skipped (issue #41) ---
 
 

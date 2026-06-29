@@ -341,6 +341,26 @@ def test_pane_treats_merged_only_repo_as_no_open_pr_for_ordering():
     assert section["collapsed"] is True
 
 
+def test_required_rollup_keeps_optional_failure_visible():
+    checks = {
+        "state": "succeeded",
+        "runs": [
+            {"name": "required-build", "state": "succeeded", "required": True},
+            {"name": "optional-lint", "state": "failing", "required": False},
+        ],
+    }
+    pull = _rich_pull(review="approved", checks=checks, comments={"unresolved": 0, "items": []})
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
+        "blocks"
+    ]
+    checks_section = next(b for b in blocks if b.get("kind") == "section" and b["title"].startswith("Checks"))
+    assert "collapsed" not in checks_section
+    rows = {child["label"]: child for child in checks_section["children"]}
+    assert rows["required-build"]["sublabel"] == "required"
+    assert rows["optional-lint"]["tone"] == "danger"
+    assert rows["optional-lint"]["sublabel"] == "optional"
+
+
 def test_pane_payload_stays_under_host_size_cap():
     # A many-repo workspace with long comments would blow the 64KB/entry host cap;
     # the pane must trim to fit (and keep the heading + refresh action).
