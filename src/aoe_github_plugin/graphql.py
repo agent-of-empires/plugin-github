@@ -39,9 +39,17 @@ _PR_CONNECTION_FRAGMENT = """
 fragment PRConnection on PullRequestConnection {
   nodes {
     id number title url state isDraft merged reviewDecision
+    baseRef { branchProtectionRule {
+      requiresStatusChecks
+      requiredStatusCheckContexts
+      requiredStatusChecks { context app { databaseId slug name } }
+    } }
     commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 50) { nodes {
       __typename
-      ... on CheckRun { name status conclusion detailsUrl startedAt completedAt }
+      ... on CheckRun {
+        name status conclusion detailsUrl startedAt completedAt
+        checkSuite { app { databaseId slug name } }
+      }
       ... on StatusContext { context state targetUrl createdAt }
     } } } } } }
     reviews(last: 1, states: [COMMENTED]) { nodes { state } }
@@ -172,6 +180,7 @@ _STATUS_STATE = {
 # Display order for the per-check rows: failing first (most actionable), then
 # in-flight, then done; anything unmapped sinks to the bottom.
 _STATE_RANK = {"failing": 0, "running": 1, "queued": 2, "succeeded": 3, "unknown": 4}
+Requirement = tuple[str, str | None]
 
 
 def _context_state(ctx: dict[str, Any]) -> str:
@@ -186,7 +195,102 @@ def _context_state(ctx: dict[str, Any]) -> str:
     return _STATUS_STATE.get(ctx.get("state") or "", "unknown")
 
 
-def check_summary(pr: dict[str, Any]) -> dict[str, Any] | None:
+def _app_key(app: Any) -> str | None:
+    if not isinstance(app, dict):
+        return None
+    for key in ("databaseId", "slug", "name"):
+        value = app.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, int):
+            return str(value)
+    return None
+
+
+def _branch_protection_rule(pr: dict[str, Any]) -> dict[str, Any] | None:
+    base_ref = pr.get("baseRef")
+    if not isinstance(base_ref, dict):
+        return None
+    rule = base_ref.get("branchProtectionRule")
+    return rule if isinstance(rule, dict) else None
+
+
+def _optional_list(rule: dict[str, Any], key: str) -> list[Any] | None:
+    if key not in rule or rule[key] is None:
+        return []
+    value = rule[key]
+    return value if isinstance(value, list) else None
+
+
+def _parse_required_checks(contexts_raw: list[Any], checks_raw: list[Any]) -> list[Requirement] | None:
+    required: set[Requirement] = set()
+    for context in contexts_raw:
+        if not isinstance(context, str):
+            return None
+        required.add((context, None))
+    for item in checks_raw:
+        if not isinstance(item, dict):
+            return None
+        context = item.get("context")
+        if not isinstance(context, str):
+            return None
+        required.add((context, _app_key(item.get("app"))))
+    return sorted(required)
+
+
+def _required_checks(pr: dict[str, Any]) -> list[Requirement] | None:
+    rule = _branch_protection_rule(pr)
+    if rule is None:
+        return None
+    requires = rule.get("requiresStatusChecks")
+    if not isinstance(requires, bool):
+        return None
+    if not requires:
+        return []
+    has_contexts = "requiredStatusCheckContexts" in rule
+    has_checks = "requiredStatusChecks" in rule
+    if not has_contexts and not has_checks:
+        return None
+    contexts_raw = _optional_list(rule, "requiredStatusCheckContexts")
+    checks_raw = _optional_list(rule, "requiredStatusChecks")
+    if contexts_raw is None or checks_raw is None:
+        return None
+    return _parse_required_checks(contexts_raw, checks_raw)
+
+
+def _matches_requirement(run: dict[str, Any], requirement: Requirement) -> bool:
+    context, app = requirement
+    if run.get("name") != context:
+        return False
+    return app is None or run.get("app") == app
+
+
+def _required_rollup_state(runs: list[dict[str, Any]], required: list[Requirement]) -> str:
+    if not required:
+        return "unknown"
+    states: list[str] = []
+    for requirement in required:
+        matches = [run for run in runs if _matches_requirement(run, requirement)]
+        states.extend(run.get("state", "unknown") for run in matches)
+        if not matches:
+            states.append("running")
+    if "failing" in states:
+        return "failing"
+    if "running" in states:
+        return "running"
+    if "queued" in states:
+        return "queued"
+    if "unknown" in states:
+        return "unknown"
+    return "succeeded"
+
+
+def _mark_required_runs(runs: list[dict[str, Any]], required: list[Requirement]) -> None:
+    for run in runs:
+        run["required"] = any(_matches_requirement(run, requirement) for requirement in required)
+
+
+def check_summary(pr: dict[str, Any], *, required_checks_only: bool = False) -> dict[str, Any] | None:
     """``{"state", "runs": [{name, state, url}]}`` for the PR head commit, or
     ``None`` when the head commit has no checks configured."""
     commits = _nodes(pr, "commits")
@@ -199,33 +303,44 @@ def check_summary(pr: dict[str, Any]) -> dict[str, Any] | None:
     # lexicographically, so plain string ``>`` is correct; missing timestamps are
     # the empty string. On a tie (equal or both missing) keep the worse state, so
     # a flake cannot hide a real failure.
-    latest: dict[str, dict[str, Any]] = {}
-    ts: dict[str, str] = {}
+    latest: dict[tuple[str, str], dict[str, Any]] = {}
+    ts: dict[tuple[str, str], str] = {}
     for ctx in _nodes(rollup, "contexts"):
         run: dict[str, Any]
         if ctx.get("__typename") == "CheckRun":
             name = ctx.get("name") or "check"
             when = ctx.get("completedAt") or ctx.get("startedAt") or ""
+            suite = ctx.get("checkSuite")
+            app = _app_key(suite.get("app") if isinstance(suite, dict) else None)
             run = {"name": name, "state": _context_state(ctx), "url": ctx.get("detailsUrl")}
+            if app is not None:
+                run["app"] = app
         else:
             name = ctx.get("context") or "check"
             when = ctx.get("createdAt") or ""
             run = {"name": name, "state": _context_state(ctx), "url": ctx.get("targetUrl")}
-        if name not in latest:
-            latest[name] = run
-            ts[name] = when
+        key = (name, run.get("app") or "")
+        if key not in latest:
+            latest[key] = run
+            ts[key] = when
             continue
-        prev_when = ts[name]
+        prev_when = ts[key]
         if when > prev_when:
-            latest[name] = run
-            ts[name] = when
-        elif when == prev_when and _STATE_RANK.get(run["state"], 5) < _STATE_RANK.get(latest[name]["state"], 5):
-            latest[name] = run
+            latest[key] = run
+            ts[key] = when
+        elif when == prev_when and _STATE_RANK.get(run["state"], 5) < _STATE_RANK.get(latest[key]["state"], 5):
+            latest[key] = run
     runs = list(latest.values())
     # Stable sort by state rank keeps GitHub's order within each group while
     # surfacing failures at the top.
     runs.sort(key=lambda r: _STATE_RANK.get(r["state"], 5))
-    return {"state": _STATUS_STATE.get(rollup.get("state") or "", "unknown"), "runs": runs}
+    state = _STATUS_STATE.get(rollup.get("state") or "", "unknown")
+    if required_checks_only:
+        required = _required_checks(pr)
+        if required is not None:
+            _mark_required_runs(runs, required)
+            state = _required_rollup_state(runs, required)
+    return {"state": state, "runs": runs}
 
 
 def comment_summary(pr: dict[str, Any]) -> dict[str, Any]:
@@ -249,7 +364,7 @@ def comment_summary(pr: dict[str, Any]) -> dict[str, Any]:
     return {"unresolved": len(items), "items": items}
 
 
-def _normalize_pull(pr: dict[str, Any]) -> dict[str, Any]:
+def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -> dict[str, Any]:
     return {
         "number": pr.get("number"),
         "url": pr.get("url"),
@@ -258,12 +373,12 @@ def _normalize_pull(pr: dict[str, Any]) -> dict[str, Any]:
         "draft": bool(pr.get("isDraft", False)),
         "merged": bool(pr.get("merged", False)),
         "review_state": review_state(pr),
-        "checks": check_summary(pr),
+        "checks": check_summary(pr, required_checks_only=required_checks_only),
         "comments": comment_summary(pr),
     }
 
 
-def normalize_connection(conn: Any) -> list[dict[str, Any]]:
+def normalize_connection(conn: Any, *, required_checks_only: bool = False) -> list[dict[str, Any]]:
     """A ``pullRequests`` connection (the value of one alias in a batched
     response, or any ``{"nodes": [...]}``) -> trimmed, UI-ready pull dicts.
 
@@ -276,4 +391,4 @@ def normalize_connection(conn: Any) -> list[dict[str, Any]]:
         return []
     nodes = conn.get("nodes")
     pulls = [n for n in nodes if isinstance(n, dict)] if isinstance(nodes, list) else []
-    return [_normalize_pull(pr) for pr in pulls]
+    return [_normalize_pull(pr, required_checks_only=required_checks_only) for pr in pulls]

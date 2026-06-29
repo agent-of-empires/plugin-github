@@ -138,6 +138,14 @@ type = "boolean"
 default = true
 
 [[settings]]
+key = "ci_required_checks_only"
+label = "Gate CI status on required checks"
+description = "When enabled, the session row treats only required status checks as the CI rollup. Optional failing checks remain visible in the GitHub pane."
+type = "boolean"
+default = false
+advanced = true
+
+[[settings]]
 key = "show_comment_status"
 label = "Show unresolved-comment status in session row"
 description = "Show the unresolved-review-comment chip on each session row. The GitHub pane still lists the comments when this is off."

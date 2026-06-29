@@ -360,6 +360,8 @@ def _checks_section(checks: Any) -> dict[str, Any] | None:
             "icon": icon,
             "tone": tone,
         }
+        if isinstance(run.get("required"), bool):
+            child["sublabel"] = "required" if run["required"] else "optional"
         if run.get("url"):
             child["href"] = run["url"]
         children.append(child)
@@ -377,7 +379,7 @@ def _checks_section(checks: Any) -> dict[str, Any] | None:
     }
     # Fold when everything passed; stay open when something needs attention
     # (failing/running/queued/unknown) so the actionable rows are visible.
-    if checks.get("state") == "succeeded":
+    if checks.get("state") == "succeeded" and all(run.get("state") == "succeeded" for run in runs):
         section["collapsed"] = True
     return section
 

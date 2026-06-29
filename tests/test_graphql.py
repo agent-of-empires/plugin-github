@@ -3,7 +3,7 @@
 from aoe_github_plugin import graphql
 
 
-def _pr(decision=None, reviews=(), threads=(), rollup=None):
+def _pr(decision=None, reviews=(), threads=(), rollup=None, branch_rule=None):
     return {
         "number": 1,
         "title": "t",
@@ -12,6 +12,7 @@ def _pr(decision=None, reviews=(), threads=(), rollup=None):
         "isDraft": False,
         "merged": False,
         "reviewDecision": decision,
+        "baseRef": {"branchProtectionRule": branch_rule} if branch_rule is not None else None,
         "commits": {"nodes": [{"commit": {"statusCheckRollup": rollup}}]} if rollup is not None else {"nodes": []},
         "reviews": {"nodes": list(reviews)},
         "reviewThreads": {"nodes": list(threads)},
@@ -26,15 +27,31 @@ def _rollup(state, contexts):
     return {"state": state, "contexts": {"nodes": list(contexts)}}
 
 
-def _checkrun(name, status, conclusion=None, url="cu", completed_at=None):
+def _branch_rule(*, requires=True, contexts=(), checks=()):
     return {
+        "requiresStatusChecks": requires,
+        "requiredStatusCheckContexts": list(contexts),
+        "requiredStatusChecks": list(checks),
+    }
+
+
+def _required_check(context, app=None):
+    return {"context": context, "app": app}
+
+
+def _checkrun(name, status, conclusion=None, **kwargs):
+    out = {
         "__typename": "CheckRun",
         "name": name,
         "status": status,
         "conclusion": conclusion,
-        "detailsUrl": url,
-        "completedAt": completed_at,
+        "detailsUrl": kwargs.get("url", "cu"),
+        "completedAt": kwargs.get("completed_at"),
     }
+    app = kwargs.get("app")
+    if app is not None:
+        out["checkSuite"] = {"app": app}
+    return out
 
 
 def _statusctx(context, state, url="su", created_at=None):
@@ -137,6 +154,69 @@ def test_check_summary_tie_keeps_worst_state():
     )
     summary = graphql.check_summary(_pr(rollup=rollup))
     assert [(r["name"], r["state"], r["url"]) for r in summary["runs"]] == [("tie", "failing", "bad")]
+
+
+def test_required_check_mode_ignores_optional_failures_for_rollup():
+    rollup = _rollup(
+        "FAILURE",
+        [
+            _checkrun("optional-lint", "COMPLETED", "FAILURE"),
+            _checkrun("required-build", "COMPLETED", "SUCCESS"),
+        ],
+    )
+    summary = graphql.check_summary(
+        _pr(rollup=rollup, branch_rule=_branch_rule(contexts=["required-build"])),
+        required_checks_only=True,
+    )
+    assert summary["state"] == "succeeded"
+    by_name = {run["name"]: run for run in summary["runs"]}
+    assert by_name["required-build"]["required"] is True
+    assert by_name["optional-lint"]["state"] == "failing"
+    assert by_name["optional-lint"]["required"] is False
+
+
+def test_required_check_mode_keeps_required_failures_failing():
+    rollup = _rollup(
+        "FAILURE",
+        [
+            _checkrun("optional-lint", "COMPLETED", "SUCCESS"),
+            _checkrun("required-build", "COMPLETED", "FAILURE"),
+        ],
+    )
+    summary = graphql.check_summary(
+        _pr(rollup=rollup, branch_rule=_branch_rule(contexts=["required-build"])),
+        required_checks_only=True,
+    )
+    assert summary["state"] == "failing"
+
+
+def test_required_check_mode_falls_back_without_required_metadata():
+    rollup = _rollup("FAILURE", [_checkrun("optional-lint", "COMPLETED", "FAILURE")])
+    summary = graphql.check_summary(_pr(rollup=rollup), required_checks_only=True)
+    assert summary["state"] == "failing"
+    assert "required" not in summary["runs"][0]
+
+
+def test_required_check_mode_matches_app_specific_required_checks():
+    rollup = _rollup(
+        "FAILURE",
+        [
+            _checkrun("build", "COMPLETED", "FAILURE", app={"slug": "optional-ci"}),
+            _checkrun("build", "COMPLETED", "SUCCESS", app={"slug": "github-actions"}),
+        ],
+    )
+    summary = graphql.check_summary(
+        _pr(
+            rollup=rollup,
+            branch_rule=_branch_rule(checks=[_required_check("build", {"slug": "github-actions"})]),
+        ),
+        required_checks_only=True,
+    )
+    assert summary["state"] == "succeeded"
+    assert [(run["app"], run["required"]) for run in summary["runs"]] == [
+        ("optional-ci", False),
+        ("github-actions", True),
+    ]
 
 
 def test_comment_summary_keeps_only_unresolved():

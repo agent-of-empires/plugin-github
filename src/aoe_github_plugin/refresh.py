@@ -36,6 +36,7 @@ from pathlib import Path
 from datetime import datetime
 from datetime import timezone
 from collections import defaultdict
+from dataclasses import dataclass
 
 import httpx
 
@@ -81,6 +82,16 @@ BACKOFF_SECS = 60.0
 MAX_BACKOFF_SECS = 3600.0
 
 RepoKey = tuple[str, str, str]  # (owner, repo, branch)
+RichCacheKey = tuple[str, str, str, bool]
+
+
+@dataclass(frozen=True)
+class SnapshotSettings:
+    ignore_submodules: bool = True
+    required_checks_only: bool = False
+
+
+DEFAULT_SNAPSHOT_SETTINGS = SnapshotSettings()
 
 # Cross-refresh ETag cache and a single rate-limit backoff gate. The HTTP
 # fan-out threads read/write both, so guard with a lock.
@@ -88,7 +99,7 @@ _cache_lock = threading.Lock()
 _etag_cache: dict[RepoKey, dict[str, Any]] = {}  # key -> {"etag", "pulls"}
 # Last-good rich (GraphQL) result per key: {"pulls", "fetched_at"}. Serves the
 # TTL window and is the stale fallback while rate-limited.
-_graphql_cache: dict[RepoKey, dict[str, Any]] = {}
+_graphql_cache: dict[RichCacheKey, dict[str, Any]] = {}
 # Last successful full refresh per session id, scoped to the repo-key set so a
 # changed workspace never inherits a timestamp from unrelated data.
 _session_refresh_cache: dict[str, dict[str, Any]] = {}
@@ -330,6 +341,11 @@ def _error_entry(exc: GitHubError) -> dict[str, Any]:
     return {"error": {"kind": exc.kind, "hint": str(exc)}, "_fresh": False, "_stale": True}
 
 
+def _rich_cache_key(key: RepoKey, *, required_checks_only: bool) -> RichCacheKey:
+    owner, repo, branch = key
+    return owner, repo, branch, required_checks_only
+
+
 def _is_active(pulls: list[dict[str, Any]]) -> bool:
     """A branch's cached rich state is ACTIVE when a non-merged PR has a CI check
     running or queued (#26). That state finishes in seconds yet does not bump the
@@ -455,8 +471,9 @@ def _apply_aliases(
     chunk: list[RepoKey],
     pending: dict[RepoKey, dict[str, Any]],
     data: dict[str, Any],
-    out: dict[RepoKey, dict[str, Any]],
-) -> None:
+    *,
+    required_checks_only: bool,
+) -> dict[RepoKey, dict[str, Any]]:
     """Normalize each alias connection back into its key's cache + result. A failed
     (named in ``errors[].path``) or malformed alias falls back per key, never
     poisoning its siblings. ``data`` is the full envelope (its ``repository`` is a
@@ -464,6 +481,7 @@ def _apply_aliases(
     repository = (data.get("data") or {}).get("repository") or {}
     failed = _error_aliases(data)
     now = time.monotonic()
+    out: dict[RepoKey, dict[str, Any]] = {}
     for i, key in enumerate(chunk):
         conn = repository.get(f"b{i}")
         if f"b{i}" in failed or not isinstance(conn, dict):
@@ -472,10 +490,14 @@ def _apply_aliases(
         for node in conn.get("nodes") or []:
             if isinstance(node, dict):
                 _paginate_threads(client, node)
-        pulls = graphql.normalize_connection(conn)
+        pulls = graphql.normalize_connection(conn, required_checks_only=required_checks_only)
         with _cache_lock:
-            _graphql_cache[key] = {"pulls": pulls, "fetched_at": now}
+            _graphql_cache[_rich_cache_key(key, required_checks_only=required_checks_only)] = {
+                "pulls": pulls,
+                "fetched_at": now,
+            }
         out[key] = _pulls_result(pulls, fresh=True)
+    return out
 
 
 def _fetch_chunk(
@@ -483,6 +505,8 @@ def _fetch_chunk(
     chunk: list[RepoKey],
     pending: dict[RepoKey, dict[str, Any]],
     out: dict[RepoKey, dict[str, Any]],
+    *,
+    required_checks_only: bool,
 ) -> None:
     """One batched GraphQL query for up to ``MAX_GRAPHQL_ALIASES`` branches of one
     repo (#25), aliased ``b0:``/``b1:``/... ``chunk`` is non-empty and all keys
@@ -522,10 +546,12 @@ def _fetch_chunk(
     if not isinstance(repository, dict):
         _resolve_null_repository(chunk, pending, data, out)
         return
-    _apply_aliases(client, chunk, pending, data, out)
+    out.update(_apply_aliases(client, chunk, pending, data, required_checks_only=required_checks_only))
 
 
-def _fetch_rich(client: GitHubClient, keys: list[RepoKey], *, force: bool) -> dict[RepoKey, dict[str, Any]]:
+def _fetch_rich(
+    client: GitHubClient, keys: list[RepoKey], *, force: bool, required_checks_only: bool
+) -> dict[RepoKey, dict[str, Any]]:
     """Token path: a cheap REST conditional probe gates each key (#21), then the
     keys that need fresh GraphQL are grouped by ``(owner, repo)`` and aliased into
     one batched query per group, chunked to ``MAX_GRAPHQL_ALIASES`` (#25). Gating
@@ -536,8 +562,9 @@ def _fetch_rich(client: GitHubClient, keys: list[RepoKey], *, force: bool) -> di
     out: dict[RepoKey, dict[str, Any]] = {}
     pending: dict[RepoKey, dict[str, Any]] = {}
     for key in keys:
+        cache_key = _rich_cache_key(key, required_checks_only=required_checks_only)
         with _cache_lock:
-            rich = _graphql_cache.get(key)
+            rich = _graphql_cache.get(cache_key)
         try:
             changed, basic, _fresh = _rest_probe(client, key)
         except GitHubError as exc:
@@ -556,7 +583,7 @@ def _fetch_rich(client: GitHubClient, keys: list[RepoKey], *, force: bool) -> di
         for start in range(0, len(gkeys), MAX_GRAPHQL_ALIASES):
             chunk = gkeys[start : start + MAX_GRAPHQL_ALIASES]
             try:
-                _fetch_chunk(client, chunk, pending, out)
+                _fetch_chunk(client, chunk, pending, out, required_checks_only=required_checks_only)
             except Exception as exc:  # noqa: BLE001 - fail-soft per repo, never abort the refresh
                 for key in chunk:
                     out.setdefault(
@@ -607,6 +634,7 @@ def _fetch_all(
     transport: httpx.BaseTransport | None,
     *,
     force: bool = False,
+    required_checks_only: bool = False,
 ) -> tuple[dict[RepoKey, dict[str, Any]], bool]:
     """Fetch every unique key. Returns ``(results, token_present)`` where results
     is ``key -> {"pulls": [...]}`` or ``key -> {"error": {...}}``. With a token,
@@ -625,7 +653,7 @@ def _fetch_all(
     results: dict[RepoKey, dict[str, Any]] = {}
     with GitHubClient(token=token, transport=transport) as client:
         if present:
-            results = _fetch_rich(client, ordered, force=force)
+            results = _fetch_rich(client, ordered, force=force, required_checks_only=required_checks_only)
         else:
             for key in ordered:
                 results[key] = _fetch_one_basic(client, key)
@@ -638,7 +666,7 @@ def build_snapshot(
     transport: httpx.BaseTransport | None = None,
     *,
     force: bool = False,
-    ignore_submodules: bool = True,
+    settings: SnapshotSettings = DEFAULT_SNAPSHOT_SETTINGS,
 ) -> dict[str, Any]:
     """Assemble the aggregate snapshot from a host ``sessions.list`` result.
 
@@ -657,7 +685,9 @@ def build_snapshot(
     for session in sessions:
         path = session.get("project_path")
         checkouts = (
-            discover_checkouts(path, ignore_submodules=ignore_submodules) if isinstance(path, str) and path else []
+            discover_checkouts(path, ignore_submodules=settings.ignore_submodules)
+            if isinstance(path, str) and path
+            else []
         )
         per_session.append((session, checkouts))
 
@@ -675,7 +705,13 @@ def build_snapshot(
             if key is not None:
                 keys.add(key)
 
-    fetched, auth_present = _fetch_all(keys, env, transport, force=force)
+    fetched, auth_present = _fetch_all(
+        keys,
+        env,
+        transport,
+        force=force,
+        required_checks_only=settings.required_checks_only,
+    )
     refreshed_at = _utc_now_iso()
 
     out_sessions: list[dict[str, Any]] = []

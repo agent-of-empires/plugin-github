@@ -482,6 +482,55 @@ def test_force_refetches_graphql_on_304(tmp_path):
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 8
 
 
+def test_required_check_mode_uses_separate_rich_cache(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    node = _gql_node(number=7)
+    node["baseRef"] = {
+        "branchProtectionRule": {
+            "requiresStatusChecks": True,
+            "requiredStatusCheckContexts": ["test"],
+            "requiredStatusChecks": [],
+        }
+    }
+    node["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {
+        "state": "FAILURE",
+        "contexts": {
+            "nodes": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "optional-lint",
+                    "status": "COMPLETED",
+                    "conclusion": "FAILURE",
+                    "detailsUrl": "https://ci/lint",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "test",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "detailsUrl": "https://ci/test",
+                },
+            ]
+        },
+    }
+    gql = []
+    transport = _rich_transport([node], gql=gql)
+    default_snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1
+    assert default_snap["sessions"][0]["repos"][0]["pulls"][0]["checks"]["state"] == "failing"
+    required_snap = refresh.build_snapshot(
+        sessions,
+        env=_Env(),
+        transport=transport,
+        settings=refresh.SnapshotSettings(required_checks_only=True),
+    )
+    assert len(gql) == 2
+    assert required_snap["sessions"][0]["repos"][0]["pulls"][0]["checks"]["state"] == "succeeded"
+
+
 def test_graphql_rate_limit_serves_stale(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
