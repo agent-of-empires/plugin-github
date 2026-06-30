@@ -571,7 +571,10 @@ def _fetch_rich(
             out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True) if rich is not None else _error_entry(exc)
             continue
         if rich is not None and not force and not changed and not _rich_stale(rich, now):
-            out[key] = _pulls_result(rich["pulls"], fresh=False)
+            # ``_fresh`` distinguishes a real 304 (GitHub confirmed the data is
+            # current) from a backoff-served cache (GitHub was never contacted).
+            # Mark the latter stale so it does not advance the freshness stamp.
+            out[key] = _pulls_result(rich["pulls"], fresh=False, stale=not _fresh)
             continue
         pending[key] = {"basic": basic, "rich": rich}
 
@@ -608,23 +611,27 @@ def _session_freshness(
     results: list[dict[str, Any]],
     refreshed_at: str,
 ) -> dict[str, Any] | None:
-    """Freshness metadata for one session, conservative on partial failure."""
+    """Freshness metadata for one session, conservative on partial failure.
+
+    The stamp advances on any refresh that confirmed the displayed data is
+    current, not only a fresh fetch. A successful conditional probe (304)
+    validates the cache, so it counts: otherwise the stamp would look frozen
+    during normal background polling and only move on a manual refresh. A
+    stale fallback (backoff, error) keeps the last successful stamp. Each per-key
+    result already carries its own ``_stale``/``error`` verdict (a backoff-served
+    cache is marked stale at the source in ``_fetch_rich``), so a plain
+    ``not stale`` gate is enough; the old ``not pulls`` heuristic wrongly flagged
+    a confirmed-current repo with zero open PRs as stale."""
     if not isinstance(session_id, str) or not fingerprint:
         return None
-    all_fresh = all(result.get("_fresh") is True and not result.get("error") for result in results)
-    stale = any(
-        result.get("_stale") is True
-        or result.get("error") is not None
-        or (result.get("_fresh") is not True and not result.get("pulls"))
-        for result in results
-    )
+    stale = any(result.get("_stale") is True or result.get("error") is not None for result in results)
     with _cache_lock:
         cached = _session_refresh_cache.get(session_id)
-        if all_fresh:
+        if not stale:
             _session_refresh_cache[session_id] = {"fingerprint": fingerprint, "refreshed_at": refreshed_at}
             return {"refreshed_at": refreshed_at, "stale": False}
         if cached and cached.get("fingerprint") == fingerprint:
-            return {"refreshed_at": cached["refreshed_at"], "stale": stale}
+            return {"refreshed_at": cached["refreshed_at"], "stale": True}
     return None
 
 
