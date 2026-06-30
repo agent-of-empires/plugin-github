@@ -1,9 +1,26 @@
 """Aggregate snapshot -> ui.state.set params mapping (pure)."""
 
+import os
 import json
 import time
 
+import pytest
+
 from aoe_github_plugin import uistate
+
+
+@pytest.fixture(autouse=True)
+def _restore_process_tz():
+    """Reset the process timezone after each test. ``monkeypatch`` reverts the
+    ``TZ`` env var but never re-runs ``time.tzset()``, so without this the tz a
+    test pinned would leak into later tests until one reset it."""
+    original = os.environ.get("TZ")
+    yield
+    if original is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = original
+    time.tzset()
 
 
 def _set_tz(monkeypatch, tz):
