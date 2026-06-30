@@ -1,8 +1,15 @@
 """Aggregate snapshot -> ui.state.set params mapping (pure)."""
 
 import json
+import time
 
 from aoe_github_plugin import uistate
+
+
+def _set_tz(monkeypatch, tz):
+    """Pin the process local timezone so ``astimezone()`` is deterministic."""
+    monkeypatch.setenv("TZ", tz)
+    time.tzset()
 
 
 def _pull(number=7, draft=False, title="t"):
@@ -148,7 +155,8 @@ def test_pane_ends_with_a_refresh_action():
     assert action["label"] == "Refresh"
 
 
-def test_pane_shows_freshness_before_refresh_action():
+def test_pane_shows_freshness_before_refresh_action(monkeypatch):
+    _set_tz(monkeypatch, "UTC")
     session = _session(repos=[_repo()])
     session["freshness"] = {"refreshed_at": "2026-06-29T14:32:10Z", "stale": False}
     blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["blocks"]
@@ -156,14 +164,15 @@ def test_pane_shows_freshness_before_refresh_action():
     assert blocks[-2] == {
         "kind": "row",
         "label": "Last refreshed",
-        "value": "14:32 UTC",
+        "value": "14:32",
         "icon": "clock",
         "tone": "neutral",
     }
     assert blocks[-1]["method"] == "github.refresh"
 
 
-def test_pane_marks_stale_freshness_before_refresh_action():
+def test_pane_marks_stale_freshness_before_refresh_action(monkeypatch):
+    _set_tz(monkeypatch, "UTC")
     session = _session(repos=[_repo()])
     session["freshness"] = {"refreshed_at": "2026-06-29T14:20:03Z", "stale": True}
     blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["blocks"]
@@ -171,11 +180,27 @@ def test_pane_marks_stale_freshness_before_refresh_action():
     assert blocks[-2] == {
         "kind": "row",
         "label": "Last successful refresh",
-        "value": "14:20 UTC",
+        "value": "14:20",
         "icon": "clock",
         "tone": "warn",
     }
     assert blocks[-1]["method"] == "github.refresh"
+
+
+def test_format_refreshed_at_converts_utc_to_local(monkeypatch):
+    # 14:32 UTC is 10:32 in America/New_York (EDT, UTC-4) on this date.
+    _set_tz(monkeypatch, "America/New_York")
+    assert uistate._format_refreshed_at("2026-06-29T14:32:10Z") == "10:32"
+
+
+def test_format_refreshed_at_treats_naive_stamp_as_utc(monkeypatch):
+    _set_tz(monkeypatch, "America/New_York")
+    assert uistate._format_refreshed_at("2026-06-29T14:32:10") == "10:32"
+
+
+def test_format_refreshed_at_rejects_garbage():
+    assert uistate._format_refreshed_at("not-a-timestamp") is None
+    assert uistate._format_refreshed_at(None) is None
 
 
 def test_pane_omits_freshness_without_timestamp():
