@@ -4,6 +4,16 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.6.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.6.1) - 2026-06-30
+
+
+
+### Bug Fixes
+
+- **github:** Show pane Last refreshed in local time and advance it on background polls in [#58](https://github.com/agent-of-empires/plugin-github/pull/58) by [@Seluj78](https://github.com/Seluj78) ([`447ca8c`](https://github.com/agent-of-empires/plugin-github/commit/447ca8cefb00a5b8d834961117f0427bd687b3a0))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v1.6.0...v1.6.1
 ## [1.6.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.6.0) - 2026-06-29
 
 
