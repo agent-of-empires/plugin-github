@@ -528,14 +528,20 @@ _TOKEN_NOTE = {
 
 
 def _format_refreshed_at(value: Any) -> str | None:
-    """ISO UTC timestamp to compact pane text."""
+    """ISO timestamp to compact pane text in the worker's local time. The worker
+    runs on the user's machine, so local time is their computer's clock; rendering
+    UTC here would mismatch every other local time the plugin shows (e.g. the
+    rate-limit reset in ``main.py``)."""
     if not isinstance(value, str):
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed.astimezone(timezone.utc).strftime("%H:%M UTC")
+    # A tz-naive stamp is UTC by convention (``_utc_now_iso`` always emits one).
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone().strftime("%H:%M")
 
 
 def _freshness_block(freshness: Any) -> dict[str, Any] | None:
