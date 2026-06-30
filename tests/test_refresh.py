@@ -400,6 +400,73 @@ def test_forced_rich_refresh_advances_freshness_when_data_unchanged(tmp_path, mo
     }
 
 
+def test_unchanged_rich_refresh_advances_freshness(tmp_path, monkeypatch):
+    # A background (non-forced) tick whose REST probe returns 304 confirms the
+    # cached rich data is current, so the freshness stamp must advance. Before
+    # the fix it only advanced on a forced refresh and looked frozen here.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    times = iter(["2026-06-29T14:00:00Z", "2026-06-29T14:05:00Z"])
+    monkeypatch.setattr(refresh, "_utc_now_iso", lambda: next(times))
+    transport = _rich_transport([_gql_node(number=7)])
+
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    second = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+
+    assert second["sessions"][0]["freshness"] == {
+        "refreshed_at": "2026-06-29T14:05:00Z",
+        "stale": False,
+    }
+
+
+def test_backoff_cached_rich_refresh_keeps_prior_freshness(tmp_path, monkeypatch):
+    # A backoff-served rich cache was never validated against GitHub, so it must
+    # keep the prior stamp and read as stale, not advance like a real 304.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    times = iter(["2026-06-29T14:00:00Z", "2026-06-29T14:05:00Z"])
+    monkeypatch.setattr(refresh, "_utc_now_iso", lambda: next(times))
+    transport = _rich_transport([_gql_node(number=7)])
+
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    refresh._backoff["until"] = time.monotonic() + 60
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+
+    assert snap["sessions"][0]["freshness"] == {
+        "refreshed_at": "2026-06-29T14:00:00Z",
+        "stale": True,
+    }
+
+
+def test_session_freshness_advances_on_confirmed_current_304():
+    fingerprint = (("o", "r", "feature"),)
+    results = [{"pulls": [{"number": 1}], "_fresh": False, "_stale": False}]
+    out = refresh._session_freshness("s1", fingerprint, results, "2026-06-29T14:05:00Z")
+    assert out == {"refreshed_at": "2026-06-29T14:05:00Z", "stale": False}
+
+
+def test_session_freshness_advances_on_confirmed_current_zero_prs():
+    # A repo with zero open PRs, confirmed current via 304 (_fresh=False on the
+    # rich-cache branch, _stale=False). The dropped not-pulls heuristic used to
+    # wrongly mark this stale and freeze the stamp.
+    fingerprint = (("o", "r", "feature"),)
+    results = [{"pulls": [], "_fresh": False, "_stale": False}]
+    out = refresh._session_freshness("s1", fingerprint, results, "2026-06-29T14:05:00Z")
+    assert out == {"refreshed_at": "2026-06-29T14:05:00Z", "stale": False}
+
+
+def test_session_freshness_keeps_prior_when_stale():
+    fingerprint = (("o", "r", "feature"),)
+    refresh._session_refresh_cache["s1"] = {"fingerprint": fingerprint, "refreshed_at": "2026-06-29T14:00:00Z"}
+    results = [{"pulls": [{"number": 1}], "_fresh": False, "_stale": True}]
+    out = refresh._session_freshness("s1", fingerprint, results, "2026-06-29T14:05:00Z")
+    assert out == {"refreshed_at": "2026-06-29T14:00:00Z", "stale": True}
+
+
 def test_graphql_merged_pull_flagged(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
