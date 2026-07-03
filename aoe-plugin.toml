@@ -14,16 +14,32 @@ name = "GitHub"
 version = "1.6.1"
 # Manifest schema / host API version. api_version 5 added the [[screenshots]]
 # list (declared below); 6 lets a command declare a client-executed `action`
-# (the `open_pr` command below uses `open-ui-link`). A host older than 6 rejects
-# this manifest with "api_version 6 is not supported" rather than loading a
-# command it cannot run.
-api_version = 6
+# (the `open_pr` command below uses `open-ui-link`); 7 adds the `icon` /
+# `icon_asset` identity fields (declared below). A host older than 7 rejects
+# this manifest with "api_version 7 is not supported" rather than a confusing
+# unknown-field error.
+#
+# NOTE: requires agent-of-empires/agent-of-empires#2636, which adds api_version
+# 7 support. Do not merge this PR until that lands in a released aoe, or every
+# user on today's release fails to install/update this plugin.
+api_version = 7
 # Host-app compatibility range (different axis from api_version, which is the
 # manifest-schema version). The host refuses install/update outside this range
 # and skips loading if a later aoe upgrade moves out of it. Requires api_version
 # >= 4. Current released aoe is 1.11.3; refuse an untested 2.0.
 aoe_version = ">=1.11.0, <2.0.0"
 description = "GitHub integration for Agent of Empires: surface PR and issue state for your sessions."
+
+# Identity icon (api_version 7): icon_asset is the actual GitHub mark, shown in
+# the installed Settings > Plugins list and the detail modal; icon_asset wins
+# wherever an image can render, falling back to `icon` if the asset fails to
+# load. `icon` alone can never be the real GitHub logo: lucide-react ships no
+# brand/logo icons, so it is only a generic fallback glyph (a git icon, since
+# this plugin is at least GitHub-adjacent) for surfaces that can't render an
+# image, or if `icon_asset` 404s. `icon_asset` follows the same path rules as
+# `screenshots.path` above (repository-relative, no traversal, raster only).
+icon = "git-branch"
+icon_asset = "assets/icon.png"
 
 # Capability grants are prompted at install and pinned to the manifest hash.
 # Declare only what the worker actually uses so the prompt stays honest.
