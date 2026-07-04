@@ -861,6 +861,7 @@ def test_active_ci_refreshes_before_the_300s_ceiling(tmp_path):
     _age_cache(refresh.GRAPHQL_ACTIVE_DIGEST_STALE + 1)
     refresh.build_snapshot(sessions, env=_Env(), transport=transport)
     assert len(gql) == 2
+    assert not _is_full_query(gql[-1])  # active-ceiling revalidation is the cheap digest, not the rich query
 
 
 def test_terminal_state_holds_cache_until_the_300s_ceiling(tmp_path):
