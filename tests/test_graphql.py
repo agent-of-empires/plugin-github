@@ -286,3 +286,78 @@ def test_build_query_single_alias_is_just_one_branch():
 def test_build_query_floors_at_one_alias():
     # A zero/negative count never yields an empty, malformed document.
     assert "b0: pullRequests(" in graphql.build_query(0)
+
+
+# --- digest tier (#69) ---
+
+
+def test_build_digest_query_aliases_and_omits_rich_connections():
+    q = graphql.build_digest_query(3)
+    for i in range(3):
+        assert f"b{i}: pullRequests" in q
+        assert f"$b{i}: String!" in q
+    assert "rateLimit { cost remaining resetAt }" in q
+    # The whole point: none of the expensive nested connections.
+    assert "contexts" not in q
+    assert "comments" not in q
+    assert "PRConnection" not in q
+
+
+def test_digest_signature_equal_for_digest_and_full_shapes():
+    # The same PR seen through the full fragment (extra fields) and the digest
+    # fragment (minimal fields) must produce the same signature.
+    full_node = _pr(decision="APPROVED", rollup=_rollup("SUCCESS", []))
+    full_node.update({"updatedAt": "2026-01-01T00:00:00Z", "headRefOid": "abc", "id": "PR_1", "title": "t"})
+    full_node["reviewThreads"]["totalCount"] = 2
+    digest_node = {
+        "number": 1,
+        "state": "OPEN",
+        "isDraft": False,
+        "merged": False,
+        "reviewDecision": "APPROVED",
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "headRefOid": "abc",
+        "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
+        "reviewThreads": {"totalCount": 2},
+    }
+    sig_full = graphql.digest_signature(_conn(full_node))
+    sig_digest = graphql.digest_signature(_conn(digest_node))
+    assert sig_full is not None
+    assert sig_full == sig_digest
+
+
+def test_digest_signature_changes_on_each_watched_field():
+    base = {
+        "number": 1,
+        "state": "OPEN",
+        "isDraft": False,
+        "merged": False,
+        "reviewDecision": None,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "headRefOid": "abc",
+        "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "PENDING"}}}]},
+        "reviewThreads": {"totalCount": 0},
+    }
+    sig = graphql.digest_signature(_conn(dict(base)))
+    for field, value in [
+        ("state", "MERGED"),
+        ("isDraft", True),
+        ("merged", True),
+        ("reviewDecision", "APPROVED"),
+        ("updatedAt", "2026-01-02T00:00:00Z"),
+        ("headRefOid", "def"),
+        ("reviewThreads", {"totalCount": 3}),
+    ]:
+        node = dict(base)
+        node[field] = value
+        assert graphql.digest_signature(_conn(node)) != sig, field
+    node = dict(base)
+    node["commits"] = {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}
+    assert graphql.digest_signature(_conn(node)) != sig
+
+
+def test_digest_signature_none_on_malformed():
+    assert graphql.digest_signature(None) is None
+    assert graphql.digest_signature({"nodes": "garbage"}) is None
+    assert graphql.digest_signature({"nodes": ["not-a-dict"]}) is None
+    assert graphql.digest_signature(_conn()) is not None  # empty connection is a valid "no PRs"
