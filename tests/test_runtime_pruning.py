@@ -28,7 +28,7 @@ def _fake_params(monkeypatch, session_ids):
         uistate,
         "snapshot_ui_state_params",
         lambda _snap, **_kwargs: [
-            {"slot": slot, "id": slot_id, "session_id": sid, "payload": {}}
+            {"slot": slot, "id": slot_id, "session_id": sid, "payload": {"text": "x"}}
             for sid in session_ids
             for slot, slot_id in (uistate.ROW_BADGE_SLOT, uistate.ROW_COLUMN_SLOT, uistate.PANE_SLOT)
         ],
