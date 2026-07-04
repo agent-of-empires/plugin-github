@@ -233,7 +233,9 @@ def test_pane_payload_carries_title_and_default_location():
     pane = _pane(uistate.snapshot_ui_state_params(_snapshot(_session())))
     assert pane["payload"]["title"] == "GitHub"
     assert pane["payload"]["default_location"] == "right"
-    assert pane["payload"]["icon"] == "message-square-diff"
+    # No per-pane icon: the manifest's icon_asset/icon (api_version 7) is the
+    # plugin's identity, and always wins in the activity bar/dock tab.
+    assert "icon" not in pane["payload"]
 
 
 def test_empty_snapshot_yields_no_pushes():

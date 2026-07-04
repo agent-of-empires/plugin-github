@@ -62,9 +62,6 @@ SORT_KEY_PAYLOAD = {"label": "GitHub PR attention", "column": ROW_COLUMN_SLOT[1]
 PANE_SLOT = ("pane", "github_pane")
 # Dock the GitHub pane opens in by default; the user can move it after.
 PANE_DEFAULT_LOCATION = "right"
-# Lucide icon for the pane's activity-bar button (host resolves against its
-# allowlist, else a generic plugin icon). Lucide dropped its GitHub brand mark.
-PANE_ICON = "message-square-diff"
 
 # PR state -> (lucide icon name, host Tone). Hard errors get an alert icon.
 _ICON_OPEN = "git-pull-request-arrow"
@@ -658,7 +655,11 @@ def snapshot_ui_state_params(
                 "payload": {
                     "title": "GitHub",
                     "default_location": PANE_DEFAULT_LOCATION,
-                    "icon": PANE_ICON,
+                    # No per-pane icon: the manifest's icon_asset (the real
+                    # GitHub logo) wins unconditionally in the activity bar
+                    # and dock tab, falling back to the manifest icon
+                    # (git-branch) below that. A per-pane icon here would
+                    # only ever shadow both.
                     "blocks": _pane_blocks(repos, auth_present=auth_present, freshness=session.get("freshness")),
                 },
             }
