@@ -103,13 +103,21 @@ _graphql_cache: dict[RichCacheKey, dict[str, Any]] = {}
 # Last successful full refresh per session id, scoped to the repo-key set so a
 # changed workspace never inherits a timestamp from unrelated data.
 _session_refresh_cache: dict[str, dict[str, Any]] = {}
-# Mutable holder (not a bare module float) so updating it needs no `global`.
-#   until        - time.monotonic() seconds; HTTP is skipped until then.
+# Rate-limit backoff, keyed by GitHub's two SEPARATE budgets (REST core, 5000
+# req/hr; GraphQL, 5000 points/hr). Exhausting one must not gate the other, so a
+# GraphQL backoff never blocks the cheap REST poll that discovers a new PR (#62).
+# Each per-budget gate is a mutable holder (no `global` needed to update it):
+#   until        - time.monotonic() seconds; that budget's HTTP is skipped until then.
 #   reset_known  - True iff `until` came from a parsed GraphQL `resetAt` (so the
 #                  countdown is real); False for the fixed REST fallback.
-#   notified     - whether this window's user-facing notice has been emitted, so
-#                  a user-initiated refresh announces a backoff at most once.
-_backoff: dict[str, Any] = {"until": 0.0, "reset_known": False, "notified": False}
+# ``notified`` is shared: one user-facing notice per continuous backoff WINDOW
+# (the span where either gate is active), so a forced refresh announces at most once.
+_BACKOFF_KINDS = ("rest", "graphql")
+_backoff: dict[str, Any] = {
+    "rest": {"until": 0.0, "reset_known": False},
+    "graphql": {"until": 0.0, "reset_known": False},
+    "notified": False,
+}
 
 
 def _utc_now_iso() -> str:
@@ -227,43 +235,71 @@ def _reset_to_monotonic(reset_at: Any) -> float | None:
     return time.monotonic() + min(delta, MAX_BACKOFF_SECS)
 
 
-def _set_backoff(reset_at: Any = None) -> None:
-    """Arm the shared backoff gate. Prefers the GraphQL response's ``resetAt``
-    (so we wait exactly until the budget refills); falls back to a fixed window
-    for the REST path, which has no usable reset.
+def _set_backoff(api: str, reset_at: Any = None) -> None:
+    """Arm one budget's backoff gate (``api`` is ``"rest"`` or ``"graphql"``).
+    Prefers the GraphQL response's ``resetAt`` (so we wait exactly until the
+    budget refills); falls back to a fixed window for the REST path, which has no
+    usable reset.
 
-    A fresh window (the previous one already expired) clears the ``notified``
-    flag so the next user-initiated refresh announces it once. Re-arming an
-    already-active window only extends the deadline and upgrades ``reset_known``;
-    it never shortens the wait, downgrades a real reset to the fallback, or
-    re-opens the notice (the fan-out threads call this repeatedly per window)."""
+    A fresh WINDOW (both gates already expired) clears the shared ``notified``
+    flag so the next user-initiated refresh announces it once; an overlapping trip
+    of the other budget never re-opens the notice. Re-arming an already-active
+    gate only extends the deadline and upgrades ``reset_known``; it never shortens
+    the wait or downgrades a real reset to the fallback (the fan-out calls this
+    repeatedly per window)."""
     until = _reset_to_monotonic(reset_at)
     now = time.monotonic()
     new_until = until if until is not None else now + BACKOFF_SECS
     new_known = until is not None
     with _cache_lock:
-        if now >= _backoff["until"]:  # fresh window
-            _backoff["until"] = new_until
-            _backoff["reset_known"] = new_known
+        # Fresh window only when neither budget is currently backed off.
+        if all(now >= _backoff[k]["until"] for k in _BACKOFF_KINDS):
             _backoff["notified"] = False
-        else:  # extend the live window; never downgrade
-            _backoff["until"] = max(_backoff["until"], new_until)
-            _backoff["reset_known"] = _backoff["reset_known"] or new_known
+        gate = _backoff[api]
+        if new_until > gate["until"]:  # arm or extend; never shorten
+            gate["until"] = new_until
+            gate["reset_known"] = new_known
+        elif new_until == gate["until"]:
+            gate["reset_known"] = gate["reset_known"] or new_known
+
+
+def _active_backoff_locked(now: float) -> dict[str, Any] | None:
+    """The active gate that stays limited LONGEST (the point the whole plugin is
+    clear again), as ``{"seconds", "reset_known", "budget"}``, or ``None`` when
+    neither budget is backed off. ``budget`` is ``"mixed"`` when both are active.
+    Caller must hold ``_cache_lock``. ``reset_known`` is that one gate's flag, not
+    an OR: a known 20s GraphQL reset behind an unknown 60s REST fallback is still
+    an unknown overall clear time."""
+    active = [(k, _backoff[k]) for k in _BACKOFF_KINDS if now < _backoff[k]["until"]]
+    if not active:
+        return None
+    _kind, gate = max(active, key=lambda item: item[1]["until"])
+    budget = active[0][0] if len(active) == 1 else "mixed"
+    return {"seconds": gate["until"] - now, "reset_known": bool(gate["reset_known"]), "budget": budget}
+
+
+def _rate_limit_status() -> dict[str, Any] | None:
+    """Non-consuming snapshot of the current backoff, for the always-on pane note
+    (#62). Unlike ``_consume_rate_limit_notice`` this never touches ``notified``,
+    so the background pane can reflect the degraded state without spending the
+    forced-refresh toast's one-shot."""
+    with _cache_lock:
+        return _active_backoff_locked(time.monotonic())
 
 
 def _consume_rate_limit_notice() -> dict[str, Any] | None:
     """Claim this backoff window's one user-facing notice. Returns
-    ``{"seconds", "reset_known"}`` the first time it is called while a backoff is
-    active and unannounced (then marks the window announced), else ``None``. Only
-    a user-initiated (forced) refresh consumes it; background ticks never do, so a
-    rate-limited workspace is not nagged on every poll."""
+    ``{"seconds", "reset_known", "budget"}`` the first time it is called while a
+    backoff is active and unannounced (then marks the window announced), else
+    ``None``. Only a user-initiated (forced) refresh consumes it; background ticks
+    never do, so a rate-limited workspace is not nagged on every poll."""
     now = time.monotonic()
     with _cache_lock:
-        until = _backoff["until"]
-        if now >= until or _backoff["notified"]:
+        status = _active_backoff_locked(now)
+        if status is None or _backoff["notified"]:
             return None
         _backoff["notified"] = True
-        return {"seconds": until - now, "reset_known": _backoff["reset_known"]}
+        return status
 
 
 def _forced_rate_limit_notice(*, force: bool) -> dict[str, Any]:
@@ -287,7 +323,7 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
     owner, repo, branch = key
     with _cache_lock:
         cached = _etag_cache.get(key)
-        blocked = time.monotonic() < _backoff["until"]
+        blocked = time.monotonic() < _backoff["rest"]["until"]
     if blocked:
         if cached is not None:
             return False, cached["pulls"], False
@@ -297,7 +333,7 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
     try:
         status, new_etag, raw = client.get_json_conditional(f"/repos/{owner}/{repo}/pulls", params, etag)
     except RateLimitedError:
-        _set_backoff()
+        _set_backoff("rest")
         if cached is not None:
             return False, cached["pulls"], False
         raise
@@ -407,11 +443,11 @@ def _paginate_threads(client: GitHubClient, pull_node: dict[str, Any]) -> None:
     try:
         while page.get("hasNextPage") and isinstance(cursor, str) and len(nodes) < MAX_REVIEW_THREADS:
             with _cache_lock:
-                if time.monotonic() < _backoff["until"]:
-                    return  # the budget gate tripped (e.g. the batched query armed it); stop here
+                if time.monotonic() < _backoff["graphql"]["until"]:
+                    return  # the GraphQL gate tripped (e.g. the batched query armed it); stop here
             data = client.post_graphql(graphql.THREADS_PAGE_QUERY, {"id": node_id, "cursor": cursor})
             if _graphql_rate_limited(data):
-                _set_backoff(((data.get("data") or {}).get("rateLimit") or {}).get("resetAt"))
+                _set_backoff("graphql", ((data.get("data") or {}).get("rateLimit") or {}).get("resetAt"))
                 return
             conn = ((data.get("data") or {}).get("node") or {}).get("reviewThreads") or {}
             more = [n for n in (conn.get("nodes") or []) if isinstance(n, dict)]
@@ -421,7 +457,7 @@ def _paginate_threads(client: GitHubClient, pull_node: dict[str, Any]) -> None:
             page = conn.get("pageInfo") or {}
             cursor = page.get("endCursor")
     except RateLimitedError:
-        _set_backoff()
+        _set_backoff("graphql")
         return
     except GitHubError:
         return
@@ -430,9 +466,18 @@ def _paginate_threads(client: GitHubClient, pull_node: dict[str, Any]) -> None:
 def _fallback_pulls(pending: dict[str, Any]) -> dict[str, Any]:
     """Per-key result when GraphQL could not produce fresh data: the last-good
     rich cache if present, else the basic REST open-PR pulls. Never an error and
-    never accidentally empty, preserving the fail-soft per-key contract."""
+    never accidentally empty, preserving the fail-soft per-key contract.
+
+    When the REST probe reported the open-PR list CHANGED (#33), the cached rich
+    result is structurally stale (it can miss a just-opened PR or show a closed
+    one), so serve the fresh basic REST pulls instead. Those lack the rich
+    CI/review fields but reflect the current PR set; the next successful GraphQL
+    tick restores the rich shape. Without this, a GraphQL rate limit can hide a
+    PR that REST already discovered (#62)."""
     rich = pending["rich"]
-    return _pulls_result(rich["pulls"] if rich is not None else pending["basic"], fresh=False, stale=True)
+    if rich is not None and not pending.get("changed"):
+        return _pulls_result(rich["pulls"], fresh=False, stale=True)
+    return _pulls_result(pending["basic"], fresh=False, stale=True)
 
 
 def _chunk_fallback(
@@ -452,14 +497,16 @@ def _resolve_null_repository(
     out: dict[RepoKey, dict[str, Any]],
 ) -> None:
     """Per-key result when the batched response carried no ``repository``: prefer
-    the last-good rich cache; a GraphQL error with no cache degrades to the basic
-    REST pulls (never blanks a PR over a transient failure); a genuinely null repo
-    (no errors) is an empty result, matching the prior single-key behavior."""
+    the last-good rich cache (unless REST saw the list change, #33, in which case
+    serve the fresh basic pulls); a GraphQL error with no cache degrades to the
+    basic REST pulls (never blanks a PR over a transient failure); a genuinely
+    null repo (no errors) is an empty result, matching the prior single-key
+    behavior."""
     errored = bool(data.get("errors"))
     for key in chunk:
         rich = pending[key]["rich"]
         if rich is not None:
-            out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True)
+            out[key] = _fallback_pulls(pending[key])
         elif errored:
             out[key] = _pulls_result(pending[key]["basic"], fresh=False, stale=True)
         else:
@@ -516,7 +563,7 @@ def _fetch_chunk(
     group-wide."""
     owner, repo, _ = chunk[0]
     with _cache_lock:
-        blocked = time.monotonic() < _backoff["until"]
+        blocked = time.monotonic() < _backoff["graphql"]["until"]
     if blocked:
         _chunk_fallback(chunk, pending, out)
         return
@@ -527,7 +574,7 @@ def _fetch_chunk(
     try:
         data = client.post_graphql(graphql.build_query(len(chunk)), variables)
     except RateLimitedError:
-        _set_backoff()
+        _set_backoff("graphql")
         _chunk_fallback(chunk, pending, out)
         return
     except GitHubError:
@@ -541,7 +588,7 @@ def _fetch_chunk(
     # remaining budget, after caching whatever good data this response carries.
     remaining = rate_info.get("remaining")
     if _graphql_rate_limited(data) or (isinstance(remaining, int) and remaining < RATELIMIT_FLOOR):
-        _set_backoff(rate_info.get("resetAt"))
+        _set_backoff("graphql", rate_info.get("resetAt"))
 
     if not isinstance(repository, dict):
         _resolve_null_repository(chunk, pending, data, out)
@@ -576,7 +623,7 @@ def _fetch_rich(
             # Mark the latter stale so it does not advance the freshness stamp.
             out[key] = _pulls_result(rich["pulls"], fresh=False, stale=not _fresh)
             continue
-        pending[key] = {"basic": basic, "rich": rich}
+        pending[key] = {"basic": basic, "rich": rich, "changed": changed}
 
     groups: dict[tuple[str, str], list[RepoKey]] = defaultdict(list)
     for key in pending:
@@ -760,8 +807,14 @@ def build_snapshot(
     # A forced refresh that is rate-limited carries a one-shot notice so the main
     # loop can tell the user why nothing changed (issue #20); background ticks
     # stay silent. See _forced_rate_limit_notice.
+    # ``rate_limit`` is the always-on counterpart (#62): the current backoff state
+    # regardless of force, so the pane can surface a persistent note on background
+    # refreshes too, not only when the user clicks Refresh. It does not consume the
+    # one-shot notice.
+    rate_limit = _rate_limit_status()
     return {
         "sessions": out_sessions,
         "auth": {"present": auth_present},
+        **({"rate_limit": rate_limit} if rate_limit is not None else {}),
         **_forced_rate_limit_notice(force=force),
     }
