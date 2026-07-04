@@ -180,9 +180,11 @@ a per-check change under an unchanged rollup), a hard full-refresh ceiling
 click on Refresh updates immediately. Every GraphQL response's
 `rateLimit { cost remaining resetAt }` is logged to stderr (the per-worker log)
 and tracked: a low remaining budget stretches the background ceilings before the
-hard backoff floor trips, a failed rich query cools that key down before it may
-retry, and a `403`/`429`/`RATE_LIMITED` (or a nearly spent budget) trips a short
-backoff serving the last-good cached result, honoring `resetAt`.
+hard backoff floor trips, any non-rate query failure (digest or full, warm key
+or cold) cools that key down before it may retry so a persistent error cannot
+re-spend a query every tick, and a `403`/`429`/`RATE_LIMITED` (or a nearly spent
+budget) trips a short backoff serving the last-good cached result, honoring
+`resetAt`.
 
 Worst-case math (every key changes every tick, so each spends one REST request,
 and same-repo branches batch into one GraphQL query per repo): for N unique

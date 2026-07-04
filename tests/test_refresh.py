@@ -76,6 +76,7 @@ def _clear_cache():
         refresh._backoff["graphql"].update({"until": 0.0, "reset_known": False})
         refresh._backoff["notified"] = False
         refresh._graphql_budget.update({"remaining": None, "valid_until": None})
+        refresh._retry_cooldown.clear()
 
     _reset()
     yield
@@ -1254,6 +1255,88 @@ def test_graphql_cost_is_logged_per_query(tmp_path, caplog):
     kinds = [r.getMessage() for r in caplog.records if "graphql kind=" in r.getMessage()]
     assert any("kind=full" in m and "cost=1" in m and "remaining=5000" in m for m in kinds)
     assert any("kind=digest" in m for m in kinds)
+
+
+def test_failed_digest_cools_down_instead_of_requerying(tmp_path):
+    # #71: a digest query that fails with a non-rate error must not re-digest
+    # every tick. Seed a rich cache, age it, then fail every digest.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=7)]))
+    _expire_graphql_cache()
+
+    gql = []
+
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            gql.append(request)
+            return httpx.Response(500, text="boom")  # only the digest fires here
+        if request.headers.get("If-None-Match") == 'W/"v1"':
+            return httpx.Response(304)
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    transport = httpx.MockTransport(handler)
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1  # one digest attempt
+    assert not _is_full_query(gql[0])
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 7  # stale cache served
+    _expire_graphql_cache()
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1  # cooldown held: no second digest
+
+
+def test_cold_key_full_failure_cools_down(tmp_path):
+    # #71: a cold key (no rich cache) whose full query keeps failing must also
+    # cool down, not retry the full query on every tick. The old per-entry
+    # full_retry_at could not reach cold keys.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    gql = []
+
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            gql.append(request)
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    transport = httpx.MockTransport(handler)
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1  # one full attempt from cold
+    assert _is_full_query(gql[0])
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 12  # basic REST pull served
+    # Force a change so the classifier would otherwise re-queue (changed=True):
+    # the cooldown must still hold it back on a background tick.
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1  # cooldown held: no second full query
+
+
+def test_forced_refresh_bypasses_cooldown(tmp_path):
+    # A user-clicked (force) refresh must attempt a live query even while a key
+    # is cooling down from a prior failure.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    gql = []
+
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            gql.append(request)
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    transport = httpx.MockTransport(handler)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1  # cooling down
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport, force=True)
+    assert len(gql) == 2  # force bypassed the cooldown
 
 
 # --- bounded parallel fan-out (#70) ---

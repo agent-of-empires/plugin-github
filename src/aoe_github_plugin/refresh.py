@@ -95,13 +95,13 @@ GRAPHQL_ACTIVE_DIGEST_STALE = 30.0
 # while CI churns.
 GRAPHQL_FULL_MAX_STALE = 7200.0
 GRAPHQL_ACTIVE_FULL_MAX_STALE = 300.0
-# Cooldown before retrying a full query for a key whose previous full attempt
-# failed with a non-rate-limit error. Without it, a digest mismatch over a
-# persistently failing full query (schema drift, scope error, malformed alias)
-# becomes a new steady-state burn loop: digest, mismatch, failed full, repeat
-# every tick. Fixed rather than exponential: worst case is one full attempt per
-# key per cooldown, already bounded.
-GRAPHQL_FULL_RETRY_COOLDOWN = 300.0
+# Cooldown before retrying a key whose previous GraphQL attempt failed with a
+# non-rate-limit error (digest or full). Without it, a persistently failing
+# query (schema drift, scope error, malformed alias, a repo-level GraphQL error)
+# becomes a new steady-state burn loop: stale, re-query, fail, repeat every tick.
+# Fixed rather than exponential: worst case is one attempt per key per cooldown,
+# already bounded.
+GRAPHQL_RETRY_COOLDOWN = 300.0
 # Budget pressure: once the last-seen GraphQL ``remaining`` drops below this,
 # stretch the background ceilings by the multiplier so a shared token under
 # load degrades to slower background freshness instead of racing to the
@@ -165,6 +165,14 @@ _backoff: dict[str, Any] = {
 # resetAt was unusable); past it the observation is discarded, since the budget
 # refilled.
 _graphql_budget: dict[str, Any] = {"remaining": None, "valid_until": None}
+# Per-key cooldown deadline (monotonic) after a NON-rate GraphQL failure, keyed
+# by ``RichCacheKey`` so it is independent of whether a rich cache entry exists
+# (#71). A rate-limit trip already arms the shared backoff gate; this covers the
+# other failure classes (schema drift, a repo-level GraphQL error, a malformed
+# alias, an unexpected raise mid-parse) that would otherwise re-spend a query
+# every background tick, at the DIGEST tier and for COLD keys too, both of which
+# the old per-entry ``full_retry_at`` could not reach.
+_retry_cooldown: dict[RichCacheKey, float] = {}
 
 
 def _snapshot_cache_path() -> Path:
@@ -639,15 +647,15 @@ def _chunk_fallback(
         out[key] = _fallback_pulls(pending[key])
 
 
-def _arm_full_retry(keys: list[RepoKey], pending: dict[RepoKey, dict[str, Any]], now: float) -> None:
-    """Cooldown the failed keys' next background full attempt (#69). Only keys
-    with a rich cache are armed; a cold key has nothing to serve meanwhile, so
-    it keeps retrying on the cold path."""
+def _arm_retry_cooldown(keys: list[RepoKey], pending: dict[RepoKey, dict[str, Any]], now: float) -> None:
+    """Cooldown the failed keys' next attempt after a NON-rate failure (#69/#71),
+    keyed by ``cache_key`` so it holds whether or not a rich cache exists (a cold
+    key that keeps failing its full query, a digest that keeps failing) and
+    covers both tiers. A rate-limit trip is handled by the shared backoff gate
+    instead and never lands here."""
     with _cache_lock:
         for key in keys:
-            rich = pending[key]["rich"]
-            if rich is not None:
-                rich["full_retry_at"] = now + GRAPHQL_FULL_RETRY_COOLDOWN
+            _retry_cooldown[pending[key]["cache_key"]] = now + GRAPHQL_RETRY_COOLDOWN
 
 
 def _resolve_null_repository(
@@ -663,6 +671,10 @@ def _resolve_null_repository(
     null repo (no errors) is an empty result, matching the prior single-key
     behavior."""
     errored = bool(data.get("errors"))
+    if errored:
+        # A repo-level error (renamed/deleted repo, transient server error) would
+        # otherwise re-fire the full query every tick; cool the chunk down (#71).
+        _arm_retry_cooldown(chunk, pending, time.monotonic())
     for key in chunk:
         rich = pending[key]["rich"]
         if rich is not None:
@@ -683,9 +695,9 @@ def _apply_aliases(
 ) -> dict[RepoKey, dict[str, Any]]:
     """Normalize each alias connection back into its key's cache + result. A failed
     (named in ``errors[].path``) or malformed alias falls back per key (and arms
-    that key's full-retry cooldown, #69), never poisoning its siblings. ``data``
-    is the full envelope (its ``repository`` is a dict here, validated by the
-    caller)."""
+    that key's retry cooldown, #69/#71), never poisoning its siblings. A good
+    alias clears any prior cooldown. ``data`` is the full envelope (its
+    ``repository`` is a dict here, validated by the caller)."""
     repository = (data.get("data") or {}).get("repository") or {}
     failed = _error_aliases(data)
     now = time.monotonic()
@@ -693,7 +705,7 @@ def _apply_aliases(
     for i, key in enumerate(chunk):
         conn = repository.get(f"b{i}")
         if f"b{i}" in failed or not isinstance(conn, dict):
-            _arm_full_retry([key], pending, now)
+            _arm_retry_cooldown([key], pending, now)
             out[key] = _fallback_pulls(pending[key])
             continue
         # The signature must come from the raw connection BEFORE thread
@@ -704,14 +716,15 @@ def _apply_aliases(
             if isinstance(node, dict):
                 _paginate_threads(client, node)
         pulls = graphql.normalize_connection(conn, required_checks_only=required_checks_only)
+        cache_key = _rich_cache_key(key, required_checks_only=required_checks_only)
         with _cache_lock:
-            _graphql_cache[_rich_cache_key(key, required_checks_only=required_checks_only)] = {
+            _graphql_cache[cache_key] = {
                 "pulls": pulls,
                 "digest": digest,
                 "fetched_at": now,
                 "validated_at": now,
-                "full_retry_at": 0.0,
             }
+            _retry_cooldown.pop(cache_key, None)
         out[key] = _pulls_result(pulls, fresh=True)
     return out
 
@@ -750,7 +763,7 @@ def _fetch_chunk(
         # A non-rate failure arms the per-key cooldown, not the global gate: the
         # budget is fine, this query is not, so retrying it every tick would be
         # the #69 burn loop in a new shape.
-        _arm_full_retry(chunk, pending, time.monotonic())
+        _arm_retry_cooldown(chunk, pending, time.monotonic())
         _chunk_fallback(chunk, pending, out)
         return
 
@@ -788,6 +801,9 @@ def _apply_digest_aliases(
         signature = None if f"b{i}" in failed else graphql.digest_signature(repository.get(f"b{i}"))
         rich = pending[key]["rich"]  # never None on the digest path (classification requires a cache)
         if signature is None:
+            # A failed or malformed digest alias arms the cooldown so it does not
+            # re-query every tick (#71); the rich cache still serves meanwhile.
+            _arm_retry_cooldown([key], pending, now)
             out[key] = _fallback_pulls(pending[key])
         elif signature == rich.get("digest"):
             with _cache_lock:
@@ -827,6 +843,9 @@ def _fetch_digest_chunk(
         _chunk_fallback(chunk, pending, out)
         return
     except GitHubError:
+        # Non-rate failure: cool the chunk down so it does not re-digest every
+        # tick (#71). The rich cache still serves meanwhile.
+        _arm_retry_cooldown(chunk, pending, time.monotonic())
         _chunk_fallback(chunk, pending, out)
         return
 
@@ -836,7 +855,11 @@ def _fetch_digest_chunk(
     remaining = rate_info.get("remaining")
     if _graphql_rate_limited(data) or (isinstance(remaining, int) and remaining < RATELIMIT_FLOOR):
         _set_backoff("graphql", rate_info.get("resetAt"))
-    if _graphql_rate_limited(data) or not isinstance(payload.get("repository"), dict):
+    if _graphql_rate_limited(data):
+        _chunk_fallback(chunk, pending, out)  # backoff gate handles the retry cadence
+        return
+    if not isinstance(payload.get("repository"), dict):
+        _arm_retry_cooldown(chunk, pending, time.monotonic())
         _chunk_fallback(chunk, pending, out)
         return
 
@@ -862,6 +885,10 @@ def _run_chunked(
             try:
                 run(chunk)
             except Exception as exc:  # noqa: BLE001 - fail-soft per repo, never abort the refresh
+                # An unexpected raise mid-parse would otherwise re-run and re-crash
+                # every tick; cool the chunk down so a deterministic bug degrades
+                # to periodic retries, not a per-tick burn (#71).
+                _arm_retry_cooldown(chunk, pending, time.monotonic())
                 for key in chunk:
                     out.setdefault(
                         key,
@@ -901,18 +928,18 @@ def _fetch_rich(
             out[key] = stale if stale is not None else _error_entry(probe)
             continue
         changed, basic, _fresh = probe
-        entry = {"basic": basic, "rich": rich, "changed": changed}
-        if rich is None or force or changed or rich.get("digest") is None:
+        entry = {"basic": basic, "rich": rich, "changed": changed, "cache_key": cache_key}
+        with _cache_lock:
+            cooling = now < _retry_cooldown.get(cache_key, 0.0)
+        if not force and cooling:
+            # A recent non-rate failure for this key: serve what we have and
+            # spend nothing until the cooldown lapses (#71). A forced refresh
+            # bypasses it, since the user asked for a live attempt.
+            out[key] = _fallback_pulls(entry)
+        elif rich is None or force or changed or rich.get("digest") is None or _full_stale(rich, now):
             full_pending[key] = entry
-        elif _full_stale(rich, now) or _digest_stale(rich, now):
-            if now < rich.get("full_retry_at", 0.0):
-                # Cooling down after a failed full attempt: serve stale rather
-                # than re-spending digest or full points on a known-bad query.
-                out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True)
-            elif _full_stale(rich, now):
-                full_pending[key] = entry
-            else:
-                digest_pending[key] = entry
+        elif _digest_stale(rich, now):
+            digest_pending[key] = entry
         else:
             # ``_fresh`` distinguishes a real 304 (GitHub confirmed the data is
             # current) from a backoff-served cache (GitHub was never contacted).
