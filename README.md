@@ -146,6 +146,13 @@ session-less `github.refresh` cover every session and prune vanished ones:
    `github.refresh` to this worker; `icon` is a lucide name for its activity-bar
    button).
 
+On restart: each successful full refresh is persisted to an on-disk cache
+(`${XDG_CACHE_HOME:-~/.cache}/agent-of-empires/github-plugin/snapshot.json`). On
+startup the worker repaints that last-known snapshot (marked stale, filtered to
+sessions that still exist) before its first network refresh runs, so a restarted
+`aoe serve` shows data immediately instead of a blank pane while the cold serial
+fan-out completes. The cache is fail-soft: a missing or corrupt file is ignored.
+
 Rate limits: the user token's budgets (REST 5000 req/hr, GraphQL 5000 points/hr)
 are shared with the user's own `gh` usage, so the worker spends as little as it
 can. A REST conditional request (ETag / `If-None-Match`) is the primary poll: a
