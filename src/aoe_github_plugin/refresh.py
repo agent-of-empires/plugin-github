@@ -16,9 +16,11 @@ Efficiency, against the user token's shared budget (REST 5000 req/hr, GraphQL
   poll; a ``304`` does not count against the primary rate limit, so a steady
   state where nothing changed costs ~0;
 - the expensive rich GraphQL query fires only when that conditional check
-  reports a change, on an explicit (forced) refresh, or when the cached rich
-  result has aged past ``GRAPHQL_MAX_STALE`` (a freshness ceiling, so CI/review
-  state cannot lie indefinitely between PR-list changes);
+  reports a change, on an explicit (forced) refresh, on a cold cache, or when
+  the cheap DIGEST query (#69) detects a change past the digest ceiling; the
+  ceilings exist so CI/review state cannot lie indefinitely between PR-list
+  changes, and the digest tier keeps revalidating them near-free (a hard
+  ``GRAPHQL_FULL_MAX_STALE`` bounds what the digest cannot see);
 - requests are issued serially (no concurrent fan-out) to stay clear of the
   secondary/concurrency limits;
 - a ``403``/``429``/``RATE_LIMITED`` trips a short global backoff, during which
@@ -30,6 +32,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import logging
 import tempfile
 import threading
 import contextlib
@@ -40,6 +43,7 @@ from datetime import datetime
 from datetime import timezone
 from collections import defaultdict
 from dataclasses import dataclass
+from collections.abc import Callable
 
 import httpx
 
@@ -51,24 +55,49 @@ from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.handlers import _resolve_optional_token
 from aoe_github_plugin.utils.gitctx import parse_owner_repo
 
+_LOG = logging.getLogger(__name__)
+
 GIT_TIMEOUT = 2.0
 # Back off proactively once the GraphQL point budget (5000/hr) is nearly spent,
 # so a busy workspace degrades to stale data rather than hard rate-limit errors.
 RATELIMIT_FLOOR = 50
-# Freshness ceiling for the rich (GraphQL) cache. The REST conditional check
-# gates GraphQL on a detected change, but the ``/pulls`` ETag does not reliably
-# bump on a CI check completing or a review thread changing, so a rich result
-# this old is refreshed even on a ``304``. Bounds how stale CI/review state can
-# get (a user-clicked refresh forces it immediately regardless).
-GRAPHQL_MAX_STALE = 300.0
-# Shorter ceiling for a branch whose cached rich state is ACTIVE: a CI check is
-# running or queued (#26). Such state transitions in seconds and the ``/pulls``
-# ETag does not bump for it, so the 300s ceiling would lag a finishing CI run by
-# minutes. A small floor (vs 0) still refreshes on every background tick while
-# deduping sub-tick bursts (closely spaced session-list changes, host retries).
-# Scoped to CI on purpose: a PR merely awaiting review can sit idle for days, so
-# polling it every tick would burn budget for no signal; it keeps the 300s gate.
-GRAPHQL_ACTIVE_STALE = 30.0
+# Freshness ceilings for the rich (GraphQL) cache, two-tier since #69. The REST
+# conditional check gates GraphQL on a detected change, but the ``/pulls`` ETag
+# does not reliably bump on a CI check completing or a review thread changing,
+# so cached rich state is still revalidated on a ``304``, just via the cheap
+# DIGEST query (~1 point per batched chunk) instead of the full rich query
+# (~25-30 points per chunk, the #69 budget burn). Only a digest mismatch, a
+# REST-detected change, a forced refresh, a cold cache, or the FULL ceiling
+# spends the rich query.
+GRAPHQL_DIGEST_STALE = 300.0
+# Shorter digest ceiling for a branch whose cached rich state is ACTIVE: a CI
+# check is running or queued (#26). Such state transitions in seconds and the
+# ``/pulls`` ETag does not bump for it. A small floor (vs 0) still revalidates
+# on every background tick while deduping sub-tick bursts. Scoped to CI on
+# purpose: a PR merely awaiting review can sit idle for days, so polling it
+# every tick would burn budget for no signal; it keeps the 300s gate.
+GRAPHQL_ACTIVE_DIGEST_STALE = 30.0
+# Hard ceilings on how long a FULL rich fetch can be deferred by matching
+# digests. The digest is a heuristic, not a hash of everything the pane renders
+# (a comment body edit or a per-check change under an unchanged rollup can slip
+# past it), so a periodic full refresh bounds any false-negative staleness. An
+# active branch gets a much shorter bound so its per-check rows stay honest
+# while CI churns.
+GRAPHQL_FULL_MAX_STALE = 7200.0
+GRAPHQL_ACTIVE_FULL_MAX_STALE = 300.0
+# Cooldown before retrying a full query for a key whose previous full attempt
+# failed with a non-rate-limit error. Without it, a digest mismatch over a
+# persistently failing full query (schema drift, scope error, malformed alias)
+# becomes a new steady-state burn loop: digest, mismatch, failed full, repeat
+# every tick. Fixed rather than exponential: worst case is one full attempt per
+# key per cooldown, already bounded.
+GRAPHQL_FULL_RETRY_COOLDOWN = 300.0
+# Budget pressure: once the last-seen GraphQL ``remaining`` drops below this,
+# stretch the background ceilings by the multiplier so a shared token under
+# load degrades to slower background freshness instead of racing to the
+# RATELIMIT_FLOOR cliff. Never applies to forced, REST-changed, or cold keys.
+BUDGET_PRESSURE_REMAINING = 1000
+BUDGET_PRESSURE_MULTIPLIER = 4.0
 # Max branches aliased into one batched GraphQL query (#25). Caps the per-query
 # point cost (cost scales with aliases x their nested connections) so a repo with
 # many worktrees splits across a few serial queries rather than one giant one.
@@ -121,6 +150,11 @@ _backoff: dict[str, Any] = {
     "graphql": {"until": 0.0, "reset_known": False},
     "notified": False,
 }
+# Last GraphQL budget observation, from any query's ``rateLimit`` payload (#69).
+# ``valid_until`` is the window's reset as a monotonic deadline (or None when
+# resetAt was unusable); past it the observation is discarded, since the budget
+# refilled.
+_graphql_budget: dict[str, Any] = {"remaining": None, "valid_until": None}
 
 
 def _snapshot_cache_path() -> Path:
@@ -447,13 +481,51 @@ def _is_active(pulls: list[dict[str, Any]]) -> bool:
     return False
 
 
-def _rich_stale(rich: dict[str, Any] | None, now: float) -> bool:
-    """Whether the cached rich result is missing or aged past its ceiling: the
-    short ``GRAPHQL_ACTIVE_STALE`` for an active branch (#26), else the 300s one."""
-    if rich is None:
-        return True
-    ceiling = GRAPHQL_ACTIVE_STALE if _is_active(rich["pulls"]) else GRAPHQL_MAX_STALE
-    return (now - rich["fetched_at"]) >= ceiling
+def _observe_rate_limit(rate_info: dict[str, Any], *, kind: str, repo: str, aliases: int) -> None:
+    """Record a query's ``rateLimit`` payload: log the spend (the #69 telemetry
+    gap; ``cost`` used to be selected and thrown away) and remember ``remaining``
+    for budget-pressure pacing, valid until the window resets."""
+    cost = rate_info.get("cost")
+    remaining = rate_info.get("remaining")
+    _LOG.info("graphql kind=%s repo=%s aliases=%d cost=%s remaining=%s", kind, repo, aliases, cost, remaining)
+    if not isinstance(remaining, int):
+        return
+    with _cache_lock:
+        _graphql_budget["remaining"] = remaining
+        _graphql_budget["valid_until"] = _reset_to_monotonic(rate_info.get("resetAt"))
+
+
+def _budget_multiplier(now: float) -> float:
+    """Ceiling stretch under budget pressure: ``BUDGET_PRESSURE_MULTIPLIER`` when
+    the last-seen GraphQL ``remaining`` (still within its window) is low, else 1.
+    An observation whose window has reset is discarded; the budget refilled."""
+    with _cache_lock:
+        remaining = _graphql_budget["remaining"]
+        valid_until = _graphql_budget["valid_until"]
+        if remaining is None:
+            return 1.0
+        if valid_until is not None and now >= valid_until:
+            _graphql_budget["remaining"] = None
+            _graphql_budget["valid_until"] = None
+            return 1.0
+    return BUDGET_PRESSURE_MULTIPLIER if remaining < BUDGET_PRESSURE_REMAINING else 1.0
+
+
+def _digest_stale(rich: dict[str, Any], now: float) -> bool:
+    """Whether the cached rich result wants digest revalidation: aged past the
+    short active ceiling (#26) or the 300s one since it was last fetched OR
+    digest-validated, stretched under budget pressure."""
+    ceiling = GRAPHQL_ACTIVE_DIGEST_STALE if _is_active(rich["pulls"]) else GRAPHQL_DIGEST_STALE
+    validated = rich.get("validated_at", rich["fetched_at"])
+    return (now - validated) >= ceiling * _budget_multiplier(now)
+
+
+def _full_stale(rich: dict[str, Any], now: float) -> bool:
+    """Whether the cached rich result is past the HARD full-fetch ceiling: only a
+    real full query resets this clock, so digest false negatives (fields the
+    signature cannot see) are bounded rather than permanent."""
+    ceiling = GRAPHQL_ACTIVE_FULL_MAX_STALE if _is_active(rich["pulls"]) else GRAPHQL_FULL_MAX_STALE
+    return (now - rich["fetched_at"]) >= ceiling * _budget_multiplier(now)
 
 
 def _error_aliases(data: dict[str, Any]) -> set[str]:
@@ -492,6 +564,7 @@ def _paginate_threads(client: GitHubClient, pull_node: dict[str, Any]) -> None:
                 if time.monotonic() < _backoff["graphql"]["until"]:
                     return  # the GraphQL gate tripped (e.g. the batched query armed it); stop here
             data = client.post_graphql(graphql.THREADS_PAGE_QUERY, {"id": node_id, "cursor": cursor})
+            _observe_rate_limit(((data.get("data") or {}).get("rateLimit") or {}), kind="threads", repo="-", aliases=1)
             if _graphql_rate_limited(data):
                 _set_backoff("graphql", ((data.get("data") or {}).get("rateLimit") or {}).get("resetAt"))
                 return
@@ -536,6 +609,17 @@ def _chunk_fallback(
         out[key] = _fallback_pulls(pending[key])
 
 
+def _arm_full_retry(keys: list[RepoKey], pending: dict[RepoKey, dict[str, Any]], now: float) -> None:
+    """Cooldown the failed keys' next background full attempt (#69). Only keys
+    with a rich cache are armed; a cold key has nothing to serve meanwhile, so
+    it keeps retrying on the cold path."""
+    with _cache_lock:
+        for key in keys:
+            rich = pending[key]["rich"]
+            if rich is not None:
+                rich["full_retry_at"] = now + GRAPHQL_FULL_RETRY_COOLDOWN
+
+
 def _resolve_null_repository(
     chunk: list[RepoKey],
     pending: dict[RepoKey, dict[str, Any]],
@@ -568,9 +652,10 @@ def _apply_aliases(
     required_checks_only: bool,
 ) -> dict[RepoKey, dict[str, Any]]:
     """Normalize each alias connection back into its key's cache + result. A failed
-    (named in ``errors[].path``) or malformed alias falls back per key, never
-    poisoning its siblings. ``data`` is the full envelope (its ``repository`` is a
-    dict here, validated by the caller)."""
+    (named in ``errors[].path``) or malformed alias falls back per key (and arms
+    that key's full-retry cooldown, #69), never poisoning its siblings. ``data``
+    is the full envelope (its ``repository`` is a dict here, validated by the
+    caller)."""
     repository = (data.get("data") or {}).get("repository") or {}
     failed = _error_aliases(data)
     now = time.monotonic()
@@ -578,8 +663,13 @@ def _apply_aliases(
     for i, key in enumerate(chunk):
         conn = repository.get(f"b{i}")
         if f"b{i}" in failed or not isinstance(conn, dict):
+            _arm_full_retry([key], pending, now)
             out[key] = _fallback_pulls(pending[key])
             continue
+        # The signature must come from the raw connection BEFORE thread
+        # pagination mutates it, so it compares equal to a later digest response
+        # (which never paginates).
+        digest = graphql.digest_signature(conn)
         for node in conn.get("nodes") or []:
             if isinstance(node, dict):
                 _paginate_threads(client, node)
@@ -587,7 +677,10 @@ def _apply_aliases(
         with _cache_lock:
             _graphql_cache[_rich_cache_key(key, required_checks_only=required_checks_only)] = {
                 "pulls": pulls,
+                "digest": digest,
                 "fetched_at": now,
+                "validated_at": now,
+                "full_retry_at": 0.0,
             }
         out[key] = _pulls_result(pulls, fresh=True)
     return out
@@ -624,12 +717,17 @@ def _fetch_chunk(
         _chunk_fallback(chunk, pending, out)
         return
     except GitHubError:
+        # A non-rate failure arms the per-key cooldown, not the global gate: the
+        # budget is fine, this query is not, so retrying it every tick would be
+        # the #69 burn loop in a new shape.
+        _arm_full_retry(chunk, pending, time.monotonic())
         _chunk_fallback(chunk, pending, out)
         return
 
     payload = data.get("data") or {}
     rate_info = payload.get("rateLimit") or {}
     repository = payload.get("repository")
+    _observe_rate_limit(rate_info, kind="full", repo=f"{owner}/{repo}", aliases=len(chunk))
     # Arm backoff for the next refresh on a riding rate-limit error or a low
     # remaining budget, after caching whatever good data this response carries.
     remaining = rate_info.get("remaining")
@@ -642,35 +740,88 @@ def _fetch_chunk(
     out.update(_apply_aliases(client, chunk, pending, data, required_checks_only=required_checks_only))
 
 
-def _fetch_rich(
-    client: GitHubClient, keys: list[RepoKey], *, force: bool, required_checks_only: bool
-) -> dict[RepoKey, dict[str, Any]]:
-    """Token path: a cheap REST conditional probe gates each key (#21), then the
-    keys that need fresh GraphQL are grouped by ``(owner, repo)`` and aliased into
-    one batched query per group, chunked to ``MAX_GRAPHQL_ALIASES`` (#25). Gating
-    is PER KEY before grouping, so one active branch never drags its quiescent
-    siblings into a fetch. Fail-soft per key: a probe error or GraphQL failure
-    serves the rich cache, then basic REST pulls, then a typed error."""
+def _apply_digest_aliases(
+    chunk: list[RepoKey],
+    pending: dict[RepoKey, dict[str, Any]],
+    data: dict[str, Any],
+    out: dict[RepoKey, dict[str, Any]],
+) -> list[RepoKey]:
+    """Compare each alias's digest signature against its cached one. A match
+    revalidates the rich cache (bumps ``validated_at``, serves it fresh, like a
+    304); a failed or malformed alias serves the stale cache. Returns the
+    mismatched keys, which the caller promotes to the full query."""
+    repository = (data.get("data") or {}).get("repository") or {}
+    failed = _error_aliases(data)
     now = time.monotonic()
-    out: dict[RepoKey, dict[str, Any]] = {}
-    pending: dict[RepoKey, dict[str, Any]] = {}
-    for key in keys:
-        cache_key = _rich_cache_key(key, required_checks_only=required_checks_only)
-        with _cache_lock:
-            rich = _graphql_cache.get(cache_key)
-        try:
-            changed, basic, _fresh = _rest_probe(client, key)
-        except GitHubError as exc:
-            out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True) if rich is not None else _error_entry(exc)
-            continue
-        if rich is not None and not force and not changed and not _rich_stale(rich, now):
-            # ``_fresh`` distinguishes a real 304 (GitHub confirmed the data is
-            # current) from a backoff-served cache (GitHub was never contacted).
-            # Mark the latter stale so it does not advance the freshness stamp.
-            out[key] = _pulls_result(rich["pulls"], fresh=False, stale=not _fresh)
-            continue
-        pending[key] = {"basic": basic, "rich": rich, "changed": changed}
+    promoted: list[RepoKey] = []
+    for i, key in enumerate(chunk):
+        signature = None if f"b{i}" in failed else graphql.digest_signature(repository.get(f"b{i}"))
+        rich = pending[key]["rich"]  # never None on the digest path (classification requires a cache)
+        if signature is None:
+            out[key] = _fallback_pulls(pending[key])
+        elif signature == rich.get("digest"):
+            with _cache_lock:
+                rich["validated_at"] = now
+            out[key] = _pulls_result(rich["pulls"], fresh=True)
+        else:
+            promoted.append(key)
+    return promoted
 
+
+def _fetch_digest_chunk(
+    client: GitHubClient,
+    chunk: list[RepoKey],
+    pending: dict[RepoKey, dict[str, Any]],
+    out: dict[RepoKey, dict[str, Any]],
+    full_pending: dict[RepoKey, dict[str, Any]],
+) -> None:
+    """One batched DIGEST query (#69) for up to ``MAX_GRAPHQL_ALIASES`` branches
+    of one repo. A matching signature revalidates that key's rich cache; a
+    mismatch promotes the key into ``full_pending`` for the rich query. Failures
+    (blocked gate, rate limit, malformed alias) serve the stale cache; they
+    never promote to full, so a flaky digest cannot burn full-query points."""
+    owner, repo, _ = chunk[0]
+    with _cache_lock:
+        blocked = time.monotonic() < _backoff["graphql"]["until"]
+    if blocked:
+        _chunk_fallback(chunk, pending, out)
+        return
+
+    variables: dict[str, Any] = {"owner": owner, "repo": repo}
+    for i, key in enumerate(chunk):
+        variables[f"b{i}"] = key[2]
+    try:
+        data = client.post_graphql(graphql.build_digest_query(len(chunk)), variables)
+    except RateLimitedError:
+        _set_backoff("graphql")
+        _chunk_fallback(chunk, pending, out)
+        return
+    except GitHubError:
+        _chunk_fallback(chunk, pending, out)
+        return
+
+    payload = data.get("data") or {}
+    rate_info = payload.get("rateLimit") or {}
+    _observe_rate_limit(rate_info, kind="digest", repo=f"{owner}/{repo}", aliases=len(chunk))
+    remaining = rate_info.get("remaining")
+    if _graphql_rate_limited(data) or (isinstance(remaining, int) and remaining < RATELIMIT_FLOOR):
+        _set_backoff("graphql", rate_info.get("resetAt"))
+    if _graphql_rate_limited(data) or not isinstance(payload.get("repository"), dict):
+        _chunk_fallback(chunk, pending, out)
+        return
+
+    for key in _apply_digest_aliases(chunk, pending, data, out):
+        full_pending[key] = pending[key]
+
+
+def _run_chunked(
+    pending: dict[RepoKey, dict[str, Any]],
+    run: Callable[[list[RepoKey]], None],
+    out: dict[RepoKey, dict[str, Any]],
+) -> None:
+    """Group ``pending`` by ``(owner, repo)``, chunk to ``MAX_GRAPHQL_ALIASES``
+    (#25), and run each chunk fail-soft: an unexpected error degrades its own
+    chunk's keys, never the whole refresh."""
     groups: dict[tuple[str, str], list[RepoKey]] = defaultdict(list)
     for key in pending:
         groups[(key[0], key[1])].append(key)
@@ -679,7 +830,7 @@ def _fetch_rich(
         for start in range(0, len(gkeys), MAX_GRAPHQL_ALIASES):
             chunk = gkeys[start : start + MAX_GRAPHQL_ALIASES]
             try:
-                _fetch_chunk(client, chunk, pending, out, required_checks_only=required_checks_only)
+                run(chunk)
             except Exception as exc:  # noqa: BLE001 - fail-soft per repo, never abort the refresh
                 for key in chunk:
                     out.setdefault(
@@ -690,6 +841,64 @@ def _fetch_rich(
                             "_stale": True,
                         },
                     )
+
+
+def _fetch_rich(
+    client: GitHubClient, keys: list[RepoKey], *, force: bool, required_checks_only: bool
+) -> dict[RepoKey, dict[str, Any]]:
+    """Token path: a cheap REST conditional probe gates each key (#21), then a
+    two-tier GraphQL pass (#69). Keys that are cold, forced, or REST-changed go
+    straight to the full rich query; a key whose cache merely aged past its
+    digest ceiling is revalidated by the cheap digest query first and only a
+    signature mismatch (or the hard full ceiling) spends the rich query. Both
+    tiers batch same-repo branches into aliased queries chunked to
+    ``MAX_GRAPHQL_ALIASES`` (#25). Gating is PER KEY before grouping, so one
+    active branch never drags its quiescent siblings into a fetch. Fail-soft per
+    key: a probe error or GraphQL failure serves the rich cache, then basic REST
+    pulls, then a typed error."""
+    now = time.monotonic()
+    out: dict[RepoKey, dict[str, Any]] = {}
+    full_pending: dict[RepoKey, dict[str, Any]] = {}
+    digest_pending: dict[RepoKey, dict[str, Any]] = {}
+    for key in keys:
+        cache_key = _rich_cache_key(key, required_checks_only=required_checks_only)
+        with _cache_lock:
+            rich = _graphql_cache.get(cache_key)
+        try:
+            changed, basic, _fresh = _rest_probe(client, key)
+        except GitHubError as exc:
+            out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True) if rich is not None else _error_entry(exc)
+            continue
+        entry = {"basic": basic, "rich": rich, "changed": changed}
+        if rich is None or force or changed or rich.get("digest") is None:
+            full_pending[key] = entry
+        elif _full_stale(rich, now) or _digest_stale(rich, now):
+            if now < rich.get("full_retry_at", 0.0):
+                # Cooling down after a failed full attempt: serve stale rather
+                # than re-spending digest or full points on a known-bad query.
+                out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True)
+            elif _full_stale(rich, now):
+                full_pending[key] = entry
+            else:
+                digest_pending[key] = entry
+        else:
+            # ``_fresh`` distinguishes a real 304 (GitHub confirmed the data is
+            # current) from a backoff-served cache (GitHub was never contacted).
+            # Mark the latter stale so it does not advance the freshness stamp.
+            out[key] = _pulls_result(rich["pulls"], fresh=False, stale=not _fresh)
+
+    # Digest tier first: mismatches promote into full_pending, so the full tier
+    # below covers them in the same refresh.
+    _run_chunked(
+        digest_pending,
+        lambda chunk: _fetch_digest_chunk(client, chunk, digest_pending, out, full_pending),
+        out,
+    )
+    _run_chunked(
+        full_pending,
+        lambda chunk: _fetch_chunk(client, chunk, full_pending, out, required_checks_only=required_checks_only),
+        out,
+    )
     return out
 
 
