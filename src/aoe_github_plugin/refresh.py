@@ -21,8 +21,9 @@ Efficiency, against the user token's shared budget (REST 5000 req/hr, GraphQL
   ceilings exist so CI/review state cannot lie indefinitely between PR-list
   changes, and the digest tier keeps revalidating them near-free (a hard
   ``GRAPHQL_FULL_MAX_STALE`` bounds what the digest cannot see);
-- requests are issued serially (no concurrent fan-out) to stay clear of the
-  secondary/concurrency limits;
+- local git identity and the REST probes fan out on small bounded pools (#70);
+  GraphQL queries stay serial to stay clear of the secondary/concurrency
+  limits;
 - a ``403``/``429``/``RATE_LIMITED`` trips a short global backoff, during which
   cached (stale) values are served instead of hammering the API.
 """
@@ -44,6 +45,7 @@ from datetime import timezone
 from collections import defaultdict
 from dataclasses import dataclass
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
@@ -58,6 +60,14 @@ from aoe_github_plugin.utils.gitctx import parse_owner_repo
 _LOG = logging.getLogger(__name__)
 
 GIT_TIMEOUT = 2.0
+# Bounded fan-out pools (#70). Local git identity is subprocess-bound with no
+# rate-limit interaction, so it parallelizes freely; the REST conditional
+# probes are independent per key and 304s are free, but the pool stays small to
+# keep well under GitHub's ~100-concurrent secondary-limit guidance. GraphQL
+# chunks stay serial on purpose: post-#69 they are few and cheap, and they are
+# the piece the secondary limits actually watch (#22).
+GIT_WORKERS = 16
+REST_PROBE_WORKERS = 6
 # Back off proactively once the GraphQL point budget (5000/hr) is nearly spent,
 # so a busy workspace degrades to stale data rather than hard rate-limit errors.
 RATELIMIT_FLOOR = 50
@@ -431,6 +441,26 @@ def _fetch_key(client: GitHubClient, key: RepoKey) -> tuple[list[dict[str, Any]]
     matters on the token path, which gates GraphQL on it."""
     _, pulls, fresh = _rest_probe(client, key)
     return pulls, fresh
+
+
+def _probe_all(
+    client: GitHubClient, keys: list[RepoKey]
+) -> dict[RepoKey, tuple[bool, list[dict[str, Any]], bool] | GitHubError]:
+    """Run the REST conditional probe for every key on a small bounded pool
+    (#70). The probes are independent per key; the ETag cache and the backoff
+    gates are lock-guarded, and a rate-limit trip mid-pool arms the shared gate
+    so the remaining probes fall back to cache without further requests. A
+    per-key ``GitHubError`` is returned as a value so the caller keeps its
+    fail-soft per-key handling."""
+
+    def probe(key: RepoKey) -> tuple[bool, list[dict[str, Any]], bool] | GitHubError:
+        try:
+            return _rest_probe(client, key)
+        except GitHubError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=REST_PROBE_WORKERS) as pool:
+        return dict(zip(keys, pool.map(probe, keys), strict=True))
 
 
 def _fetch_one_basic(client: GitHubClient, key: RepoKey) -> dict[str, Any]:
@@ -860,15 +890,17 @@ def _fetch_rich(
     out: dict[RepoKey, dict[str, Any]] = {}
     full_pending: dict[RepoKey, dict[str, Any]] = {}
     digest_pending: dict[RepoKey, dict[str, Any]] = {}
+    probes = _probe_all(client, keys)
     for key in keys:
         cache_key = _rich_cache_key(key, required_checks_only=required_checks_only)
         with _cache_lock:
             rich = _graphql_cache.get(cache_key)
-        try:
-            changed, basic, _fresh = _rest_probe(client, key)
-        except GitHubError as exc:
-            out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True) if rich is not None else _error_entry(exc)
+        probe = probes[key]
+        if isinstance(probe, GitHubError):
+            stale = _pulls_result(rich["pulls"], fresh=False, stale=True) if rich is not None else None
+            out[key] = stale if stale is not None else _error_entry(probe)
             continue
+        changed, basic, _fresh = probe
         entry = {"basic": basic, "rich": rich, "changed": changed}
         if rich is None or force or changed or rich.get("digest") is None:
             full_pending[key] = entry
@@ -951,9 +983,10 @@ def _fetch_all(
     that need GraphQL share one batched query (``_fetch_rich``); without one we
     keep the basic REST open-PR path and report ``token_present=False`` so the UI
     can show the "token needed" banner. ``force`` (a manual refresh) bypasses the
-    staleness gate on the token path. GraphQL is batched per repo but otherwise
-    serialized (sorted for determinism), to stay under GitHub's secondary/
-    concurrency limits (#22); none of this touches stdin or host RPCs."""
+    staleness gate on the token path. REST probes fan out on a small bounded
+    pool (#70); GraphQL is batched per repo and stays serialized (sorted for
+    determinism), to stay under GitHub's secondary/concurrency limits (#22);
+    none of this touches stdin or host RPCs."""
     if not keys:
         return {}, True
     token = _resolve_optional_token(env)
@@ -964,8 +997,8 @@ def _fetch_all(
         if present:
             results = _fetch_rich(client, ordered, force=force, required_checks_only=required_checks_only)
         else:
-            for key in ordered:
-                results[key] = _fetch_one_basic(client, key)
+            with ThreadPoolExecutor(max_workers=REST_PROBE_WORKERS) as pool:
+                results = dict(zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True))
     return results, present
 
 
@@ -990,29 +1023,29 @@ def build_snapshot(
     of IO side effects on the host channel; only filesystem + GitHub HTTP. ``env``
     and ``transport`` are test seams.
     """
-    per_session: list[tuple[dict[str, Any], list[str]]] = []
-    for session in sessions:
-        path = session.get("project_path")
-        checkouts = (
-            discover_checkouts(path, ignore_submodules=settings.ignore_submodules)
-            if isinstance(path, str) and path
-            else []
-        )
-        per_session.append((session, checkouts))
 
-    # Identity (two git calls) is keyed by real path so a checkout shared across
-    # sessions is resolved once, not once per occurrence.
-    ident: dict[str, tuple[str | None, RepoKey | None]] = {}
-    keys: set[RepoKey] = set()
-    for _, checkouts in per_session:
-        for checkout in checkouts:
-            checkout_id = os.path.realpath(checkout)
-            if checkout_id in ident:
-                continue
-            repo_str, key = _identify(checkout)
-            ident[checkout_id] = (repo_str, key)
-            if key is not None:
-                keys.add(key)
+    # Discovery and identity are git subprocess calls, hundreds of them on a big
+    # workspace set, so both phases fan out on a bounded pool (#70): local-only
+    # work, no rate-limit interaction. Results map back over ordered inputs, so
+    # the output is identical to the serial version.
+    def _discover(session: dict[str, Any]) -> list[str]:
+        path = session.get("project_path")
+        if not (isinstance(path, str) and path):
+            return []
+        return discover_checkouts(path, ignore_submodules=settings.ignore_submodules)
+
+    with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
+        per_session = list(zip(sessions, pool.map(_discover, sessions), strict=True))
+        # Identity (two git calls) is keyed by real path so a checkout shared
+        # across sessions is resolved once, not once per occurrence.
+        reps: dict[str, str] = {}
+        for _, checkouts in per_session:
+            for checkout in checkouts:
+                reps.setdefault(os.path.realpath(checkout), checkout)
+        ident: dict[str, tuple[str | None, RepoKey | None]] = dict(
+            zip(reps.keys(), pool.map(_identify, reps.values()), strict=True)
+        )
+    keys: set[RepoKey] = {key for _, key in ident.values() if key is not None}
 
     fetched, auth_present = _fetch_all(
         keys,

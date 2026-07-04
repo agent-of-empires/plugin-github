@@ -6,6 +6,7 @@ Discovery uses real temp git repos (cheap); GitHub lookups use a MockTransport.
 import json
 import time
 import logging
+import threading
 import subprocess
 from datetime import datetime
 from datetime import timezone
@@ -1252,3 +1253,53 @@ def test_graphql_cost_is_logged_per_query(tmp_path, caplog):
     kinds = [r.getMessage() for r in caplog.records if "graphql kind=" in r.getMessage()]
     assert any("kind=full" in m and "cost=1" in m and "remaining=5000" in m for m in kinds)
     assert any("kind=digest" in m for m in kinds)
+
+
+# --- bounded parallel fan-out (#70) ---
+
+
+def test_rest_probes_run_parallel_within_bound(tmp_path):
+    # Eight distinct repos probe concurrently on the pool: strictly more than
+    # one in flight at once (the fan-out is real), never more than the bound,
+    # and every repo still resolves its own pulls correctly.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    for i in range(8):
+        _make_repo(ws / f"r{i}", remote=f"https://github.com/o/r{i}.git")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    lock = threading.Lock()
+    state = {"inflight": 0, "max": 0}
+
+    def handler(request):
+        with lock:
+            state["inflight"] += 1
+            state["max"] = max(state["max"], state["inflight"])
+        time.sleep(0.05)
+        with lock:
+            state["inflight"] -= 1
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=httpx.MockTransport(handler))
+    assert state["max"] > 1
+    assert state["max"] <= refresh.REST_PROBE_WORKERS
+    repos = snap["sessions"][0]["repos"]
+    assert len(repos) == 8
+    assert all(r["pulls"][0]["number"] == 12 for r in repos)
+
+
+def test_parallel_discovery_output_matches_serial_shape(tmp_path):
+    # The pooled discovery/identity path must produce the same per-session repo
+    # entries (paths, names, repos, branches) as the serial implementation did.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "a", remote="https://github.com/o/a.git", branch="b1")
+    _make_repo(ws / "b", remote="https://github.com/o/b.git", branch="b2")
+    (ws / "plain").mkdir()  # not a checkout; must not appear
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull()]))
+    repos = snap["sessions"][0]["repos"]
+    assert [(r["name"], r["repo"], r["branch"]) for r in repos] == [
+        ("a", "o/a", "b1"),
+        ("b", "o/b", "b2"),
+    ]
