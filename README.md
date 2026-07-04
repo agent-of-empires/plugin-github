@@ -111,9 +111,11 @@ session-less `github.refresh` cover every session and prune vanished ones:
    skipped by default; turn off `ignore_submodules` to include them again. The
    workspace root is still scanned when it is itself a submodule.
 3. Resolve each checkout to `(owner, repo, branch)`, deduplicate (a branch shared
-   across workspaces is fetched once), and look up its PRs. Lookups run serially
-   (no concurrent fan-out) to stay clear of GitHub's secondary/concurrency
-   limits. With a token the per-branch lookup is a cheap REST conditional check
+   across workspaces is fetched once), and look up its PRs. Local git identity
+   and the REST lookups fan out on small bounded thread pools so a big workspace
+   set refreshes in seconds; GraphQL queries stay serial to stay clear of
+   GitHub's secondary/concurrency limits.
+   With a token the per-branch lookup is a cheap REST conditional check
    first (see "Rate limits" below); only when that reports a change (or on a
    forced refresh, a cold cache, or a cheap digest query detecting a change past
    the freshness ceiling) does it spend the expensive
