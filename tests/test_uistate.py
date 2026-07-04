@@ -608,3 +608,43 @@ def test_row_degrades_without_token():
     params = uistate.snapshot_ui_state_params(_snapshot(_session(repos=[_repo(pulls=[_pull()])])))
     assert _badge(params)["payload"]["items"][0]["icon"] == "git-pull-request-arrow"
     assert _column(params)["payload"]["text"] == "open PR"
+
+
+def _rate_limited_snapshot(budget, *, repos=None):
+    repos = repos if repos is not None else [_repo(pulls=[_pull()])]
+    return {"sessions": [_session(repos=repos)], "rate_limit": {"budget": budget, "seconds": 100, "reset_known": False}}
+
+
+def test_pane_shows_rate_limit_note_on_background_snapshot():
+    # #62: the always-on rate_limit snapshot key surfaces a warn note in the pane,
+    # not only on a forced-refresh toast.
+    params = uistate.snapshot_ui_state_params(_rate_limited_snapshot("graphql"))
+    blocks = _pane(params)["payload"]["blocks"]
+    notes = [b for b in blocks if b.get("kind") == "note"]
+    assert any(b["tone"] == "warn" and "GraphQL" in b["text"] for b in notes)
+
+
+def test_rate_limit_note_wording_is_budget_aware():
+    def note_text(budget):
+        blocks = _pane(uistate.snapshot_ui_state_params(_rate_limited_snapshot(budget)))["payload"]["blocks"]
+        return next(b["text"] for b in blocks if b.get("kind") == "note")
+
+    assert "still updates" in note_text("graphql")  # REST-driven list stays fresh
+    assert "list may be stale" in note_text("rest")
+    assert note_text("mixed") != note_text("graphql")
+
+
+def test_no_rate_limit_note_when_clear():
+    blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(_session(repos=[_repo(pulls=[_pull()])]))))["payload"][
+        "blocks"
+    ]
+    assert not [b for b in blocks if b.get("kind") == "note"]
+
+
+def test_rate_limit_note_suppressed_without_github_repo():
+    # A non-github checkout (repo=None) is not gated by GitHub limits, so no note.
+    repos = [_repo(repo=None)]
+    blocks = _pane(uistate.snapshot_ui_state_params(_rate_limited_snapshot("graphql", repos=repos)))["payload"][
+        "blocks"
+    ]
+    assert not [b for b in blocks if b.get("kind") == "note"]

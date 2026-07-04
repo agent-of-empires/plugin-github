@@ -70,7 +70,9 @@ def _clear_cache():
         refresh._etag_cache.clear()
         refresh._graphql_cache.clear()
         refresh._session_refresh_cache.clear()
-        refresh._backoff.update({"until": 0.0, "reset_known": False, "notified": False})
+        refresh._backoff["rest"].update({"until": 0.0, "reset_known": False})
+        refresh._backoff["graphql"].update({"until": 0.0, "reset_known": False})
+        refresh._backoff["notified"] = False
 
     _reset()
     yield
@@ -193,7 +195,7 @@ def test_backoff_serves_cached_and_skips_http(tmp_path):
     sessions = [{"id": "s1", "project_path": str(ws)}]
     # Seed the cache, then trip backoff: the next refresh must not hit HTTP.
     refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull(number=5)]))
-    refresh._backoff["until"] = time.monotonic() + 60
+    refresh._backoff["rest"]["until"] = time.monotonic() + 60
     captured = []
 
     def boom(request):
@@ -268,7 +270,7 @@ def test_backoff_cached_basic_refresh_keeps_prior_freshness(tmp_path, monkeypatc
     monkeypatch.setattr(refresh, "_utc_now_iso", lambda: next(times))
 
     refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull(number=5)]))
-    refresh._backoff["until"] = time.monotonic() + 60
+    refresh._backoff["rest"]["until"] = time.monotonic() + 60
     snap = refresh.build_snapshot(
         sessions, env=_NoToken(), transport=httpx.MockTransport(lambda _request: httpx.Response(500))
     )
@@ -433,7 +435,7 @@ def test_backoff_cached_rich_refresh_keeps_prior_freshness(tmp_path, monkeypatch
     transport = _rich_transport([_gql_node(number=7)])
 
     refresh.build_snapshot(sessions, env=_Env(), transport=transport)
-    refresh._backoff["until"] = time.monotonic() + 60
+    refresh._backoff["rest"]["until"] = time.monotonic() + 60
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
 
     assert snap["sessions"][0]["freshness"] == {
@@ -613,7 +615,7 @@ def test_graphql_rate_limit_serves_stale(tmp_path):
         transport=_rich_transport([], errors=[{"type": "RATE_LIMITED", "message": "slow down"}]),
     )
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 42
-    assert refresh._backoff["until"] > time.monotonic()
+    assert refresh._backoff["graphql"]["until"] > time.monotonic()
 
 
 def test_graphql_failure_falls_back_to_basic_pulls(tmp_path):
@@ -653,7 +655,7 @@ def test_graphql_keeps_partial_data_with_rate_limit_error(tmp_path):
 
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 99
-    assert refresh._backoff["until"] > time.monotonic()
+    assert refresh._backoff["graphql"]["until"] > time.monotonic()
 
 
 # --- rate-limit notice (issue #20) ---
@@ -688,7 +690,11 @@ def test_background_refresh_never_emits_notice(tmp_path):
     ws.mkdir()
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
-    refresh._backoff.update({"until": time.monotonic() + 300, "reset_known": True, "notified": False})
+    # Block BOTH budgets so no HTTP fires (a graphql-only backoff would leave the
+    # REST probe free to run, #62).
+    refresh._backoff["rest"].update({"until": time.monotonic() + 300, "reset_known": True})
+    refresh._backoff["graphql"].update({"until": time.monotonic() + 300, "reset_known": True})
+    refresh._backoff["notified"] = False
 
     def boom(request):
         raise AssertionError("HTTP must not be called during backoff")
@@ -777,7 +783,10 @@ def test_partial_alias_failure_isolates_to_its_key(tmp_path):
     )
 
     # Forced refresh where the b2-branch alias (b1, by sorted order) errors via
-    # errors[].path while the b1-branch alias (b0) returns fresh data.
+    # errors[].path while the b1-branch alias (b0) returns fresh data. The REST
+    # probe answers 304 (open-PR list unchanged), so the failed alias keeps its
+    # stale RICH cache rather than dropping to the basic pulls (#33 only prefers
+    # basic when REST reports a change).
     def handler(request):
         if str(request.url).endswith("/graphql"):
             body = {
@@ -788,7 +797,9 @@ def test_partial_alias_failure_isolates_to_its_key(tmp_path):
                 "errors": [{"type": "SERVICE", "message": "boom", "path": ["repository", "b1"]}],
             }
             return httpx.Response(200, json=body)
-        return httpx.Response(200, headers={"ETag": 'W/"v2"'}, json=[_pull()])
+        if request.headers.get("If-None-Match") == 'W/"v1"':
+            return httpx.Response(304)
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
 
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler), force=True)
     by_branch = {r["branch"]: r for r in snap["sessions"][0]["repos"]}
@@ -966,4 +977,67 @@ def test_thread_pagination_stops_and_backs_off_on_rate_limit(tmp_path):
     # The first page survives (never blanked) and the rate limit arms the backoff.
     assert comments["unresolved"] == 1
     assert [c["path"] for c in comments["items"]] == ["a.py"]
-    assert refresh._backoff["until"] > time.monotonic()
+    assert refresh._backoff["graphql"]["until"] > time.monotonic()
+
+
+def test_graphql_backoff_does_not_block_rest_probe(tmp_path):
+    # The core of #62: with only the GraphQL budget exhausted, the cheap REST
+    # probe must still run and discover the branch's open PR. GraphQL must not be
+    # contacted (its gate is armed), and the REST gate must stay clear.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh._backoff["graphql"]["until"] = time.monotonic() + 300
+
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            raise AssertionError("GraphQL must not be called while its budget is backed off")
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=77)])
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
+    # The PR is discovered via REST (basic shape) rather than hidden as "no open PR".
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 77
+    assert refresh._backoff["rest"]["until"] <= time.monotonic()  # REST budget never gated
+
+
+def test_changed_rest_overrides_stale_empty_rich_cache(tmp_path):
+    # #33 / #62 residual: a branch whose rich cache is EMPTY (GraphQL previously
+    # saw no PR) gets a PR opened while GraphQL is rate-limited. The REST probe
+    # reports the list changed, so the fresh basic pulls win over the stale empty
+    # rich cache instead of the pane showing "no open PR".
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    # Seed: GraphQL returns no nodes -> rich cache is [] for this branch.
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([]))
+    # Now a PR exists: REST returns it under a NEW etag (changed), GraphQL is rate
+    # limited. Forced so the staleness gate does not short-circuit the fetch.
+    rl = _rich_transport([], errors=[{"type": "RATE_LIMITED", "message": "slow down"}], etag='W/"v2"')
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=rl, force=True)
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 12
+
+
+def test_snapshot_reports_active_rate_limit_regardless_of_force(tmp_path):
+    # #62 surfacing: build_snapshot carries the current backoff state so the pane
+    # can show a note on a background (force=False) refresh, not only when forced.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh._backoff["graphql"]["until"] = time.monotonic() + 300
+
+    snap = refresh.build_snapshot(
+        sessions, env=_Env(), transport=httpx.MockTransport(lambda _r: httpx.Response(304)), force=False
+    )
+    assert snap["rate_limit"]["budget"] == "graphql"
+
+
+def test_snapshot_omits_rate_limit_when_clear(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull()]))
+    assert "rate_limit" not in snap
