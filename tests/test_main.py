@@ -259,7 +259,7 @@ def _fake_per_session_params(monkeypatch):
         main.uistate,
         "snapshot_ui_state_params",
         lambda snap, **_k: [
-            {"slot": slot, "id": slot_id, "session_id": s["id"], "payload": {}}
+            {"slot": slot, "id": slot_id, "session_id": s["id"], "payload": {"text": "x"}}
             for s in snap["sessions"]
             for slot, slot_id in (main.uistate.ROW_BADGE_SLOT, main.uistate.ROW_COLUMN_SLOT, main.uistate.PANE_SLOT)
         ],
@@ -309,3 +309,28 @@ def test_full_refresh_still_prunes_vanished(monkeypatch):
     removes = {x["params"]["session_id"] for x in sent if x["method"] == "ui.state.remove"}
     assert removes == {"gone"}
     assert rt.pushed_session_ids == {"s1"}
+
+
+def test_pr_less_session_removes_row_column_not_empty_set(monkeypatch):
+    # A session whose repos have no open PRs and no error yields an empty
+    # row-column payload from the pure mapper (issue #66). It must dispatch as a
+    # ui.state.remove (which clears any stale cell), never a ui.state.set with an
+    # empty payload, which the host rejects with `missing field text`.
+    sent: list = []
+    rt = main.Runtime(send=sent.append)
+    rt.call_host = lambda *_a, **_kw: {"value": True}
+    snapshot = {
+        "sessions": [{"session_id": "s1", "repos": [{"name": "r", "repo": "o/r", "pulls": []}]}],
+        "auth": {"present": True},
+    }
+    monkeypatch.setattr(main.refresh, "build_snapshot", lambda _sessions, **_k: snapshot)
+
+    rt.run_refresh(sessions=[{"id": "s1"}], force=True)
+
+    columns = [m for m in sent if m["params"].get("slot") == "row-column"]
+    assert columns, "expected a row-column push for the session"
+    for m in columns:
+        assert not (m["method"] == "ui.state.set" and not m["params"]["payload"]), (
+            "empty row-column must not be a ui.state.set (host rejects missing text)"
+        )
+    assert any(m["method"] == "ui.state.remove" for m in columns), "empty row-column should clear via ui.state.remove"

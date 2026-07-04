@@ -335,11 +335,16 @@ class Runtime:
                 sid = params.get("session_id")
                 if isinstance(sid, str):
                     current_ids.add(sid)
+                # An empty payload (only the row-column emits one, when a session
+                # has no open PR and no error) means "nothing to show": clear any
+                # stale cell via remove rather than a set the host rejects for a
+                # missing `text` field.
+                method = UI_STATE_REMOVE if not params.get("payload") else UI_STATE_SET
                 self.send(
                     {
                         "jsonrpc": "2.0",
                         "id": next(_outbound_ids),
-                        "method": UI_STATE_SET,
+                        "method": method,
                         "params": params,
                     }
                 )
