@@ -1,10 +1,14 @@
 """Token resolution + hint wording. No network, no real ``gh``. Mirrors the
 #1681 Rust unit tests."""
 
+import subprocess
+
 import pytest
 
+from aoe_github_plugin import auth
 from aoe_github_plugin import errors
 from aoe_github_plugin.auth import TokenEnvironment
+from aoe_github_plugin.auth import SystemEnvironment
 from aoe_github_plugin.auth import resolve_token
 
 
@@ -81,6 +85,29 @@ def test_gh_empty_token():
 
 def test_gh_oserror_is_command_failed():
     env = FakeEnv(gh_available=True, gh_result=OSError("boom"))
+    with pytest.raises(errors.GhCommandFailedError):
+        resolve_token(env)
+
+
+def test_gh_auth_token_timeout_returns_failure_tuple(monkeypatch):
+    # A hung `gh` must not raise TimeoutExpired out of gh_auth_token (it is not
+    # an OSError, so resolve_token would not catch it and the whole refresh would
+    # abort). It degrades to a failure tuple instead.
+    def _raise(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="gh auth token", timeout=auth.GH_AUTH_TIMEOUT)
+
+    monkeypatch.setattr(auth.subprocess, "run", _raise)
+    success, stdout, stderr = SystemEnvironment().gh_auth_token()
+    assert success is False
+    assert stdout == ""
+    assert "timed out" in stderr
+
+
+def test_gh_auth_token_timeout_maps_to_command_failed():
+    # The failure tuple a timeout produces is a non-canonical stderr, so it is a
+    # real gh failure, mapped to GhCommandFailedError (swallowed by the refresh
+    # path's _resolve_optional_token, which falls back to unauthenticated).
+    env = FakeEnv(gh_available=True, gh_result=(False, "", "gh auth token timed out after 5s"))
     with pytest.raises(errors.GhCommandFailedError):
         resolve_token(env)
 

@@ -290,6 +290,54 @@ class Runtime:
             return None
         return [s for s in sessions if not s.get("archived") and not s.get("snoozed")]
 
+    def _push_snapshot(self, snapshot: dict[str, Any]) -> set[str]:
+        """Emit ``ui.state.set`` for every session in the snapshot and return the
+        set of session ids pushed. Shared by the live refresh and the startup
+        replay so both render through the same offline-pure UI mapping."""
+        current_ids: set[str] = set()
+        for params in uistate.snapshot_ui_state_params(
+            snapshot, chips_on=self._chip_flags, show_column=self._show_status_text
+        ):
+            sid = params.get("session_id")
+            if isinstance(sid, str):
+                current_ids.add(sid)
+            # An empty payload (only the row-column emits one, when a session
+            # has no open PR and no error) means "nothing to show": clear any
+            # stale cell via remove rather than a set the host rejects for a
+            # missing `text` field.
+            method = UI_STATE_REMOVE if not params.get("payload") else UI_STATE_SET
+            self.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": next(_outbound_ids),
+                    "method": method,
+                    "params": params,
+                }
+            )
+        return current_ids
+
+    def _replay_cached(self, sessions: list[dict[str, Any]]) -> None:
+        """Paint last-known data from the persisted snapshot before the cold
+        network refresh runs, so a restart is not blank for the whole fan-out.
+        Filtered to sessions that still exist (session ids are stable across a
+        restart), so a session removed while the daemon was down leaves no ghost
+        row; the subsequent full refresh reconciles the rest. Each replayed row
+        is marked stale so it does not claim to be freshly fetched. Fully
+        fail-soft: a bad cache never blocks the real refresh."""
+        with contextlib.suppress(Exception):
+            snapshot = refresh.load_snapshot()
+            if snapshot is None:
+                return
+            live_ids = {s["id"] for s in sessions if isinstance(s, dict) and isinstance(s.get("id"), str)}
+            cached = [s for s in snapshot["sessions"] if isinstance(s, dict) and s.get("session_id") in live_ids]
+            for session in cached:
+                freshness = session.get("freshness")
+                if isinstance(freshness, dict):
+                    session["freshness"] = {**freshness, "stale": True}
+            if not cached:
+                return
+            self.pushed_session_ids |= self._push_snapshot({**snapshot, "sessions": cached})
+
     def run_refresh(
         self,
         sessions: list[dict[str, Any]] | None = None,
@@ -328,26 +376,7 @@ class Runtime:
                     required_checks_only=self._required_checks_only,
                 ),
             )
-            current_ids: set[str] = set()
-            for params in uistate.snapshot_ui_state_params(
-                snapshot, chips_on=self._chip_flags, show_column=self._show_status_text
-            ):
-                sid = params.get("session_id")
-                if isinstance(sid, str):
-                    current_ids.add(sid)
-                # An empty payload (only the row-column emits one, when a session
-                # has no open PR and no error) means "nothing to show": clear any
-                # stale cell via remove rather than a set the host rejects for a
-                # missing `text` field.
-                method = UI_STATE_REMOVE if not params.get("payload") else UI_STATE_SET
-                self.send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": next(_outbound_ids),
-                        "method": method,
-                        "params": params,
-                    }
-                )
+            current_ids = self._push_snapshot(snapshot)
             if only_session is None:
                 # Full refresh: the snapshot is the whole truth, so a session
                 # that dropped out has vanished and its slots are pruned.
@@ -362,6 +391,9 @@ class Runtime:
                             }
                         )
                 self.pushed_session_ids = current_ids
+                # Persist the full snapshot so the next worker start can repaint
+                # this data instantly instead of blocking on a cold refresh.
+                refresh.save_snapshot(snapshot)
             else:
                 # Scoped refresh: only the target was fetched, so an absence
                 # here means "not refreshed", not "vanished". Add what we pushed
@@ -460,8 +492,15 @@ class Runtime:
         self._show_status_text = self._setting_bool(STATUS_TEXT_SETTING_KEY, default=True)
         self._ignore_submodules = self.resolve_ignore_submodules()
         self._required_checks_only = self.resolve_required_checks_only()
-        # Proactive refresh on startup so slots populate before any user action.
-        self.run_refresh()
+        # Paint last-known data instantly from the persisted snapshot, then run
+        # the (cold, serial) network refresh that replaces it. One session list
+        # feeds both so startup makes a single sessions.list call.
+        sessions = self.list_sessions()
+        if sessions is not None:
+            self._replay_cached(sessions)
+            self.run_refresh(sessions)
+        else:
+            self.run_refresh()
         self._seen_ids = set(self.pushed_session_ids)
         self._interval = self.resolve_interval()
         # interval 0 disables all background polling (startup + on github.refresh

@@ -23,6 +23,12 @@ from aoe_github_plugin.errors import GhCommandFailedError
 from aoe_github_plugin.errors import GhNotAuthenticatedError
 from aoe_github_plugin.errors import GhReturnedEmptyTokenError
 
+# Hard cap on the `gh auth token` shell-out. `gh` can block (keyring unlock, a
+# credential-helper network call, a slow auth backend); without a bound it would
+# stall the whole startup refresh, so a hung `gh` degrades to unauthenticated
+# rather than freezing the pane.
+GH_AUTH_TIMEOUT = 5.0
+
 
 class TokenEnvironment:
     """Seam over the process environment so resolution is testable."""
@@ -48,12 +54,19 @@ class SystemEnvironment(TokenEnvironment):
         return shutil.which("gh") is not None
 
     def gh_auth_token(self) -> tuple[bool, str, str]:
-        proc = subprocess.run(
-            ["gh", "auth", "token"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        # TimeoutExpired is NOT an OSError, so resolve_token's `except OSError`
+        # would not catch it; map it to a failure tuple here so the caller
+        # falls back the same way it does for any other gh failure.
+        try:
+            proc = subprocess.run(
+                ["gh", "auth", "token"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=GH_AUTH_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "", f"gh auth token timed out after {GH_AUTH_TIMEOUT:g}s"
         return proc.returncode == 0, proc.stdout, proc.stderr
 
 
