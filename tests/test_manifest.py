@@ -70,3 +70,17 @@ def test_open_pr_command_is_wired():
     assert open_pr is not None, "open_pr command missing"
     assert open_pr["action"] == {"kind": "open-ui-link", "slot": "row-badge", "id": "github_pr_badge"}
     assert any(kb["command"] == "open_pr" for kb in m.get("keybinds", [])), "open_pr has no keybind"
+
+
+def test_icon_asset_exists_on_disk():
+    m = _manifest()
+    icon_asset = m.get("icon_asset")
+    if icon_asset:
+        path = MANIFEST.parent / icon_asset
+        assert path.is_file(), f"icon_asset {icon_asset!r} does not exist on disk"
+
+
+def test_icon_requires_api_version_7():
+    m = _manifest()
+    if m.get("icon") or m.get("icon_asset"):
+        assert m["api_version"] >= 7, "icon/icon_asset requires api_version >= 7"
