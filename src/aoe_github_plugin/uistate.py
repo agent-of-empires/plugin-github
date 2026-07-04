@@ -523,6 +523,31 @@ _TOKEN_NOTE = {
     ),
 }
 
+# Budget-aware text for the always-on rate-limit note (#62). GitHub meters REST
+# and GraphQL separately, so which budget is limited changes what still updates:
+# a GraphQL-only limit keeps the REST-driven open-PR list fresh (only the rich
+# CI/review fields go stale), while a REST limit freezes the list itself. The
+# text is static (no live countdown) so the background pane push stays identical
+# every tick until the budget refills.
+_RATE_LIMIT_NOTE_TEXT = {
+    "graphql": "GitHub GraphQL rate limit hit: CI and review details may be stale. The open-PR list still updates.",
+    "rest": "GitHub REST rate limit hit: the pull request list may be stale until the budget resets.",
+    "mixed": "GitHub API rate limit hit: showing cached pull request data until the budget resets.",
+}
+
+
+def _rate_limit_note(rate_limit: Any) -> dict[str, Any] | None:
+    """A persistent warn note describing an active rate-limit backoff, or ``None``
+    when none is active. ``rate_limit`` is the snapshot's ``{"budget", ...}`` from
+    ``refresh._rate_limit_status``; an unknown budget degrades to the generic
+    (``mixed``) wording rather than dropping the note."""
+    if not isinstance(rate_limit, dict):
+        return None
+    budget = rate_limit.get("budget")
+    key = budget if isinstance(budget, str) else "mixed"
+    text = _RATE_LIMIT_NOTE_TEXT.get(key, _RATE_LIMIT_NOTE_TEXT["mixed"])
+    return {"kind": "note", "tone": "warn", "text": text}
+
 
 def _format_refreshed_at(value: Any) -> str | None:
     """ISO timestamp to compact pane text in the worker's local time. The worker
@@ -580,10 +605,20 @@ def _fit_to_budget(
     return head + kept + tail
 
 
-def _pane_blocks(repos: list[dict[str, Any]], *, auth_present: bool, freshness: Any = None) -> list[dict[str, Any]]:
+def _pane_blocks(
+    repos: list[dict[str, Any]], *, auth_present: bool, freshness: Any = None, rate_limit: Any = None
+) -> list[dict[str, Any]]:
     head: list[dict[str, Any]] = [{"kind": "heading", "text": "GitHub"}]
+    has_github_repo = any(repo.get("repo") for repo in repos)
+    # Surface an active rate-limit right under the heading, on background refreshes
+    # too (#62): the pane, not just a forced-refresh toast, explains why the data
+    # is stale. Only when there is a GitHub repo whose data the limit affects.
+    if has_github_repo:
+        note = _rate_limit_note(rate_limit)
+        if note is not None:
+            head.append(note)
     # Only nag when there is actually a GitHub repo whose detail the token gates.
-    if not auth_present and any(repo.get("repo") for repo in repos):
+    if not auth_present and has_github_repo:
         head.append(dict(_TOKEN_NOTE))
     tail = [{"kind": "divider"}]
     freshness_row = _freshness_block(freshness)
@@ -613,6 +648,7 @@ def snapshot_ui_state_params(
         return []
     sessions = raw_sessions
     auth_present = bool((snapshot.get("auth") or {}).get("present", True))
+    rate_limit = snapshot.get("rate_limit")
     params: list[dict[str, Any]] = [
         {"slot": SORT_KEY_SLOT[0], "id": SORT_KEY_SLOT[1], "payload": dict(SORT_KEY_PAYLOAD)}
     ]
@@ -660,7 +696,9 @@ def snapshot_ui_state_params(
                     # and dock tab, falling back to the manifest icon
                     # (git-branch) below that. A per-pane icon here would
                     # only ever shadow both.
-                    "blocks": _pane_blocks(repos, auth_present=auth_present, freshness=session.get("freshness")),
+                    "blocks": _pane_blocks(
+                        repos, auth_present=auth_present, freshness=session.get("freshness"), rate_limit=rate_limit
+                    ),
                 },
             }
         )
