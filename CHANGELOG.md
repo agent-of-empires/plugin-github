@@ -4,6 +4,16 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.7.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.7.0) - 2026-07-04
+
+
+
+### Features
+
+- **manifest:** Identity icon (api_version 7) in [#60](https://github.com/agent-of-empires/plugin-github/pull/60) by [@Seluj78](https://github.com/Seluj78) ([`0e5a974`](https://github.com/agent-of-empires/plugin-github/commit/0e5a9741ee228aa69dd256c1312c1d967caf1592))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v1.6.1...v1.7.0
 ## [1.6.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.6.1) - 2026-06-30
 
 
