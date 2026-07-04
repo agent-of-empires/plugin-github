@@ -32,6 +32,7 @@ import math
 import time
 import queue
 import random
+import logging
 import itertools
 import threading
 import contextlib
@@ -524,6 +525,10 @@ class Runtime:
 
 
 def main() -> None:
+    # stdout is the JSON-RPC channel; diagnostics (e.g. the per-query GraphQL
+    # cost telemetry from refresh, #69) go to stderr, which the host captures in
+    # the per-worker log.
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     Runtime().run()
 
 
