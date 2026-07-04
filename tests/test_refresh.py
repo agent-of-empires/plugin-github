@@ -1383,7 +1383,9 @@ def test_parallel_discovery_output_matches_serial_shape(tmp_path):
     sessions = [{"id": "s1", "project_path": str(ws)}]
     snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull()]))
     repos = snap["sessions"][0]["repos"]
-    assert [(r["name"], r["repo"], r["branch"]) for r in repos] == [
+    # Discovery order follows os.scandir (filesystem-dependent), the same for the
+    # serial and pooled paths; assert the SET of entries, not their order.
+    assert sorted((r["name"], r["repo"], r["branch"]) for r in repos) == [
         ("a", "o/a", "b1"),
         ("b", "o/b", "b2"),
     ]
