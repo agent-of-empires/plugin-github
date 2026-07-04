@@ -28,8 +28,11 @@ Efficiency, against the user token's shared budget (REST 5000 req/hr, GraphQL
 from __future__ import annotations
 
 import os
+import json
 import time
+import tempfile
 import threading
+import contextlib
 import subprocess
 from typing import Any
 from pathlib import Path
@@ -118,6 +121,49 @@ _backoff: dict[str, Any] = {
     "graphql": {"until": 0.0, "reset_known": False},
     "notified": False,
 }
+
+
+def _snapshot_cache_path() -> Path:
+    """Where the last full snapshot is persisted for instant repaint on restart.
+    A cache (not config/state), so it follows the XDG cache convention and stays
+    decoupled from the host's own directories."""
+    base = os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
+    return Path(base) / "agent-of-empires" / "github-plugin" / "snapshot.json"
+
+
+def save_snapshot(snapshot: dict[str, Any]) -> None:
+    """Persist a full snapshot so the next worker start can paint last-known data
+    before its cold network refresh finishes. Fully fail-soft: a disk problem
+    never affects a refresh. An empty snapshot is skipped so a transient
+    "no sessions" blip cannot erase a useful cache. Written atomically (temp file
+    in the same dir + ``os.replace``) so a crash mid-write cannot corrupt it."""
+    sessions = snapshot.get("sessions")
+    if not isinstance(sessions, list) or not sessions:
+        return
+    with contextlib.suppress(Exception):
+        path = _snapshot_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".snapshot.", suffix=".tmp", dir=path.parent)
+        tmp_path = Path(tmp)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(snapshot, fh)
+            tmp_path.replace(path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+
+def load_snapshot() -> dict[str, Any] | None:
+    """The persisted snapshot, or ``None`` if it is missing, corrupt, or the
+    wrong shape. Never raises: a bad cache is simply ignored, and the normal
+    refresh repopulates. Structural validation (plus the caller filtering by the
+    live session list) is enough; no version envelope is needed."""
+    with contextlib.suppress(Exception):
+        with _snapshot_cache_path().open(encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("sessions"), list):
+            return data
+    return None
 
 
 def _utc_now_iso() -> str:

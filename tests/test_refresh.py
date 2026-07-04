@@ -1041,3 +1041,43 @@ def test_snapshot_omits_rate_limit_when_clear(tmp_path):
     sessions = [{"id": "s1", "project_path": str(ws)}]
     snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull()]))
     assert "rate_limit" not in snap
+
+
+# --- snapshot persistence for instant repaint on restart (#63) ---
+
+
+def test_save_load_snapshot_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    snap = {"sessions": [{"session_id": "s1", "repos": []}], "auth": {"present": True}}
+    refresh.save_snapshot(snap)
+    assert refresh._snapshot_cache_path().parent == tmp_path / "agent-of-empires" / "github-plugin"
+    assert refresh.load_snapshot() == snap
+
+
+def test_save_snapshot_skips_empty_sessions(tmp_path, monkeypatch):
+    # A transient "no sessions" blip must not erase a useful cache.
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    refresh.save_snapshot({"sessions": [{"session_id": "s1", "repos": []}]})
+    refresh.save_snapshot({"sessions": []})
+    assert refresh.load_snapshot()["sessions"] == [{"session_id": "s1", "repos": []}]
+
+
+def test_load_snapshot_missing_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    assert refresh.load_snapshot() is None
+
+
+def test_load_snapshot_corrupt_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    path = refresh._snapshot_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+    assert refresh.load_snapshot() is None
+
+
+def test_load_snapshot_wrong_shape_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    path = refresh._snapshot_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"sessions": "nope"}), encoding="utf-8")
+    assert refresh.load_snapshot() is None
