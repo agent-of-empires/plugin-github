@@ -334,3 +334,84 @@ def test_pr_less_session_removes_row_column_not_empty_set(monkeypatch):
             "empty row-column must not be a ui.state.set (host rejects missing text)"
         )
     assert any(m["method"] == "ui.state.remove" for m in columns), "empty row-column should clear via ui.state.remove"
+
+
+# --- instant repaint from a persisted snapshot on restart (#63) ---
+
+
+def test_replay_cached_pushes_only_live_sessions_marked_stale(tmp_path, monkeypatch):
+    # A session that vanished while the daemon was down is filtered out (no ghost
+    # row), and the replayed row is marked stale so it does not claim freshness.
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    main.refresh.save_snapshot(
+        {
+            "sessions": [
+                {"session_id": "s1", "freshness": {"refreshed_at": "t", "stale": False}, "repos": []},
+                {"session_id": "gone", "repos": []},
+            ],
+            "auth": {"present": True},
+        }
+    )
+    seen = {}
+
+    def fake_params(snapshot, **_kw):
+        seen["ids"] = [s["session_id"] for s in snapshot["sessions"]]
+        seen["stale"] = [s.get("freshness", {}).get("stale") for s in snapshot["sessions"]]
+        return [
+            {"session_id": s["session_id"], "slot": "row-badge", "payload": {"items": []}} for s in snapshot["sessions"]
+        ]
+
+    monkeypatch.setattr(main.uistate, "snapshot_ui_state_params", fake_params)
+    sent = []
+    rt = main.Runtime(send=sent.append)
+    rt._replay_cached([{"id": "s1", "project_path": "/a"}])
+    assert seen["ids"] == ["s1"]
+    assert seen["stale"] == [True]
+    pushes = [m for m in sent if m["method"] == "ui.state.set"]
+    assert [p["params"]["session_id"] for p in pushes] == ["s1"]
+    assert rt.pushed_session_ids == {"s1"}
+
+
+def test_replay_cached_without_cache_is_noop(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    sent = []
+    rt = main.Runtime(send=sent.append)
+    rt._replay_cached([{"id": "s1", "project_path": "/a"}])
+    assert sent == []
+    assert rt.pushed_session_ids == set()
+
+
+def test_full_refresh_persists_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    snap = {"sessions": [{"session_id": "s1", "repos": []}], "auth": {"present": True}}
+    monkeypatch.setattr(main.refresh, "build_snapshot", lambda *_a, **_kw: snap)
+    monkeypatch.setattr(main.uistate, "snapshot_ui_state_params", lambda *_a, **_kw: [])
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: {"value": True}
+    rt.run_refresh(sessions=[{"id": "s1"}])
+    assert main.refresh.load_snapshot() == snap
+
+
+def test_scoped_refresh_does_not_persist(tmp_path, monkeypatch):
+    # A scoped (single-pane) refresh is partial; it must not overwrite the full
+    # aggregate cache used for the next restart's repaint.
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    snap = {"sessions": [{"session_id": "s1", "repos": []}], "auth": {"present": True}}
+    monkeypatch.setattr(main.refresh, "build_snapshot", lambda *_a, **_kw: snap)
+    monkeypatch.setattr(main.uistate, "snapshot_ui_state_params", lambda *_a, **_kw: [])
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: {"value": True}
+    rt.run_refresh(sessions=[{"id": "s1"}], only_session="s1")
+    assert main.refresh.load_snapshot() is None
+
+
+def test_startup_replays_cached_before_network(monkeypatch):
+    # Acceptance #1: the cached repaint happens before the (network) refresh.
+    order = []
+    rt = main.Runtime(send=lambda _m: None, stdin=iter([]))
+    rt.call_host = lambda *_a, **_kw: {"value": True}
+    rt.list_sessions = lambda *_a, **_kw: [{"id": "s1", "project_path": "/a"}]
+    monkeypatch.setattr(rt, "_replay_cached", lambda _sessions: order.append("replay"))
+    monkeypatch.setattr(rt, "run_refresh", lambda *_a, **_kw: order.append("refresh"))
+    rt.run()
+    assert order == ["replay", "refresh"]
