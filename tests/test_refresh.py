@@ -5,6 +5,8 @@ Discovery uses real temp git repos (cheap); GitHub lookups use a MockTransport.
 
 import json
 import time
+import logging
+import threading
 import subprocess
 from datetime import datetime
 from datetime import timezone
@@ -73,6 +75,8 @@ def _clear_cache():
         refresh._backoff["rest"].update({"until": 0.0, "reset_known": False})
         refresh._backoff["graphql"].update({"until": 0.0, "reset_known": False})
         refresh._backoff["notified"] = False
+        refresh._graphql_budget.update({"remaining": None, "valid_until": None})
+        refresh._retry_cooldown.clear()
 
     _reset()
     yield
@@ -483,10 +487,11 @@ def test_graphql_merged_pull_flagged(tmp_path):
 
 
 def _expire_graphql_cache():
-    """Age every cached GraphQL entry past the freshness ceiling so the next
-    refresh re-queries even on a REST 304."""
+    """Age every cached GraphQL entry past the DIGEST ceiling (but not the hard
+    full ceiling) so the next refresh revalidates even on a REST 304."""
     for entry in refresh._graphql_cache.values():
-        entry["fetched_at"] -= refresh.GRAPHQL_MAX_STALE + 1
+        entry["fetched_at"] -= refresh.GRAPHQL_DIGEST_STALE + 1
+        entry["validated_at"] -= refresh.GRAPHQL_DIGEST_STALE + 1
 
 
 def test_rest_304_with_fresh_cache_skips_graphql(tmp_path):
@@ -528,10 +533,11 @@ def test_stale_cache_triggers_graphql_on_304(tmp_path):
     refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=7)]))
     _expire_graphql_cache()
     # REST still answers 304 (unchanged list), but the rich cache is past the
-    # ceiling, so GraphQL fires to refresh CI/review state.
+    # digest ceiling and the data really changed (number 7 -> 9): the cheap
+    # digest detects the mismatch and the full query fires in the same refresh.
     gql = []
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=9)], gql=gql))
-    assert len(gql) == 1
+    assert [_is_full_query(r) for r in gql] == [False, True]  # digest first, then rich
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 9
 
 
@@ -839,6 +845,7 @@ def _running_node(number=7):
 def _age_cache(seconds):
     for entry in refresh._graphql_cache.values():
         entry["fetched_at"] -= seconds
+        entry["validated_at"] -= seconds
 
 
 def test_active_ci_refreshes_before_the_300s_ceiling(tmp_path):
@@ -852,9 +859,10 @@ def test_active_ci_refreshes_before_the_300s_ceiling(tmp_path):
     assert len(gql) == 1
     # Past the short active ceiling but far under 300s; REST still 304. A running
     # check means the cache is active, so GraphQL re-fires to catch the CI result.
-    _age_cache(refresh.GRAPHQL_ACTIVE_STALE + 1)
+    _age_cache(refresh.GRAPHQL_ACTIVE_DIGEST_STALE + 1)
     refresh.build_snapshot(sessions, env=_Env(), transport=transport)
     assert len(gql) == 2
+    assert not _is_full_query(gql[-1])  # active-ceiling revalidation is the cheap digest, not the rich query
 
 
 def test_terminal_state_holds_cache_until_the_300s_ceiling(tmp_path):
@@ -868,7 +876,7 @@ def test_terminal_state_holds_cache_until_the_300s_ceiling(tmp_path):
     assert len(gql) == 1
     # Same age, but a terminal cache is not active, so the short ceiling does not
     # apply and a 304 holds the cache (no GraphQL) until the 300s ceiling.
-    _age_cache(refresh.GRAPHQL_ACTIVE_STALE + 1)
+    _age_cache(refresh.GRAPHQL_ACTIVE_DIGEST_STALE + 1)
     refresh.build_snapshot(sessions, env=_Env(), transport=transport)
     assert len(gql) == 1
 
@@ -887,7 +895,7 @@ def test_waiting_review_is_not_treated_as_active(tmp_path):
     assert len(gql) == 1
     # Awaiting review (no running CI) is NOT active: it must not burn a GraphQL
     # query every tick, so the short ceiling does not apply.
-    _age_cache(refresh.GRAPHQL_ACTIVE_STALE + 1)
+    _age_cache(refresh.GRAPHQL_ACTIVE_DIGEST_STALE + 1)
     refresh.build_snapshot(sessions, env=_Env(), transport=transport)
     assert len(gql) == 1
 
@@ -1081,3 +1089,303 @@ def test_load_snapshot_wrong_shape_returns_none(tmp_path, monkeypatch):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"sessions": "nope"}), encoding="utf-8")
     assert refresh.load_snapshot() is None
+
+
+# --- two-tier digest refresh (#69) ---
+
+
+def _is_full_query(request):
+    """The rich query carries the PRConnection fragment; the digest does not."""
+    return b"PRConnection" in request.content
+
+
+def test_expired_ceiling_with_unchanged_data_sends_no_full_query(tmp_path):
+    # The #69 reproduce: a background tick past the freshness ceiling where
+    # GitHub reports nothing changed must NOT spend a full-cost rich query.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    gql = []
+    transport = _rich_transport([_gql_node(number=7)], gql=gql)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1  # cold fill is the full query
+    _expire_graphql_cache()
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    full = [r for r in gql[1:] if _is_full_query(r)]
+    assert full == []  # unchanged data revalidates via the cheap digest only
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 7
+
+
+def test_digest_match_advances_freshness_and_rearms_window(tmp_path, monkeypatch):
+    # A digest match is a revalidation: the freshness stamp advances and the
+    # digest window re-arms, so the immediately following tick sends nothing.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    times = iter(["2026-06-29T14:00:00Z", "2026-06-29T14:05:00Z", "2026-06-29T14:06:00Z"])
+    monkeypatch.setattr(refresh, "_utc_now_iso", lambda: next(times))
+    gql = []
+    transport = _rich_transport([_gql_node(number=7)], gql=gql)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    _expire_graphql_cache()
+    second = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 2  # cold full + one digest
+    assert second["sessions"][0]["freshness"] == {"refreshed_at": "2026-06-29T14:05:00Z", "stale": False}
+    third = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 2  # window re-armed: no GraphQL at all
+    assert third["sessions"][0]["freshness"] == {"refreshed_at": "2026-06-29T14:06:00Z", "stale": False}
+
+
+def test_full_ceiling_bypasses_digest(tmp_path):
+    # Past the HARD full ceiling the rich query fires directly, no digest probe:
+    # the digest cannot see everything the pane renders (comment edits, per-check
+    # churn under an unchanged rollup), so its false negatives must be bounded.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    gql = []
+    transport = _rich_transport([_gql_node(number=7)], gql=gql)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    for entry in refresh._graphql_cache.values():
+        entry["fetched_at"] -= refresh.GRAPHQL_FULL_MAX_STALE + 1
+        entry["validated_at"] -= refresh.GRAPHQL_FULL_MAX_STALE + 1
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert [_is_full_query(r) for r in gql] == [True, True]
+
+
+def test_digest_validation_does_not_reset_full_ceiling(tmp_path):
+    # Digest matches keep bumping validated_at, but fetched_at only moves on a
+    # real full query; once the hard ceiling passes, the full query fires even
+    # though every digest matched.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    gql = []
+    transport = _rich_transport([_gql_node(number=7)], gql=gql)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    _expire_graphql_cache()
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)  # digest match
+    assert [_is_full_query(r) for r in gql] == [True, False]
+    for entry in refresh._graphql_cache.values():
+        entry["fetched_at"] -= refresh.GRAPHQL_FULL_MAX_STALE + 1  # only the FULL clock ages
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert [_is_full_query(r) for r in gql] == [True, False, True]
+
+
+def test_failed_full_after_digest_mismatch_cools_down(tmp_path):
+    # The #69 anti-burn-loop: digest mismatch promotes to a full query; the full
+    # query fails with a non-rate error; the next tick must serve stale instead
+    # of re-spending digest + full every tick until the cooldown passes.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=7)]))
+    _expire_graphql_cache()
+
+    gql = []
+
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            gql.append(request)
+            if _is_full_query(request):
+                return httpx.Response(500, text="boom")
+            body = {
+                "data": {
+                    "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                    "repository": _alias_repo(request, {"feature": [_gql_node(number=9)]}),
+                }
+            }
+            return httpx.Response(200, json=body)
+        if request.headers.get("If-None-Match") == 'W/"v1"':
+            return httpx.Response(304)
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    transport = httpx.MockTransport(handler)
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert [_is_full_query(r) for r in gql] == [False, True]  # digest mismatch, full failed
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 7  # stale cache served
+    _expire_graphql_cache()
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 2  # cooldown: no digest, no full retry this tick
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 7
+
+
+def test_budget_pressure_stretches_ceilings(tmp_path):
+    # A low last-seen remaining (below BUDGET_PRESSURE_REMAINING but above the
+    # backoff floor) stretches the background ceilings, so an age that would
+    # normally trigger the digest no longer does.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    gql = []
+    transport = _rich_transport([_gql_node(number=7)], gql=gql, remaining=600)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1
+    _expire_graphql_cache()  # past the 1x ceiling, well under the 4x one
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1  # pressure multiplier held the window shut
+
+
+def test_budget_multiplier_resets_after_window(tmp_path):
+    now = time.monotonic()
+    refresh._graphql_budget.update({"remaining": 600, "valid_until": now + 60})
+    assert refresh._budget_multiplier(now) == refresh.BUDGET_PRESSURE_MULTIPLIER
+    assert refresh._budget_multiplier(now + 61) == 1.0  # window reset, budget refilled
+    assert refresh._graphql_budget["remaining"] is None
+
+
+def test_graphql_cost_is_logged_per_query(tmp_path, caplog):
+    # The #69 telemetry gap: rateLimit.cost used to be selected and discarded.
+    # Every query now logs kind/cost/remaining so a spend regression is visible.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    transport = _rich_transport([_gql_node(number=7)])
+    with caplog.at_level(logging.INFO, logger="aoe_github_plugin.refresh"):
+        refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+        _expire_graphql_cache()
+        refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    kinds = [r.getMessage() for r in caplog.records if "graphql kind=" in r.getMessage()]
+    assert any("kind=full" in m and "cost=1" in m and "remaining=5000" in m for m in kinds)
+    assert any("kind=digest" in m for m in kinds)
+
+
+def test_failed_digest_cools_down_instead_of_requerying(tmp_path):
+    # #71: a digest query that fails with a non-rate error must not re-digest
+    # every tick. Seed a rich cache, age it, then fail every digest.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=7)]))
+    _expire_graphql_cache()
+
+    gql = []
+
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            gql.append(request)
+            return httpx.Response(500, text="boom")  # only the digest fires here
+        if request.headers.get("If-None-Match") == 'W/"v1"':
+            return httpx.Response(304)
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    transport = httpx.MockTransport(handler)
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1  # one digest attempt
+    assert not _is_full_query(gql[0])
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 7  # stale cache served
+    _expire_graphql_cache()
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1  # cooldown held: no second digest
+
+
+def test_cold_key_full_failure_cools_down(tmp_path):
+    # #71: a cold key (no rich cache) whose full query keeps failing must also
+    # cool down, not retry the full query on every tick. The old per-entry
+    # full_retry_at could not reach cold keys.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    gql = []
+
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            gql.append(request)
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    transport = httpx.MockTransport(handler)
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1  # one full attempt from cold
+    assert _is_full_query(gql[0])
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 12  # basic REST pull served
+    # Force a change so the classifier would otherwise re-queue (changed=True):
+    # the cooldown must still hold it back on a background tick.
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1  # cooldown held: no second full query
+
+
+def test_forced_refresh_bypasses_cooldown(tmp_path):
+    # A user-clicked (force) refresh must attempt a live query even while a key
+    # is cooling down from a prior failure.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    gql = []
+
+    def handler(request):
+        if str(request.url).endswith("/graphql"):
+            gql.append(request)
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    transport = httpx.MockTransport(handler)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1  # cooling down
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport, force=True)
+    assert len(gql) == 2  # force bypassed the cooldown
+
+
+# --- bounded parallel fan-out (#70) ---
+
+
+def test_rest_probes_run_parallel_within_bound(tmp_path):
+    # Eight distinct repos probe concurrently on the pool: strictly more than
+    # one in flight at once (the fan-out is real), never more than the bound,
+    # and every repo still resolves its own pulls correctly.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    for i in range(8):
+        _make_repo(ws / f"r{i}", remote=f"https://github.com/o/r{i}.git")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    lock = threading.Lock()
+    state = {"inflight": 0, "max": 0}
+
+    def handler(request):
+        with lock:
+            state["inflight"] += 1
+            state["max"] = max(state["max"], state["inflight"])
+        time.sleep(0.05)
+        with lock:
+            state["inflight"] -= 1
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=httpx.MockTransport(handler))
+    assert state["max"] > 1
+    assert state["max"] <= refresh.REST_PROBE_WORKERS
+    repos = snap["sessions"][0]["repos"]
+    assert len(repos) == 8
+    assert all(r["pulls"][0]["number"] == 12 for r in repos)
+
+
+def test_parallel_discovery_output_matches_serial_shape(tmp_path):
+    # The pooled discovery/identity path must produce the same per-session repo
+    # entries (paths, names, repos, branches) as the serial implementation did.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "a", remote="https://github.com/o/a.git", branch="b1")
+    _make_repo(ws / "b", remote="https://github.com/o/b.git", branch="b2")
+    (ws / "plain").mkdir()  # not a checkout; must not appear
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull()]))
+    repos = snap["sessions"][0]["repos"]
+    # Discovery order follows os.scandir (filesystem-dependent), the same for the
+    # serial and pooled paths; assert the SET of entries, not their order.
+    assert sorted((r["name"], r["repo"], r["branch"]) for r in repos) == [
+        ("a", "o/a", "b1"),
+        ("b", "o/b", "b2"),
+    ]

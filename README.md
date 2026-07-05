@@ -111,11 +111,14 @@ session-less `github.refresh` cover every session and prune vanished ones:
    skipped by default; turn off `ignore_submodules` to include them again. The
    workspace root is still scanned when it is itself a submodule.
 3. Resolve each checkout to `(owner, repo, branch)`, deduplicate (a branch shared
-   across workspaces is fetched once), and look up its PRs. Lookups run serially
-   (no concurrent fan-out) to stay clear of GitHub's secondary/concurrency
-   limits. With a token the per-branch lookup is a cheap REST conditional check
+   across workspaces is fetched once), and look up its PRs. Local git identity
+   and the REST lookups fan out on small bounded thread pools so a big workspace
+   set refreshes in seconds; GraphQL queries stay serial to stay clear of
+   GitHub's secondary/concurrency limits.
+   With a token the per-branch lookup is a cheap REST conditional check
    first (see "Rate limits" below); only when that reports a change (or on a
-   forced refresh, or when the cached rich data has aged out) does it spend a
+   forced refresh, a cold cache, or a cheap digest query detecting a change past
+   the freshness ceiling) does it spend the expensive
    GraphQL query for the rich state (PR state incl. MERGED, `reviewDecision`, the
    head commit's check rollup + per-check runs, and every unresolved review
    thread with its first comment). Branches of the same repo that need a fresh
@@ -158,29 +161,43 @@ are shared with the user's own `gh` usage, so the worker spends as little as it
 can. A REST conditional request (ETag / `If-None-Match`) is the primary poll: a
 `304 Not Modified` means nothing changed and does NOT count against the primary
 rate limit, so a steady state where nothing changed costs ~0. GraphQL (which has
-no `304`) fires only when the conditional check reports a change, on a forced
-refresh, or when the cached rich result is older than its freshness ceiling. That
-ceiling exists because the `/pulls` list ETag does not reliably bump when a CI
-check completes or a review thread changes, so CI/review state could otherwise go
-stale indefinitely between PR-list changes. It is state-aware: a branch whose
-cached state is active (a CI check running or queued) uses a short ceiling so a
-finishing CI run shows up on the next tick, while a terminal or awaiting-review
-branch uses the 300s ceiling (awaiting review can sit idle for days, so polling it
-every tick would waste budget). Either way a click on Refresh updates immediately.
-The GraphQL query reads `rateLimit { cost remaining resetAt }` and trips a short
-backoff (serving the last-good cached result, honoring `resetAt`) when the budget
-runs low or a `403`/`429`/`RATE_LIMITED` is returned.
+no `304`) is two-tier: the expensive rich query (per-check runs, review threads,
+comment excerpts; roughly 25-30 points per 10-branch batch) fires only when the
+conditional check reports a change, on a forced refresh, on a cold cache, or when
+the cheap DIGEST query detects a change. The digest (~1 point per batch) carries
+just the change-detection fields (PR state, `reviewDecision`, `updatedAt`, head
+commit, check rollup state, review-thread count) and revalidates cached rich
+state past its freshness ceiling; a matching signature serves the cache and
+re-arms the window, so an idle workspace revalidates for pennies instead of
+re-paying the rich query every 5 minutes. The ceilings exist because the `/pulls`
+list ETag does not reliably bump when a CI check completes or a review thread
+changes. They are state-aware: a branch whose cached state is active (a CI check
+running or queued) digests on a short ceiling so a finishing CI run shows up on
+the next tick, while a terminal or awaiting-review branch uses the 300s ceiling.
+Because the digest cannot see everything the pane renders (a comment body edit,
+a per-check change under an unchanged rollup), a hard full-refresh ceiling
+(2h idle, 5m active) bounds how long a full fetch can be deferred. Either way a
+click on Refresh updates immediately. Every GraphQL response's
+`rateLimit { cost remaining resetAt }` is logged to stderr (the per-worker log)
+and tracked: a low remaining budget stretches the background ceilings before the
+hard backoff floor trips, any non-rate query failure (digest or full, warm key
+or cold) cools that key down before it may retry so a persistent error cannot
+re-spend a query every tick, and a `403`/`429`/`RATE_LIMITED` (or a nearly spent
+budget) trips a short backoff serving the last-good cached result, honoring
+`resetAt`.
 
 Worst-case math (every key changes every tick, so each spends one REST request,
 and same-repo branches batch into one GraphQL query per repo): for N unique
 `(owner, repo, branch)` keys at a T-second network tick, that is `N * 3600 / T`
 REST req/hr; the GraphQL queries scale with the number of distinct repos (each
 capped at `MAX_GRAPHQL_ALIASES` branches per query), not N. At the 120s default,
-a 20-worktree single-repo workspace tops out around 600 REST req/hr but only ~60
-GraphQL queries/hr (two batched queries per tick), both a small fraction of
-5000/hr. The realistic steady state is far cheaper: most ticks are a `304`, so the
-REST cost is ~0 and no GraphQL fires. The fast local session tick (a couple
-seconds, no network) is separate and unaffected by `ui_refresh_secs`.
+a 20-worktree single-repo workspace tops out around 600 REST req/hr and ~60
+batched GraphQL queries/hr. The realistic steady state is far cheaper: most ticks
+are a `304`, so the REST cost is ~0 and GraphQL spends ~1 point per repo per
+ceiling expiry on the digest (a large multi-repo workspace holds around a couple
+hundred points/hr where the pre-digest design burned its way through the entire
+5000/hr budget). The fast local session tick (a couple seconds, no network) is
+separate and unaffected by `ui_refresh_secs`.
 
 When a user-initiated refresh (the pane's Refresh action) hits an active backoff,
 the worker raises one in-app `ui.notify` (a warning, "GitHub rate limited") via

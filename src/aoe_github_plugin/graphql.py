@@ -15,6 +15,7 @@ inferred from a COMMENTED review or any unresolved thread.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 # The per-PR node selection, shared by every aliased ``pullRequests`` field in a
@@ -38,7 +39,7 @@ from typing import Any
 _PR_CONNECTION_FRAGMENT = """
 fragment PRConnection on PullRequestConnection {
   nodes {
-    id number title url state isDraft merged reviewDecision
+    id number title url state isDraft merged reviewDecision updatedAt headRefOid
     baseRef { branchProtectionRule {
       requiresStatusChecks
       requiredStatusCheckContexts
@@ -54,6 +55,7 @@ fragment PRConnection on PullRequestConnection {
     } } } } } }
     reviews(last: 1, states: [COMMENTED]) { nodes { state } }
     reviewThreads(first: 100) {
+      totalCount
       pageInfo { hasNextPage endCursor }
       nodes {
         isResolved path line
@@ -90,6 +92,77 @@ query({params}) {{
   }}
 }}
 {_PR_CONNECTION_FRAGMENT}"""
+
+
+# The cheap change-detection tier (#69). Scalars plus the top-level check rollup
+# and the review-thread count only: no contexts, no thread nodes, no comments, so
+# a batched digest costs ~1 point where the rich query costs ~25-30. The fields
+# mirror ``digest_signature`` exactly; anything the signature reads must be
+# selected both here and in ``_PR_CONNECTION_FRAGMENT`` so a signature computed
+# from a full response compares equal to one computed from a digest response.
+_DIGEST_ALIAS_FIELD = """    b{i}: pullRequests(
+      headRefName: $b{i}, states: [OPEN, MERGED], first: 3,
+      orderBy: {{field: UPDATED_AT, direction: DESC}}
+    ) {{ nodes {{
+      number state isDraft merged reviewDecision updatedAt headRefOid
+      commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }}
+      reviewThreads(first: 1) {{ totalCount }}
+    }} }}"""
+
+
+def build_digest_query(alias_count: int) -> str:
+    """The digest counterpart of ``build_query``: same aliasing and variable
+    scheme, minimal per-PR selection (#69)."""
+    n = max(alias_count, 1)
+    params = ", ".join(["$owner: String!", "$repo: String!", *[f"$b{i}: String!" for i in range(n)]])
+    fields = "\n".join(_DIGEST_ALIAS_FIELD.format(i=i) for i in range(n))
+    return f"""
+query({params}) {{
+  rateLimit {{ cost remaining resetAt }}
+  repository(owner: $owner, name: $repo) {{
+{fields}
+  }}
+}}"""
+
+
+def digest_signature(conn: Any) -> str | None:
+    """Canonical signature of the cheap change-detection fields for one
+    ``pullRequests`` connection, valid for both the digest and the full (rich)
+    response shapes. Equal signatures mean the cached rich result is still
+    current for everything the digest can see; the caller then skips the full
+    query. ``None`` for a malformed connection, which callers treat as
+    "cannot validate" (next background pass falls back to the full query).
+
+    Deliberately a heuristic, not a hash of everything the pane renders: a
+    comment body edit or a per-check change under an unchanged rollup state can
+    slip past it, which is why ``GRAPHQL_FULL_MAX_STALE`` still bounds how long
+    a full refresh can be deferred."""
+    if not isinstance(conn, dict):
+        return None
+    nodes = conn.get("nodes")
+    if not isinstance(nodes, list):
+        return None
+    sig: list[dict[str, Any]] = []
+    for pr in nodes:
+        if not isinstance(pr, dict):
+            return None
+        commits = _nodes(pr, "commits")
+        rollup = commits[0].get("commit", {}).get("statusCheckRollup") if commits else None
+        threads = pr.get("reviewThreads")
+        sig.append(
+            {
+                "number": pr.get("number"),
+                "state": pr.get("state"),
+                "draft": bool(pr.get("isDraft", False)),
+                "merged": bool(pr.get("merged", False)),
+                "decision": pr.get("reviewDecision"),
+                "updated": pr.get("updatedAt"),
+                "head": pr.get("headRefOid"),
+                "rollup": rollup.get("state") if isinstance(rollup, dict) else None,
+                "threads": threads.get("totalCount") if isinstance(threads, dict) else None,
+            }
+        )
+    return json.dumps(sig, sort_keys=True, separators=(",", ":"))
 
 
 # Follow-up query for a PR whose reviewThreads exceeded one page (#28): fetch the
