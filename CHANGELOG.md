@@ -4,6 +4,20 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.7.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.7.1) - 2026-07-05
+
+
+
+### Bug Fixes
+
+- **pane:** Drop the per-pane icon, now redundant with icon_asset in [#64](https://github.com/agent-of-empires/plugin-github/pull/64) by [@Seluj78](https://github.com/Seluj78) ([`fbe1c82`](https://github.com/agent-of-empires/plugin-github/commit/fbe1c82b6e1bc4042fdd7c0021bbddacbc137e56))
+- **refresh:** Meter REST and GraphQL rate-limit budgets separately, surface backoff in pane in [#65](https://github.com/agent-of-empires/plugin-github/pull/65) by [@Seluj78](https://github.com/Seluj78) ([`bd48cc1`](https://github.com/agent-of-empires/plugin-github/commit/bd48cc1e815561e3346ebbd18772248411142706))
+- **refresh:** Clear empty row-column via remove instead of rejected ui.state.set in [#67](https://github.com/agent-of-empires/plugin-github/pull/67) by [@Seluj78](https://github.com/Seluj78) ([`9be992d`](https://github.com/agent-of-empires/plugin-github/commit/9be992d2707387fef37ee0a9d314a82cd8b839af))
+- Repaint last-known GitHub data instantly on aoe serve restart in [#68](https://github.com/agent-of-empires/plugin-github/pull/68) by [@Seluj78](https://github.com/Seluj78) ([`859fed2`](https://github.com/agent-of-empires/plugin-github/commit/859fed254b0b960a74ad96cf9f87a81ebacbe0c6))
+- **refresh:** Two-tier digest polling kills the GraphQL budget burn, bounded pools cut big-refresh latency in [#71](https://github.com/agent-of-empires/plugin-github/pull/71) by [@Seluj78](https://github.com/Seluj78) ([`2610965`](https://github.com/agent-of-empires/plugin-github/commit/26109651a679fbf33d407c8ba4039fd3e9adab64))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v1.7.0...v1.7.1
 ## [1.7.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.7.0) - 2026-07-04
 
 
