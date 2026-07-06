@@ -196,6 +196,24 @@ def test_list_sessions_keeps_sessions_when_flags_absent():
     assert [s["id"] for s in _list_sessions_with(reply)] == ["s1", "s2"]
 
 
+def test_list_sessions_requests_server_side_exclude():
+    # The worker asks the host to drop archived/snoozed/trashed server-side, so a
+    # workspace with hundreds of trashed sessions never enumerates them and cannot
+    # exhaust the host's per-plugin UI-state quota.
+    captured = {}
+
+    def fake_call_host(method, params, timeout=None):
+        captured["method"] = method
+        captured["params"] = params
+        return {"sessions": [{"id": "s1", "project_path": "/a"}]}
+
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = fake_call_host
+    rt.list_sessions()
+    assert captured["method"] == main.SESSIONS_LIST
+    assert set(captured["params"]["exclude"]) == {"archived", "snoozed", "trashed"}
+
+
 def test_archived_session_never_reaches_build_snapshot(monkeypatch):
     # End-to-end: an archived session in the host reply triggers zero network
     # work, it is filtered before build_snapshot, which is what does the HTTP.
