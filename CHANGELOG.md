@@ -4,6 +4,16 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.7.2](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.7.2) - 2026-07-06
+
+
+
+### Bug Fixes
+
+- **worker:** Exclude trashed sessions from sessions.list in [#75](https://github.com/agent-of-empires/plugin-github/pull/75) by [@Seluj78](https://github.com/Seluj78) ([`10f13b0`](https://github.com/agent-of-empires/plugin-github/commit/10f13b00670600436c5983efc13061c4536d7422))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v1.7.1...v1.7.2
 ## [1.7.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.7.1) - 2026-07-05
 
 
