@@ -270,17 +270,24 @@ class Runtime:
         transient failure must never be read as "no sessions", which would prune
         every session's UI.
 
-        Archived and snoozed sessions are dropped here, the single chokepoint
-        every consumer reads (#41): they are inactive by definition, so polling
-        them only burns the user's GitHub quota. Filtering at the source (not just
-        in the snapshot) keeps the fast local session tick consistent, it compares
-        these ids against the pushed set, so a snapshot-only filter would diff the
-        archived session forever and refresh every tick. A previously-pushed
-        session that becomes archived simply drops out of the list and the refresh
-        reconcile removes its UI slots, same path as a vanished session. The
-        ``archived``/``snoozed`` flags are additive (host #2504); a host that omits
-        them polls every session as before."""
-        result = self.call_host(SESSIONS_LIST, {}, timeout=timeout)
+        Archived, snoozed, and trashed sessions are dropped here, the single
+        chokepoint every consumer reads (#41): they are inactive by definition, so
+        polling them only burns the user's GitHub quota, and trashed sessions in
+        particular can pile up in the hundreds and exhaust the host's per-plugin
+        UI-state quota, starving live sessions' panes. Filtering at the source (not
+        just in the snapshot) keeps the fast local session tick consistent, it
+        compares these ids against the pushed set, so a snapshot-only filter would
+        diff the inactive session forever and refresh every tick. A previously-pushed
+        session that becomes inactive simply drops out of the list and the refresh
+        reconcile removes its UI slots, same path as a vanished session.
+
+        The ``exclude`` param filters server-side so the host never even
+        enumerates those sessions; a host too old to honor it ignores the param and
+        returns everything, so the client-side filter below still drops archived
+        and snoozed sessions (trashed has no per-entry flag, so an old host cannot
+        drop those client-side, which is exactly the exhaustion the host-side
+        ``exclude`` fixes)."""
+        result = self.call_host(SESSIONS_LIST, {"exclude": ["archived", "snoozed", "trashed"]}, timeout=timeout)
         sessions = result.get("sessions") if isinstance(result, dict) else None
         if not isinstance(sessions, list):
             return None
@@ -289,6 +296,7 @@ class Runtime:
         # pruning live UI; treat a garbage list as "no answer" instead.
         if not all(isinstance(s, dict) and isinstance(s.get("id"), str) for s in sessions):
             return None
+        # Fallback for a host that ignored `exclude`: still drop archived/snoozed.
         return [s for s in sessions if not s.get("archived") and not s.get("snoozed")]
 
     def _push_snapshot(self, snapshot: dict[str, Any]) -> set[str]:
