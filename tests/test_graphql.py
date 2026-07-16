@@ -347,6 +347,7 @@ def test_digest_signature_changes_on_each_watched_field():
         ("updatedAt", "2026-01-02T00:00:00Z"),
         ("headRefOid", "def"),
         ("reviewThreads", {"totalCount": 3}),
+        ("mergeable", "CONFLICTING"),
     ]:
         node = dict(base)
         node[field] = value
@@ -361,3 +362,53 @@ def test_digest_signature_none_on_malformed():
     assert graphql.digest_signature({"nodes": "garbage"}) is None
     assert graphql.digest_signature({"nodes": ["not-a-dict"]}) is None
     assert graphql.digest_signature(_conn()) is not None  # empty connection is a valid "no PRs"
+
+
+def test_merge_state_maps_only_conflicting():
+    assert graphql.merge_state({"mergeable": "CONFLICTING"}) == "conflicts"
+    # MERGEABLE is healthy; UNKNOWN is GitHub's transient async-compute value;
+    # missing is the no-token / partial shape. None of them are a conflict.
+    assert graphql.merge_state({"mergeable": "MERGEABLE"}) is None
+    assert graphql.merge_state({"mergeable": "UNKNOWN"}) is None
+    assert graphql.merge_state({"mergeable": None}) is None
+    assert graphql.merge_state({}) is None
+
+
+def test_normalize_pull_exposes_merge_state():
+    conflicting = _pr()
+    conflicting["mergeable"] = "CONFLICTING"
+    clean = _pr()
+    clean["mergeable"] = "MERGEABLE"
+    assert graphql.normalize_connection(_conn(conflicting))[0]["merge_state"] == "conflicts"
+    assert graphql.normalize_connection(_conn(clean))[0]["merge_state"] is None
+    # No mergeable field (no-token / partial) degrades to no signal, not a raise.
+    assert graphql.normalize_connection(_conn(_pr()))[0]["merge_state"] is None
+
+
+def test_digest_signature_tracks_conflict_not_transient_unknown():
+    # Canonicalized to the conflict bool, so MERGEABLE and UNKNOWN are
+    # signature-equal: the MERGEABLE -> UNKNOWN -> MERGEABLE churn GitHub emits
+    # on every push must not re-fire the expensive rich query. But a real
+    # conflict (CONFLICTING) still diffs, so onset is detected immediately.
+    def node(mergeable):
+        base = {
+            "number": 1,
+            "state": "OPEN",
+            "isDraft": False,
+            "merged": False,
+            "reviewDecision": None,
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "headRefOid": "abc",
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
+            "reviewThreads": {"totalCount": 0},
+        }
+        if mergeable is not None:
+            base["mergeable"] = mergeable
+        return base
+
+    sig_clean = graphql.digest_signature(_conn(node("MERGEABLE")))
+    sig_unknown = graphql.digest_signature(_conn(node("UNKNOWN")))
+    sig_missing = graphql.digest_signature(_conn(node(None)))
+    sig_conflict = graphql.digest_signature(_conn(node("CONFLICTING")))
+    assert sig_clean == sig_unknown == sig_missing
+    assert sig_conflict != sig_clean

@@ -39,7 +39,7 @@ from typing import Any
 _PR_CONNECTION_FRAGMENT = """
 fragment PRConnection on PullRequestConnection {
   nodes {
-    id number title url state isDraft merged reviewDecision updatedAt headRefOid
+    id number title url state isDraft merged mergeable reviewDecision updatedAt headRefOid
     baseRef { branchProtectionRule {
       requiresStatusChecks
       requiredStatusCheckContexts
@@ -104,7 +104,7 @@ _DIGEST_ALIAS_FIELD = """    b{i}: pullRequests(
       headRefName: $b{i}, states: [OPEN, MERGED], first: 3,
       orderBy: {{field: UPDATED_AT, direction: DESC}}
     ) {{ nodes {{
-      number state isDraft merged reviewDecision updatedAt headRefOid
+      number state isDraft merged mergeable reviewDecision updatedAt headRefOid
       commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }}
       reviewThreads(first: 1) {{ totalCount }}
     }} }}"""
@@ -158,6 +158,15 @@ def digest_signature(conn: Any) -> str | None:
                 "decision": pr.get("reviewDecision"),
                 "updated": pr.get("updatedAt"),
                 "head": pr.get("headRefOid"),
+                # Canonicalized to the actionable conflict bool, NOT the raw
+                # ``mergeable`` enum: GitHub recomputes mergeability async, so a
+                # push cycles MERGEABLE -> UNKNOWN -> MERGEABLE. Storing the raw
+                # enum would diff twice per push and re-fire the ~25-point rich
+                # query each time. The bool only flips when a conflict actually
+                # appears or clears, and CONFLICTING still diffs the instant
+                # GitHub reports it (the digest reads the same scalar), so this
+                # loses no detection latency (#80).
+                "conflicts": merge_state(pr) == "conflicts",
                 "rollup": rollup.get("state") if isinstance(rollup, dict) else None,
                 "threads": threads.get("totalCount") if isinstance(threads, dict) else None,
             }
@@ -228,6 +237,19 @@ def review_state(pr: dict[str, Any]) -> str:
     if any(r.get("state") == "COMMENTED" for r in reviews) or any(not t.get("isResolved") for t in threads):
         return "commented"
     return "waiting"
+
+
+def merge_state(pr: dict[str, Any]) -> str | None:
+    """``conflicts`` when GitHub reports the PR head conflicts with its base, else
+    ``None`` (no signal).
+
+    Only ``mergeable == CONFLICTING`` is surfaced. ``MERGEABLE`` is healthy and
+    ``UNKNOWN`` is the transient value GitHub returns while it recomputes
+    mergeability after a push; both degrade to ``None`` so the UI never flashes a
+    conflict state that GitHub has not actually confirmed. ``mergeStateStatus`` is
+    deliberately not consulted: it conflates conflicts (DIRTY) with policy/CI/
+    behind-base blockers, which are not this signal (#80)."""
+    return "conflicts" if pr.get("mergeable") == "CONFLICTING" else None
 
 
 # Per-check conclusion -> our state vocabulary. Anything unlisted reads "unknown".
@@ -445,6 +467,7 @@ def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -
         "state": pr.get("state"),
         "draft": bool(pr.get("isDraft", False)),
         "merged": bool(pr.get("merged", False)),
+        "merge_state": merge_state(pr),
         "review_state": review_state(pr),
         "checks": check_summary(pr, required_checks_only=required_checks_only),
         "comments": comment_summary(pr),

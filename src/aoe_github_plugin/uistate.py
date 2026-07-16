@@ -89,22 +89,25 @@ _CHECK_VISUAL: dict[str, tuple[str, str, str]] = {
 
 # PR attention kind -> (rank, lucide icon, host Tone, compact label). Lower rank
 # = more attention, so it wins the badge icon and the row-column summary. The
-# order follows issue #36: changes-requested outranks everything, failing checks
-# outrank running/queued, unresolved comments surface even without a formal
-# review. Glyphs/tones reuse the pane vocabulary above so the row and pane agree.
-# "open" is a healthy non-rich PR (no token, or nothing notable); "draft" is WIP.
+# order follows issue #36 (#80 adds conflicts): a merge conflict outranks
+# everything, a hard blocker regardless of review; then changes-requested,
+# failing checks outrank running/queued, unresolved comments surface even
+# without a formal review. Glyphs/tones reuse the pane vocabulary above so the
+# row and pane agree. "open" is a healthy non-rich PR (no token, or nothing
+# notable); "draft" is WIP.
 _ATTENTION_VISUAL: dict[str, tuple[int, str, str, str]] = {
     "error": (0, _ICON_ERROR, "danger", "error"),
-    "changes-requested": (1, *_REVIEW_VISUAL["changes-requested"][:2], "changes requested"),
-    "checks-failing": (2, *_CHECK_VISUAL["failing"][:2], "CI failing"),
-    "unresolved": (3, "message-square", "warn", "unresolved comments"),
-    "checks-running": (4, *_CHECK_VISUAL["running"][:2], "CI running"),
-    "checks-queued": (5, *_CHECK_VISUAL["queued"][:2], "CI queued"),
-    "awaiting-review": (6, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
-    "commented": (7, *_REVIEW_VISUAL["commented"][:2], "commented"),
-    "approved": (8, *_REVIEW_VISUAL["approved"][:2], "approved"),
-    "open": (9, _ICON_OPEN, "success", "open PR"),
-    "draft": (10, _ICON_DRAFT, "warn", "draft"),
+    "conflicts": (1, "triangle-alert", "danger", "conflicts"),
+    "changes-requested": (2, *_REVIEW_VISUAL["changes-requested"][:2], "changes requested"),
+    "checks-failing": (3, *_CHECK_VISUAL["failing"][:2], "CI failing"),
+    "unresolved": (4, "message-square", "warn", "unresolved comments"),
+    "checks-running": (5, *_CHECK_VISUAL["running"][:2], "CI running"),
+    "checks-queued": (6, *_CHECK_VISUAL["queued"][:2], "CI queued"),
+    "awaiting-review": (7, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
+    "commented": (8, *_REVIEW_VISUAL["commented"][:2], "commented"),
+    "approved": (9, *_REVIEW_VISUAL["approved"][:2], "approved"),
+    "open": (10, _ICON_OPEN, "success", "open PR"),
+    "draft": (11, _ICON_DRAFT, "warn", "draft"),
 }
 
 
@@ -134,6 +137,11 @@ def _pull_attention(pull: dict[str, Any], chips: frozenset[str]) -> str:
     basic view rather than mislabeling state it cannot see."""
     if pull.get("draft"):
         return "draft"
+    # A merge conflict is a hard blocker that no reviewer can clear, so it wins
+    # over the whole toggle ladder and is never user-suppressible (kept out of
+    # _KIND_CATEGORY, matched here before the ladder so it cannot KeyError).
+    if pull.get("merge_state") == "conflicts":
+        return "conflicts"
     review = pull.get("review_state")
     checks = pull.get("checks")
     cstate = checks.get("state") if isinstance(checks, dict) else None
@@ -220,6 +228,12 @@ def _pr_badge_chips(repo_name: str, pull: dict[str, Any], chips_on: frozenset[st
         # a draft is WIP: skip review/CI/comment noise until it opens.
         return [_chip(_ICON_DRAFT, "warn", f"{head} (draft)", href)]
     chips = [_chip(_ICON_OPEN, "success", head, href)]
+
+    # Conflicts are ungated (not a suppressible category): a merge-blocked PR
+    # always shows the danger chip. Exact match, so a malformed/future value
+    # never trips a false conflict.
+    if pull.get("merge_state") == "conflicts":
+        chips.append(_chip("triangle-alert", "danger", f"{head} (conflicts)", href))
 
     review_state = pull.get("review_state")
     review = _REVIEW_VISUAL.get(review_state) if isinstance(review_state, str) else None
@@ -335,6 +349,20 @@ def _headline_row(repo_name: str, pull: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _merge_row(merge_state: Any) -> dict[str, Any] | None:
+    """A danger row when the PR conflicts with its base, else ``None``. Exact
+    match on ``conflicts`` so no other/absent value renders a row (#80)."""
+    if merge_state != "conflicts":
+        return None
+    return {
+        "kind": "row",
+        "label": "Merge",
+        "value": "conflicts with base branch",
+        "icon": "triangle-alert",
+        "tone": "danger",
+    }
+
+
 def _review_row(review: Any) -> dict[str, Any] | None:
     if review not in _REVIEW_VISUAL:
         return None
@@ -423,6 +451,7 @@ def _pull_detail_blocks(pull: dict[str, Any]) -> list[dict[str, Any]]:
     if _is_merged(pull):
         return []
     candidates = (
+        _merge_row(pull.get("merge_state")),
         _review_row(pull.get("review_state")),
         _checks_section(pull.get("checks")),
         _comments_section(pull.get("comments")),

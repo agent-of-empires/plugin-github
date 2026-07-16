@@ -267,15 +267,18 @@ def test_session_without_id_is_skipped():
 # --- rich (token) rendering ---
 
 
-def _rich_pull(state="OPEN", merged=False, review="approved", checks=None, comments=None):
+def _rich_pull(  # noqa: PLR0913
+    state="OPEN", merged=False, review="approved", checks=None, comments=None, merge_state=None, draft=False
+):
     number = 5
     return {
         "number": number,
         "url": f"https://github.com/o/r/pull/{number}",
         "title": "T",
         "state": state,
-        "draft": False,
+        "draft": draft,
         "merged": merged,
+        "merge_state": merge_state,
         "review_state": review,
         "checks": checks,
         "comments": comments or {"unresolved": 0, "items": []},
@@ -584,6 +587,67 @@ def test_column_shows_healthy_state_not_empty():
     payload = _column_payload([_repo(pulls=[_rich_pull(review="approved")])])
     assert payload["text"] == "approved"
     assert payload["tone"] == "success"
+
+
+# --- merge conflicts (#80) ---
+
+
+def test_conflict_outranks_review_and_ci_in_column():
+    # A merge conflict is a hard blocker: it wins over changes-requested + failing
+    # CI on the same PR and drives the row-column summary.
+    checks = {"state": "failing", "runs": []}
+    pull = _rich_pull(review="changes-requested", checks=checks, merge_state="conflicts")
+    payload = _column_payload([_repo(pulls=[pull])])
+    assert payload["text"] == "conflicts"
+    assert payload["tone"] == "danger"
+    assert payload["sort_value"] == uistate._ATTENTION_VISUAL["conflicts"][0]
+
+
+def test_conflict_chip_is_ungated_by_categories():
+    # Conflicts are never user-suppressible: the danger chip shows even with every
+    # toggle category disabled.
+    repos = [_repo(pulls=[_rich_pull(review="approved", merge_state="conflicts")])]
+    assert "triangle-alert" in _badge_icons_with(repos, frozenset())
+
+
+def test_conflict_renders_a_pane_merge_row():
+    pull = _rich_pull(review="changes-requested", merge_state="conflicts")
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
+        "blocks"
+    ]
+    merge_row = next(b for b in blocks if b.get("kind") == "row" and b.get("label") == "Merge")
+    assert merge_row["value"] == "conflicts with base branch"
+    assert merge_row["tone"] == "danger"
+
+
+def test_clean_pr_has_no_conflict_chip_or_row():
+    pull = _rich_pull(review="approved", merge_state=None)
+    repos = [_repo(pulls=[pull])]
+    assert "triangle-alert" not in _badge_icons_with(repos, frozenset({"review", "ci", "comments"}))
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos))))["payload"]["blocks"]
+    assert not [b for b in blocks if b.get("kind") == "row" and b.get("label") == "Merge"]
+
+
+def test_draft_conflict_asymmetry_quiet_badge_visible_pane_row():
+    # A draft keeps the established asymmetry: the session badge stays draft-only
+    # (WIP, no conflict chip), but the pane still surfaces the conflict row so a
+    # user who opens the pane sees it.
+    pull = _rich_pull(draft=True, merge_state="conflicts")
+    repos = [_repo(pulls=[pull])]
+    icons = _badge_icons_with(repos, frozenset({"review", "ci", "comments"}))
+    assert icons == ["git-pull-request-draft"]
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos))))["payload"]["blocks"]
+    merge_row = next(b for b in blocks if b.get("kind") == "row" and b.get("label") == "Merge")
+    assert merge_row["tone"] == "danger"
+
+
+def test_merged_pr_suppresses_conflict_row():
+    # Merged PRs suppress all live detail, including a stale conflict signal.
+    pull = _rich_pull(state="MERGED", merged=True, merge_state="conflicts")
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
+        "blocks"
+    ]
+    assert not [b for b in blocks if b.get("kind") == "row" and b.get("label") == "Merge"]
 
 
 def test_column_is_empty_when_no_prs_to_clear_stale_state():

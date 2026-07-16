@@ -8,7 +8,7 @@ common git/GitHub operations from #658 without dropping into a terminal.
 > layer from AoE core (PR #1681 / issue #1667) into a Tier 1 plugin worker, with
 > structured `github.status` (open PRs for the branch, each with its URL) and
 > `github.open` (open-in-GitHub). The per-session pane shows rich PR state
-> (state incl. merged, review state, CI checks, and unresolved comments) when a
+> (state incl. merged, review state, merge conflicts, CI checks, and unresolved comments) when a
 > token is present, degrading to open PRs only without one. The write operations
 > (create/merge PR, push, pull, fix-CI) land in follow-ups.
 
@@ -119,7 +119,8 @@ session-less `github.refresh` cover every session and prune vanished ones:
    first (see "Rate limits" below); only when that reports a change (or on a
    forced refresh, a cold cache, or a cheap digest query detecting a change past
    the freshness ceiling) does it spend the expensive
-   GraphQL query for the rich state (PR state incl. MERGED, `reviewDecision`, the
+   GraphQL query for the rich state (PR state incl. MERGED, `reviewDecision`,
+   mergeability (merge conflicts with the base), the
    head commit's check rollup + per-check runs, and every unresolved review
    thread with its first comment). Branches of the same repo that need a fresh
    fetch are aliased into one batched GraphQL query rather than one per branch, so
@@ -127,7 +128,8 @@ session-less `github.refresh` cover every session and prune vanished ones:
    few once it exceeds the per-query alias cap). Without a token it is the basic
    REST open-PR lookup only.
 4. Push one global `sort-key` and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
-   chip sequence per open PR: a clickable PR icon, then review-state, CI-rollup,
+   chip sequence per open PR: a clickable PR icon, a merge-conflict chip when the
+   PR conflicts with its base, then review-state, CI-rollup,
    and unresolved-comment chips, each shown only when a token supplies that field,
    concatenated across the workspace's repos, plus an error marker per failed
    repo. Each chip is colored by tone, so failing CI / changes requested read as
