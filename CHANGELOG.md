@@ -4,6 +4,16 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.8.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.8.0) - 2026-07-16
+
+
+
+### Features
+
+- **github:** Surface PR merge conflicts in the badge and pane in [#81](https://github.com/agent-of-empires/plugin-github/pull/81) by [@Seluj78](https://github.com/Seluj78) ([`410cc20`](https://github.com/agent-of-empires/plugin-github/commit/410cc20dfe5fc5b2dfff95ec6158d78122fd1e64))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v1.7.2...v1.8.0
 ## [1.7.2](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.7.2) - 2026-07-06
 
 
