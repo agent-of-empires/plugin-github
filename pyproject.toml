@@ -29,7 +29,7 @@ dev = [
     "mypy>=1.14.1",
     "pre-commit>=4.0.1",
     "pytest>=8.3.4",
-    "ruff>=0.11.4",
+    "ruff>=0.15.21",
     # CI-only: scripts/featured_index.py edits AoE's featured.toml trust root
     # through a real TOML parser, never string surgery.
     "tomlkit>=0.13",
