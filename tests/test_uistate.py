@@ -546,6 +546,26 @@ def test_required_rollup_keeps_optional_failure_visible():
     assert group["children"][0]["label"] == "required-build"
 
 
+def test_check_row_sublabel_is_built_from_the_parts_it_has():
+    # A StatusContext has no workflow group and no duration, so a required external
+    # check has nothing to append the marker to. It must still say "required", and
+    # must never ship an empty sublabel where the host expects a value or nothing.
+    cases = [
+        (
+            {"name": "c", "state": "failing", "group": "Lint", "duration": "4s", "required": True},
+            "Lint · 4s · required",
+        ),
+        ({"name": "c", "state": "failing", "group": "Lint", "duration": "4s", "required": False}, "Lint · 4s"),
+        ({"name": "c", "state": "failing", "required": True}, "required"),
+        ({"name": "c", "state": "failing", "duration": "4s", "required": True}, "4s · required"),
+    ]
+    for run, expected in cases:
+        assert uistate._check_row(run, compact=False)["sublabel"] == expected, run
+    # Nothing to say: no sublabel key at all, rather than an empty string.
+    bare = uistate._check_row({"name": "c", "state": "failing", "required": False}, compact=False)
+    assert "sublabel" not in bare
+
+
 def test_pane_payload_stays_under_host_size_cap():
     # Detailing one selected PR bounds the pane by construction, but a single
     # pathological block (a review with hundreds of long comments) can still blow

@@ -481,11 +481,16 @@ def _check_row(run: dict[str, Any], *, compact: bool) -> dict[str, Any]:
         return row
     row["icon"] = icon
     row["tone"] = tone
-    detail = " · ".join(str(x) for x in (run.get("group"), run.get("duration")) if x)
-    if detail:
-        row["sublabel"] = detail
-    if isinstance(run.get("required"), bool):
-        row["sublabel"] = f"{detail} · required" if detail and run["required"] else row.get("sublabel", detail)
+    # Built from parts rather than overwritten: composing the marker onto an
+    # already-set sublabel dropped it whenever the detail was empty, which is
+    # exactly the StatusContext case (no workflow group, no duration) that carries
+    # the external required checks a branch-protection user most wants labelled.
+    # It also shipped `sublabel: ""` where the host expects a value or nothing.
+    parts = [str(x) for x in (run.get("group"), run.get("duration")) if x]
+    if run.get("required") is True:
+        parts.append("required")
+    if parts:
+        row["sublabel"] = " · ".join(parts)
     return row
 
 
