@@ -151,17 +151,22 @@ def test_badge_keeps_href_even_when_status_column_hidden():
     assert _column(params)["payload"] == {"text": "", "sort_value": uistate._ATTENTION_VISUAL["open"][0]}
 
 
-def test_pane_has_heading_and_a_row_per_repo():
+def test_pane_leads_with_a_pr_selector_and_folds_repos_without_prs():
     session = _session(repos=[_repo(name="b"), _repo(name="a", pulls=[_pull(number=9, title="Add x")])])
     blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["blocks"]
-    assert blocks[0] == {"kind": "heading", "text": "GitHub"}
-    rows = _rows(blocks)
-    assert [r["label"] for r in rows] == ["a", "b"]
-    assert rows[0]["value"] == "PR #9 Add x"
-    assert rows[0]["href"] == "https://github.com/o/r/pull/9"
-    assert rows[1]["value"] == "no open PR"
-    section = next(b for b in blocks if b.get("kind") == "section" and b.get("title") == "Repos without open PRs (1)")
-    assert section["collapsed"] is True
+    # No heading block: the dock tab already names the pane.
+    assert blocks[0]["kind"] == "section"
+    selector = blocks[0]["children"]
+    assert [r["prefix"] for r in selector] == ["#9"]
+    assert selector[0]["label"] == "Add x"
+    assert selector[0]["href"] == "https://github.com/o/r/pull/9"
+    # The only PR is selected by default, and clicking a row names it by key.
+    assert selector[0]["selected"] is True
+    assert selector[0]["method"] == uistate.SELECT_METHOD
+    assert selector[0]["params"] == {"pr": "o/r#9"}
+    other = next(b for b in blocks if b.get("kind") == "section" and b.get("title") == "Other repos (1)")
+    assert other["collapsed"] is True
+    assert other["children"][0]["value"] == "no open PR"
 
 
 def test_pane_ends_with_a_refresh_action():
@@ -172,36 +177,29 @@ def test_pane_ends_with_a_refresh_action():
     assert action["label"] == "Refresh"
 
 
-def test_pane_shows_freshness_before_refresh_action(monkeypatch):
+def test_pane_footer_carries_freshness_and_the_selected_verdict(monkeypatch):
+    # Freshness lives in the pinned footer, not a block, so it stays visible while
+    # the block list scrolls.
     _set_tz(monkeypatch, "UTC")
-    session = _session(repos=[_repo()])
+    session = _session(repos=[_repo(pulls=[_rich_pull(review="approved")])])
     session["freshness"] = {"refreshed_at": "2026-06-29T14:32:10Z", "stale": False}
-    blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["blocks"]
-
-    assert blocks[-2] == {
-        "kind": "row",
-        "label": "Last refreshed",
-        "value": "14:32",
-        "icon": "clock",
-        "tone": "neutral",
+    payload = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(session)))["payload"]
+    assert payload["footer"] == {
+        "text": "refreshed 14:32",
+        "icon": "refresh-cw",
+        "value": "ready",
+        "tone": "success",
     }
-    assert blocks[-1]["method"] == "github.refresh"
+    assert payload["blocks"][-1]["method"] == "github.refresh"
 
 
-def test_pane_marks_stale_freshness_before_refresh_action(monkeypatch):
+def test_pane_footer_marks_stale_freshness(monkeypatch):
     _set_tz(monkeypatch, "UTC")
     session = _session(repos=[_repo()])
     session["freshness"] = {"refreshed_at": "2026-06-29T14:20:03Z", "stale": True}
-    blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["blocks"]
-
-    assert blocks[-2] == {
-        "kind": "row",
-        "label": "Last successful refresh",
-        "value": "14:20",
-        "icon": "clock",
-        "tone": "warn",
-    }
-    assert blocks[-1]["method"] == "github.refresh"
+    payload = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]
+    # No PR in this session, so the footer carries only the refresh half.
+    assert payload["footer"] == {"text": "last good refresh 14:20", "icon": "clock"}
 
 
 def test_format_refreshed_at_converts_utc_to_local(monkeypatch):
@@ -223,10 +221,10 @@ def test_format_refreshed_at_rejects_garbage():
 def test_pane_omits_freshness_without_timestamp():
     session = _session(repos=[_repo()])
     session["freshness"] = {"stale": False}
-    blocks = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]["blocks"]
-
-    assert not any(b.get("label") == "Last refreshed" for b in blocks)
-    assert blocks[-1]["method"] == "github.refresh"
+    payload = _pane(uistate.snapshot_ui_state_params(_snapshot(session)))["payload"]
+    # Nothing to pin: no timestamp and no PR verdict, so no footer at all.
+    assert "footer" not in payload
+    assert payload["blocks"][-1]["method"] == "github.refresh"
 
 
 def test_pane_payload_carries_title_and_default_location():
@@ -294,11 +292,11 @@ def test_merged_pr_uses_purple_color_and_is_omitted_from_badge():
     params = uistate.snapshot_ui_state_params(_auth_snapshot(session))
     # Badge: merged-only repo contributes no actionable badge.
     assert _badge(params)["payload"]["items"] == []
-    # Pane: headline row is purple with the merge icon.
-    head = next(b for b in _pane(params)["payload"]["blocks"] if b.get("kind") == "row")
+    # Pane: the selector row is purple with the merge icon.
+    head = _rows(_pane(params)["payload"]["blocks"])[0]
     assert head["icon"] == "git-merge"
     assert head["color"] == uistate.MERGED_COLOR
-    assert head["value"].startswith("MERGED #5")
+    assert head["prefix"] == "#5"
 
 
 def test_merged_pr_suppresses_review_checks_and_comments():
@@ -313,12 +311,14 @@ def test_merged_pr_suppresses_review_checks_and_comments():
     blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
         "blocks"
     ]
-    # Headline still present and merged.
-    head = next(b for b in blocks if b.get("kind") == "row" and b.get("label") == "r")
-    assert head["value"].startswith("MERGED #5")
-    # No active review row, no Checks section, no Unresolved-comments section.
-    assert not [b for b in blocks if b.get("kind") == "row" and b.get("label") == "Review"]
-    assert not [b for b in blocks if b.get("kind") == "section"]
+    # The selector still lists it, and its verdict says merged.
+    assert _rows(blocks)[0]["icon"] == "git-merge"
+    callout = next(b for b in blocks if b.get("kind") == "callout")
+    assert callout["title"] == "Merged"
+    # No Review or Checks card, and no unresolved comments: all of it is history.
+    titles = {b.get("title") for b in blocks if b.get("kind") == "section"}
+    assert "Review" not in titles
+    assert "Checks" not in titles
     assert not [b for b in blocks if b.get("kind") == "comment"]
 
 
@@ -332,37 +332,170 @@ def test_pane_renders_review_checks_and_comments():
     blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
         "blocks"
     ]
-    review_row = next(b for b in blocks if b.get("kind") == "row" and b.get("label") == "Review")
-    assert review_row["value"] == "changes requested"
-    assert review_row["tone"] == "danger"
     sections = [b for b in blocks if b.get("kind") == "section"]
-    checks_section = next(s for s in sections if s["title"].startswith("Checks"))
+    # No per-reviewer data here, so the Review card degrades to the aggregate state.
+    review = next(s for s in sections if s.get("title") == "Review")
+    assert review["value"] == "changes requested"
+    assert review["value_tone"] == "danger"
+    checks_section = next(s for s in sections if s.get("title") == "Checks")
     assert checks_section["children"][0]["label"] == "test"
+    assert checks_section["badges"] == [{"text": "1 failing", "tone": "danger"}]
+    assert checks_section["scroll"] is True
+    # The blocking reason leads the pane as a callout with an inert button.
+    callout = next(b for b in blocks if b.get("kind") == "callout")
+    assert callout["title"] == "Changes requested"
+    assert callout["tone"] == "danger"
+    assert callout["actions"][0]["disabled"] is True
+    # The count pills carry the rollup state now, so the title needs no icon/tone.
     assert checks_section["children"][0]["tone"] == "danger"
-    # The section title carries the rollup's icon + tone for an at-a-glance state.
-    assert checks_section["icon"] == "circle-x"
-    assert checks_section["tone"] == "danger"
-    comments_section = next(s for s in sections if s["title"].startswith("Unresolved comments"))
+    assert "icon" not in checks_section
+    comments_section = next(s for s in sections if s.get("title", "").startswith("Unresolved comments"))
     comment = comments_section["children"][0]
     assert comment["kind"] == "comment"
     assert comment["author"] == "al"
     assert comment["href"] == "https://c/1"
-    # Both sections fold. These checks are failing, so the section stays open;
-    # the comments section is open because there are unresolved comments.
-    assert checks_section["collapsible"] is True
-    assert "collapsed" not in checks_section
+    # The Checks card no longer folds as a whole (only its passing group does), so
+    # a failing check can never be hidden behind a collapsed header. The comments
+    # section still folds, and stays open because there are unresolved comments.
+    assert "collapsible" not in checks_section
     assert comments_section["collapsible"] is True
     assert "collapsed" not in comments_section
 
 
-def test_passing_checks_section_starts_collapsed():
-    checks = {"state": "succeeded", "runs": [{"name": "test", "state": "succeeded"}]}
+def test_selection_points_the_detail_at_the_chosen_pr_and_survives_nothing_else():
+    a = _rich_pull(review="approved")
+    a["number"] = 1
+    b = _rich_pull(review="changes-requested")
+    b["number"] = 2
+    session = _session(repos=[_repo(pulls=[a, b])])
+    snapshot = _auth_snapshot(session)
+
+    # Default: the most-actionable PR (changes-requested outranks approved).
+    default_pane = _pane(uistate.snapshot_ui_state_params(snapshot))["payload"]
+    assert next(x for x in default_pane["blocks"] if x.get("kind") == "callout")["title"] == "Changes requested"
+
+    # Choosing the other PR re-points the detail without touching the selector order.
+    chosen = _pane(uistate.snapshot_ui_state_params(snapshot, selected={"s1": "o/r#1"}))["payload"]
+    assert next(x for x in chosen["blocks"] if x.get("kind") == "callout")["title"] == "Ready to merge"
+    selector = chosen["blocks"][0]["children"]
+    assert [r["params"]["pr"] for r in selector] == ["o/r#2", "o/r#1"]
+    assert [r["selected"] for r in selector] == [False, True]
+
+    # A key naming a PR that is no longer in the snapshot falls back to the top of
+    # the list rather than stranding the pane on a dead selection.
+    stale = _pane(uistate.snapshot_ui_state_params(snapshot, selected={"s1": "o/r#999"}))["payload"]
+    assert stale["blocks"][0]["children"][0]["selected"] is True
+
+
+def test_review_card_lists_each_reviewer_with_initials():
+    pull = _rich_pull(review="changes-requested")
+    pull["reviewers"] = [
+        {"name": "Nate Brake", "state": "approved"},
+        {"name": "njbrake", "state": "changes-requested"},
+    ]
+    pull["review_summary"] = "changes requested"
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
+        "blocks"
+    ]
+    review = next(b for b in blocks if b.get("kind") == "section" and b.get("title") == "Review")
+    assert review["value"] == "changes requested"
+    assert [(r["avatar"], r["label"], r["value"]) for r in review["children"]] == [
+        ("NB", "Nate Brake", "approved"),
+        ("NJ", "njbrake", "changes requested"),
+    ]
+
+
+def test_diff_and_linked_issues_share_a_columns_row():
+    pull = _rich_pull(review="approved")
+    pull["diff"] = {"added": 842, "removed": 317, "files": 18}
+    pull["issues"] = [{"number": 3180, "title": "Stale daemon", "url": "https://gh/i/3180", "state": "open"}]
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
+        "blocks"
+    ]
+    columns = next(b for b in blocks if b.get("kind") == "columns")
+    diff, linked = columns["children"]
+    assert diff["badges"] == [{"text": "+842", "tone": "success"}, {"text": "-317", "tone": "danger"}]
+    bar = diff["children"][0]
+    assert bar["kind"] == "bar"
+    assert [s["value"] for s in bar["segments"]] == [842, 317]
+    assert bar["caption"] == "18 files"
+    assert linked["children"][0]["prefix"] == "#3180"
+    assert linked["children"][0]["href"] == "https://gh/i/3180"
+
+    # With no linked issues the Diff card is the lone column, so it spans the pane.
+    pull["issues"] = []
+    solo = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
+        "blocks"
+    ]
+    assert len(next(b for b in solo if b.get("kind") == "columns")["children"]) == 1
+
+
+def test_activity_card_renders_timeline_rows_newest_first(monkeypatch):
+    _set_tz(monkeypatch, "UTC")
+    pull = _rich_pull(review="approved")
+    pull["timeline"] = [
+        {"kind": "commit", "text": "njbrake pushed 4f9a1c2", "at": "2026-06-29T12:04:00Z"},
+        {"kind": "comment", "text": "seluj78 commented", "at": "2026-06-29T11:52:00Z"},
+    ]
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
+        "blocks"
+    ]
+    activity = next(b for b in blocks if b.get("kind") == "section" and b.get("title") == "Activity")
+    assert [(r["label"], r["value"]) for r in activity["children"]] == [
+        ("njbrake pushed 4f9a1c2", "12:04"),
+        ("seluj78 commented", "11:52"),
+    ]
+
+
+def test_merge_verdict_ladder_orders_blockers_by_who_can_clear_them():
+    # One case per rung, so the precedence between them is pinned in one place.
+    running = {"state": "running", "runs": [{"name": "Cargo Test", "state": "running"}]}
+    failing = {"state": "failing", "runs": [{"name": "Clippy", "state": "failing"}]}
+    unresolved = {"unresolved": 2, "items": [{"author": "a", "body": "x", "resolved": False}]}
+    cases = [
+        (_rich_pull(draft=True, merge_state="conflicts"), "Draft", "draft"),
+        (_rich_pull(review="approved", merge_state="conflicts"), "Conflicts with base", "conflicts"),
+        (_rich_pull(review="changes-requested", checks=failing), "Changes requested", "changes requested"),
+        (_rich_pull(review="approved", checks=failing), "1 check failing", "blocked"),
+        (_rich_pull(review="approved", checks=running), "1 check running", "in progress"),
+        (_rich_pull(review="approved", comments=unresolved), "2 unresolved comments", "unresolved"),
+        (_rich_pull(review="approved"), "Ready to merge", "ready"),
+        (_rich_pull(review="waiting"), "Awaiting review", "awaiting review"),
+    ]
+    for pull, title, short in cases:
+        verdict = uistate._merge_verdict(pull)
+        assert verdict["title"] == title, pull
+        assert verdict["short"] == short, pull
+    # Only the ready rung offers a live affordance, and it is a link out.
+    assert uistate._merge_verdict(_rich_pull(review="approved"))["ready"] is True
+
+
+def test_passing_checks_fold_into_a_collapsed_group():
+    checks = {
+        "state": "succeeded",
+        "runs": [
+            {"name": "test", "state": "succeeded", "duration": "48s"},
+            {"name": "close-stale", "state": "succeeded", "skipped": True},
+        ],
+    }
     pull = _rich_pull(review="approved", checks=checks, comments={"unresolved": 0, "items": []})
     blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
         "blocks"
     ]
-    checks_section = next(b for b in blocks if b.get("kind") == "section" and b["title"].startswith("Checks"))
-    assert checks_section["collapsed"] is True
+    checks_section = next(b for b in blocks if b.get("kind") == "section" and b.get("title") == "Checks")
+    # The card itself stays open; the passes fold into a nested group so the
+    # attention rows (none here) would sit above them.
+    assert "collapsed" not in checks_section
+    group = checks_section["children"][0]
+    assert group["title"] == "1 check passing"
+    assert group["collapsed"] is True
+    assert group["children"][0] == {"kind": "row", "label": "test", "mono": True, "value": "48s"}
+    # A skipped run counts as passing for the rollup but is listed apart from it.
+    assert checks_section["children"][1]["label"] == "1 skipped"
+    assert checks_section["badges"] == [
+        {"text": "1 passing", "tone": "success"},
+        {"text": "1 skipped", "tone": "neutral"},
+    ]
 
 
 def test_pane_keeps_no_pr_repos_direct_when_nothing_is_actionable():
@@ -374,18 +507,19 @@ def test_pane_keeps_no_pr_repos_direct_when_nothing_is_actionable():
     assert not [b for b in blocks if b.get("title") == "Repos without open PRs (2)"]
 
 
-def test_pane_treats_merged_only_repo_as_no_open_pr_for_ordering():
+def test_pane_selector_ranks_open_prs_above_merged_ones():
     session = _session(
         repos=[
-            _repo(name="merged", pulls=[_rich_pull(state="MERGED", merged=True)]),
-            _repo(name="open", pulls=[_pull(number=1)]),
+            _repo(name="merged", repo="o/merged", pulls=[_rich_pull(state="MERGED", merged=True)]),
+            _repo(name="open", repo="o/open", pulls=[_pull(number=1)]),
         ]
     )
     blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(session)))["payload"]["blocks"]
-    rows = _rows(blocks)
-    assert [r["label"] for r in rows] == ["open", "merged"]
-    section = next(b for b in blocks if b.get("title") == "Repos without open PRs (1)")
-    assert section["collapsed"] is True
+    selector = blocks[0]["children"]
+    # The open PR outranks the merged one and is what the pane details by default.
+    assert [r["params"]["pr"] for r in selector] == ["o/open#1", "o/merged#5"]
+    assert selector[0]["selected"] is True
+    assert selector[1]["selected"] is False
 
 
 def test_required_rollup_keeps_optional_failure_visible():
@@ -400,26 +534,53 @@ def test_required_rollup_keeps_optional_failure_visible():
     blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
         "blocks"
     ]
-    checks_section = next(b for b in blocks if b.get("kind") == "section" and b["title"].startswith("Checks"))
+    checks_section = next(b for b in blocks if b.get("kind") == "section" and b.get("title") == "Checks")
     assert "collapsed" not in checks_section
-    rows = {child["label"]: child for child in checks_section["children"]}
-    assert rows["required-build"]["sublabel"] == "required"
-    assert rows["optional-lint"]["tone"] == "danger"
-    assert rows["optional-lint"]["sublabel"] == "optional"
+    # The optional failure is an attention row, listed outright above the fold.
+    failing = checks_section["children"][0]
+    assert failing["label"] == "optional-lint"
+    assert failing["tone"] == "danger"
+    # The required pass folds into the passing group.
+    group = checks_section["children"][1]
+    assert group["title"] == "1 check passing"
+    assert group["children"][0]["label"] == "required-build"
+
+
+def test_check_row_sublabel_is_built_from_the_parts_it_has():
+    # A StatusContext has no workflow group and no duration, so a required external
+    # check has nothing to append the marker to. It must still say "required", and
+    # must never ship an empty sublabel where the host expects a value or nothing.
+    cases = [
+        (
+            {"name": "c", "state": "failing", "group": "Lint", "duration": "4s", "required": True},
+            "Lint · 4s · required",
+        ),
+        ({"name": "c", "state": "failing", "group": "Lint", "duration": "4s", "required": False}, "Lint · 4s"),
+        ({"name": "c", "state": "failing", "required": True}, "required"),
+        ({"name": "c", "state": "failing", "duration": "4s", "required": True}, "4s · required"),
+    ]
+    for run, expected in cases:
+        assert uistate._check_row(run, compact=False)["sublabel"] == expected, run
+    # Nothing to say: no sublabel key at all, rather than an empty string.
+    bare = uistate._check_row({"name": "c", "state": "failing", "required": False}, compact=False)
+    assert "sublabel" not in bare
 
 
 def test_pane_payload_stays_under_host_size_cap():
-    # A many-repo workspace with long comments would blow the 64KB/entry host cap;
-    # the pane must trim to fit (and keep the heading + refresh action).
-    big_comment = {
-        "unresolved": 1,
-        "items": [{"author": "a", "body": "x" * 2000, "path": "p.py", "line": 1, "resolved": False}],
+    # Detailing one selected PR bounds the pane by construction, but a single
+    # pathological block (a review with hundreds of long comments) can still blow
+    # the 64KB/entry host cap. It must be trimmed to fit, with the refresh action
+    # and a truncation note surviving, rather than rejected and the pane blanked.
+    many_comments = {
+        "unresolved": 400,
+        "items": [
+            {"author": "a", "body": "x" * 2000, "path": f"p{i}.py", "line": i, "resolved": False} for i in range(400)
+        ],
     }
-    repos = [_repo(name=f"r{i}", repo=f"o/r{i}", pulls=[_rich_pull(comments=big_comment)]) for i in range(40)]
+    repos = [_repo(name=f"r{i}", repo=f"o/r{i}", pulls=[_rich_pull(comments=many_comments)]) for i in range(4)]
     pane = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos))))
     blocks = pane["payload"]["blocks"]
     assert len(json.dumps(blocks)) <= uistate._PANE_BUDGET + 200  # under cap (+ truncation note slack)
-    assert blocks[0] == {"kind": "heading", "text": "GitHub"}
     assert blocks[-1]["method"] == "github.refresh"
     assert any(b.get("text", "").startswith("more not shown") for b in blocks)
 
@@ -610,44 +771,54 @@ def test_conflict_chip_is_ungated_by_categories():
     assert "triangle-alert" in _badge_icons_with(repos, frozenset())
 
 
-def test_conflict_renders_a_pane_merge_row():
+def _callout(repos):
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos))))["payload"]["blocks"]
+    return next(b for b in blocks if b.get("kind") == "callout")
+
+
+def test_conflict_becomes_the_pane_verdict():
+    # A conflict is a hard blocker no reviewer can clear, so it outranks the
+    # changes-requested decision in the verdict.
     pull = _rich_pull(review="changes-requested", merge_state="conflicts")
-    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
-        "blocks"
-    ]
-    merge_row = next(b for b in blocks if b.get("kind") == "row" and b.get("label") == "Merge")
-    assert merge_row["value"] == "conflicts with base branch"
-    assert merge_row["tone"] == "danger"
+    pull["base"] = "main"
+    callout = _callout([_repo(pulls=[pull])])
+    assert callout["title"] == "Conflicts with base"
+    assert callout["detail"] == "This branch conflicts with main."
+    assert callout["tone"] == "danger"
 
 
-def test_clean_pr_has_no_conflict_chip_or_row():
+def test_clean_pr_has_no_conflict_chip_and_reads_ready():
     pull = _rich_pull(review="approved", merge_state=None)
     repos = [_repo(pulls=[pull])]
     assert "triangle-alert" not in _badge_icons_with(repos, frozenset({"review", "ci", "comments"}))
-    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos))))["payload"]["blocks"]
-    assert not [b for b in blocks if b.get("kind") == "row" and b.get("label") == "Merge"]
+    callout = _callout(repos)
+    assert callout["title"] == "Ready to merge"
+    assert callout["tone"] == "success"
+    # Read-only: the primary affordance links out to GitHub rather than merging.
+    action = callout["actions"][0]
+    assert action["variant"] == "primary"
+    assert action["href"] == "https://github.com/o/r/pull/5"
+    assert "disabled" not in action
 
 
-def test_draft_conflict_asymmetry_quiet_badge_visible_pane_row():
+def test_draft_conflict_asymmetry_quiet_badge_visible_pane_verdict():
     # A draft keeps the established asymmetry: the session badge stays draft-only
-    # (WIP, no conflict chip), but the pane still surfaces the conflict row so a
-    # user who opens the pane sees it.
+    # (WIP, no conflict chip), but the pane still says the branch is blocked.
     pull = _rich_pull(draft=True, merge_state="conflicts")
     repos = [_repo(pulls=[pull])]
-    icons = _badge_icons_with(repos, frozenset({"review", "ci", "comments"}))
-    assert icons == ["git-pull-request-draft"]
-    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos))))["payload"]["blocks"]
-    merge_row = next(b for b in blocks if b.get("kind") == "row" and b.get("label") == "Merge")
-    assert merge_row["tone"] == "danger"
+    assert _badge_icons_with(repos, frozenset({"review", "ci", "comments"})) == ["git-pull-request-draft"]
+    # Draft is the more actionable thing to say: open it before worrying about the
+    # conflict, and the conflict signal still rides the selector row's glyph strip.
+    callout = _callout(repos)
+    assert callout["title"] == "Draft"
+    row = _rows(_pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos))))["payload"]["blocks"])[0]
+    assert any(b.get("icon") == "triangle-alert" for b in row["badges"])
 
 
-def test_merged_pr_suppresses_conflict_row():
+def test_merged_pr_verdict_replaces_the_conflict_signal():
     # Merged PRs suppress all live detail, including a stale conflict signal.
     pull = _rich_pull(state="MERGED", merged=True, merge_state="conflicts")
-    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
-        "blocks"
-    ]
-    assert not [b for b in blocks if b.get("kind") == "row" and b.get("label") == "Merge"]
+    assert _callout([_repo(pulls=[pull])])["title"] == "Merged"
 
 
 def test_column_is_empty_when_no_prs_to_clear_stale_state():

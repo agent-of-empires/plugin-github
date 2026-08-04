@@ -354,6 +354,80 @@ def test_pr_less_session_removes_row_column_not_empty_set(monkeypatch):
     assert any(m["method"] == "ui.state.remove" for m in columns), "empty row-column should clear via ui.state.remove"
 
 
+def _two_pr_snapshot():
+    def pull(number, review):
+        return {
+            "number": number,
+            "url": f"https://github.com/o/r/pull/{number}",
+            "title": f"T{number}",
+            "state": "OPEN",
+            "draft": False,
+            "merged": False,
+            "review_state": review,
+            "comments": {"unresolved": 0, "items": []},
+        }
+
+    return {
+        "sessions": [
+            {
+                "session_id": "s1",
+                "repos": [
+                    {"name": "r", "repo": "o/r", "branch": "b", "pulls": [pull(1, "approved"), pull(2, "waiting")]}
+                ],
+            }
+        ],
+        "auth": {"present": True},
+    }
+
+
+def _pane_callout(messages):
+    pane = [m for m in messages if m["params"].get("slot") == "pane"][-1]
+    return next(b for b in pane["params"]["payload"]["blocks"] if b.get("kind") == "callout")
+
+
+def test_select_pr_repaints_from_cache_without_a_network_refresh(monkeypatch):
+    # Picking a PR only changes which one the pane details, so it must repaint from
+    # the snapshot already on screen: a refresh here would spend GitHub quota on
+    # every click, and the click's spinner only needs the UI revision to move.
+    sent: list = []
+    rt = main.Runtime(send=sent.append)
+    rt.call_host = lambda *_a, **_kw: {"value": True}
+    monkeypatch.setattr(main.refresh, "build_snapshot", lambda _sessions, **_k: _two_pr_snapshot())
+    rt.run_refresh(sessions=[{"id": "s1"}], force=True)
+    # Default selection is the most-actionable PR (awaiting review beats approved).
+    assert _pane_callout(sent)["title"] == "Awaiting review"
+
+    sent.clear()
+    rt.handle_inbound({"method": main.SELECT_PR_METHOD, "params": {"session_id": "s1", "pr": "o/r#1"}})
+
+    assert rt._selected_pr == {"s1": "o/r#1"}
+    assert rt.refresh_due is False, "selecting a PR must not schedule a network refresh"
+    assert _pane_callout(sent)["title"] == "Ready to merge"
+
+
+def test_select_pr_ignores_a_malformed_click_and_acks_it(monkeypatch):
+    sent: list = []
+    rt = main.Runtime(send=sent.append)
+    rt.call_host = lambda *_a, **_kw: {"value": True}
+    monkeypatch.setattr(main.refresh, "build_snapshot", lambda _sessions, **_k: _two_pr_snapshot())
+    rt.run_refresh(sessions=[{"id": "s1"}], force=True)
+    sent.clear()
+
+    for params in (
+        {"session_id": "s1"},
+        {"pr": "o/r#1"},
+        {"session_id": 5, "pr": "o/r#1"},
+        {"session_id": "s1", "pr": ""},
+    ):
+        rt.handle_inbound({"method": main.SELECT_PR_METHOD, "params": params})
+    assert rt._selected_pr == {}
+    assert sent == [], "a malformed selection changes nothing and repaints nothing"
+
+    # The method itself is still a known request, so a host that sends it with an
+    # id gets a result rather than an unknown-method error.
+    assert main.dispatch(main.SELECT_PR_METHOD, {}) == {"accepted": True}
+
+
 # --- instant repaint from a persisted snapshot on restart (#63) ---
 
 
@@ -433,3 +507,27 @@ def test_startup_replays_cached_before_network(monkeypatch):
     monkeypatch.setattr(rt, "run_refresh", lambda *_a, **_kw: order.append("refresh"))
     rt.run()
     assert order == ["replay", "refresh"]
+
+
+def test_select_pr_survives_a_drifted_cached_snapshot(monkeypatch):
+    # handle_inbound wraps only its dispatch call, and run() does not wrap
+    # handle_inbound, so an unguarded raise here would end the main loop and freeze
+    # every session's pane. A drifted cached snapshot (a truthy non-dict `error`,
+    # which the mapper reads with .get) is a reachable source of one.
+    sent: list = []
+    rt = main.Runtime(send=sent.append)
+    rt.call_host = lambda *_a, **_kw: {"value": True}
+    monkeypatch.setattr(main.refresh, "build_snapshot", lambda _sessions, **_k: _two_pr_snapshot())
+    rt.run_refresh(sessions=[{"id": "s1"}], force=True)
+    rt._last_snapshot = {
+        "sessions": [{"session_id": "s1", "repos": [{"name": "r", "repo": "o/r", "error": "not-a-dict"}]}],
+        "auth": {"present": True},
+    }
+    sent.clear()
+
+    rt.handle_inbound({"method": main.SELECT_PR_METHOD, "params": {"session_id": "s1", "pr": "o/r#1"}})
+
+    # The click is absorbed: the selection is still recorded, nothing was pushed,
+    # and crucially no exception escaped to the caller.
+    assert rt._selected_pr == {"s1": "o/r#1"}
+    assert not [m for m in sent if m["method"] == "ui.state.set"]

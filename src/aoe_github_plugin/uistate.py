@@ -24,14 +24,26 @@ sort option plus three pushes per session:
   to their single highest-attention candidate; the pane keeps the per-repo
   breakdown.
 - a ``pane`` (the in-session GitHub tool-window, opened in the right dock by
-  default via ``default_location``) whose payload is a flexible
-  ``{"title", "blocks": [...]}`` block list. Per PR the pane shows a headline
-  row (MERGED in purple, since no semantic tone names that hue), a review-state
-  row, a Checks section listing each CI run, and an unresolved-comments section.
-  These reuse the host's generic block vocabulary (``heading``/``row``/
-  ``section``/``note``/``divider``/``action``) plus one read-only ``comment``
-  block; the host renders the kinds it knows and ignores the rest, so the pane
-  can grow without a lockstep host change.
+  default via ``default_location``) whose payload is a
+  ``{"title", "blocks": [...], "footer"}`` block list. The pane is one-PR-focused:
+  a selector lists every PR in the session (most-actionable first, each row
+  carrying its number, branch/author, and a CI/review/conflict glyph strip), and
+  clicking a row fires ``github.select_pr`` so the detail below it re-points at
+  that PR. The detail is a merge-verdict ``callout``, a Review card (one row per
+  reviewer), a Checks card (count pills, the runs needing attention listed
+  outright, the passes folded into a collapsible group), an unresolved-comments
+  section, a ``columns`` row pairing the diff summary with any linked issues, and
+  an Activity timeline. The footer pins the refresh time and the verdict in a word.
+  These reuse the host's generic block vocabulary (``heading``/``row``/``section``/
+  ``note``/``divider``/``action``/``callout``/``bar``/``columns``) plus one
+  read-only ``comment`` block; the host renders the kinds it knows and ignores the
+  rest, so the pane can grow without a lockstep host change. The block kinds and
+  fields used here need ``api_version >= 12``, which the manifest declares.
+
+The merge verdict is derived here, not fetched: GitHub's ``mergeStateStatus``
+collapses conflicts, policy, CI and review into one enum, so it cannot say which
+one is blocking (see ``graphql.merge_state``, #80). The ladder in
+``_merge_verdict`` orders blockers by who can clear them.
 
 The rich fields (review_state/checks/comments/merged) are present only when the
 worker had a GitHub token; without one the snapshot's ``auth.present`` is
@@ -331,15 +343,94 @@ def _pull_visual(pull: dict[str, Any]) -> tuple[str, str | None, str | None]:
     return _ICON_OPEN, "success", None
 
 
-def _headline_row(repo_name: str, pull: dict[str, Any]) -> dict[str, Any]:
+# The worker method a PR row fires to change which PR the pane details. The host
+# forwards it with the row's ``params``, so one method serves every row.
+SELECT_METHOD = "github.select_pr"
+
+
+def _pull_key(repo: dict[str, Any], pull: dict[str, Any]) -> str:
+    """Stable id for one PR within a session. Round-trips through the selector
+    row's ``params`` and back as the worker's remembered selection, so it has to
+    be derived from the snapshot alone (no index into a list that reorders)."""
+    return f"{repo.get('repo') or repo.get('name') or '?'}#{pull.get('number', '?')}"
+
+
+def _session_pulls(repos: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Every PR in the session as ``(repo, pull)``, most-actionable first.
+
+    Ranked per PR rather than per repo (the pane's selector is a flat list across
+    the workspace), using the same attention ladder the session row uses so the
+    two orders agree. Merged PRs sink below every open one: they are history, not
+    work. Ties keep snapshot order, which keeps the list stable between refreshes.
+    """
+    ranked: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
+    order = 0
+    for repo in repos:
+        for pull in repo.get("pulls") or []:
+            if _is_merged(pull):
+                rank = len(_ATTENTION_VISUAL)
+            else:
+                rank = _ATTENTION_VISUAL[_pull_attention(pull, _ALL_CHIPS)][0]
+            ranked.append((rank, order, repo, pull))
+            order += 1
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [(repo, pull) for _, _, repo, pull in ranked]
+
+
+def _unresolved_count(pull: dict[str, Any]) -> int:
+    comments = pull.get("comments")
+    count = comments.get("unresolved") if isinstance(comments, dict) else 0
+    return count if isinstance(count, int) and not isinstance(count, bool) else 0
+
+
+def _pr_signals(pull: dict[str, Any]) -> list[dict[str, Any]]:
+    """The compact glyph strip on a PR selector row: CI, review, conflicts and an
+    unresolved-comment count. Each entry is tone-colored with the words in its
+    tooltip, so a run of rows is scannable without reading any of them. Empty for
+    the no-token shape, where none of these fields exist."""
+    signals: list[dict[str, Any]] = []
+    checks = pull.get("checks")
+    cstate = checks.get("state") if isinstance(checks, dict) else None
+    if isinstance(cstate, str):
+        icon, tone, label = _CHECK_VISUAL.get(cstate, _CHECK_VISUAL["unknown"])
+        signals.append({"icon": icon, "tone": tone, "tooltip": f"CI {label}"})
+    review = pull.get("review_state")
+    visual = _REVIEW_VISUAL.get(review) if isinstance(review, str) else None
+    if visual is not None:
+        icon, tone, label = visual
+        signals.append({"icon": icon, "tone": tone, "tooltip": label})
+    if pull.get("merge_state") == "conflicts":
+        signals.append({"icon": "triangle-alert", "tone": "danger", "tooltip": "conflicts with base branch"})
+    unresolved = _unresolved_count(pull)
+    if unresolved:
+        signals.append(
+            {"icon": "message-square", "tone": "warn", "text": str(unresolved), "tooltip": f"{unresolved} unresolved"}
+        )
+    return signals
+
+
+def _pr_row(repo: dict[str, Any], pull: dict[str, Any], *, selected: bool) -> dict[str, Any]:
+    """One row of the pane's PR selector: number, title, the branch/author line,
+    and the signal strip. Clicking the row body re-points the pane's detail at that
+    PR; the trailing href stays a separate affordance so selecting never navigates
+    away."""
     icon, tone, color = _pull_visual(pull)
-    prefix = "MERGED" if _is_merged(pull) else "Draft PR" if pull.get("draft") else "PR"
     row: dict[str, Any] = {
         "kind": "row",
-        "label": repo_name,
-        "value": f"{prefix} #{pull.get('number', '?')} {pull.get('title', '')}".rstrip(),
+        "prefix": f"#{pull.get('number', '?')}",
+        "label": pull.get("title") or "",
         "icon": icon,
+        "mono": True,
+        "method": SELECT_METHOD,
+        "params": {"pr": _pull_key(repo, pull)},
+        "selected": selected,
     }
+    sublabel = " · ".join(str(x) for x in (repo.get("branch"), pull.get("author")) if x)
+    if sublabel:
+        row["sublabel"] = sublabel
+    signals = _pr_signals(pull)
+    if signals:
+        row["badges"] = signals
     if tone:
         row["tone"] = tone
     if color:
@@ -349,64 +440,122 @@ def _headline_row(repo_name: str, pull: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
-def _merge_row(merge_state: Any) -> dict[str, Any] | None:
-    """A danger row when the PR conflicts with its base, else ``None``. Exact
-    match on ``conflicts`` so no other/absent value renders a row (#80)."""
-    if merge_state != "conflicts":
+def _check_buckets(checks: Any) -> dict[str, list[dict[str, Any]]] | None:
+    """Split a check summary's runs into the display buckets the pane shows, or
+    ``None`` when there is no check data. ``skipped`` is carved out of the passing
+    set (a skipped run counts as passing for the rollup but is not a real pass), and
+    ``attention`` is the concatenation the pane leaves expanded."""
+    if not isinstance(checks, dict):
         return None
+    runs = [r for r in (checks.get("runs") or []) if isinstance(r, dict)]
+    failing = [r for r in runs if r.get("state") == "failing"]
+    running = [r for r in runs if r.get("state") == "running"]
+    queued = [r for r in runs if r.get("state") == "queued"]
+    unknown = [r for r in runs if r.get("state") == "unknown"]
+    passing = [r for r in runs if r.get("state") == "succeeded" and not r.get("skipped")]
+    skipped = [r for r in runs if r.get("state") == "succeeded" and r.get("skipped")]
     return {
-        "kind": "row",
-        "label": "Merge",
-        "value": "conflicts with base branch",
-        "icon": "triangle-alert",
-        "tone": "danger",
+        "failing": failing,
+        "running": running,
+        "queued": queued,
+        "unknown": unknown,
+        "passing": passing,
+        "skipped": skipped,
+        "attention": failing + running + queued + unknown,
     }
 
 
-def _review_row(review: Any) -> dict[str, Any] | None:
-    if review not in _REVIEW_VISUAL:
-        return None
-    icon, tone, label = _REVIEW_VISUAL[review]
-    return {"kind": "row", "label": "Review", "value": label, "icon": icon, "tone": tone}
+def _check_row(run: dict[str, Any], *, compact: bool) -> dict[str, Any]:
+    """One check row. The expanded (attention) form leads with a state glyph and
+    carries ``workflow · duration`` beneath the name; the ``compact`` form, used
+    inside the folded passing group, drops the glyph (the group header already says
+    they passed) and pins the duration right."""
+    icon, tone, _label = _CHECK_VISUAL.get(run.get("state") or "", _CHECK_VISUAL["unknown"])
+    name = run.get("name") or "check"
+    row: dict[str, Any] = {"kind": "row", "label": name, "mono": True}
+    if run.get("url"):
+        row["href"] = run["url"]
+    if compact:
+        if run.get("duration"):
+            row["value"] = str(run["duration"])
+        return row
+    row["icon"] = icon
+    row["tone"] = tone
+    # Built from parts rather than overwritten: composing the marker onto an
+    # already-set sublabel dropped it whenever the detail was empty, which is
+    # exactly the StatusContext case (no workflow group, no duration) that carries
+    # the external required checks a branch-protection user most wants labelled.
+    # It also shipped `sublabel: ""` where the host expects a value or nothing.
+    parts = [str(x) for x in (run.get("group"), run.get("duration")) if x]
+    if run.get("required") is True:
+        parts.append("required")
+    if parts:
+        row["sublabel"] = " · ".join(parts)
+    return row
+
+
+def _check_count_badges(buckets: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """The count pills in the Checks header, in severity order. Only non-empty
+    buckets appear, so a green PR shows one pill rather than a row of zeros."""
+    pills: list[dict[str, Any]] = []
+    for key, tone, word in (
+        ("failing", "danger", "failing"),
+        ("running", "warn", "running"),
+        ("queued", "neutral", "queued"),
+        ("unknown", "neutral", "unknown"),
+        ("passing", "success", "passing"),
+        ("skipped", "neutral", "skipped"),
+    ):
+        count = len(buckets[key])
+        if count:
+            pills.append({"text": f"{count} {word}", "tone": tone})
+    return pills
 
 
 def _checks_section(checks: Any) -> dict[str, Any] | None:
-    if not isinstance(checks, dict):
+    """The Checks card: count pills in the header, the runs that need attention
+    listed outright, and the passing ones folded into a collapsible group so a
+    twenty-check repo does not bury everything below it. The body scrolls in place
+    rather than pushing the rest of the pane away."""
+    buckets = _check_buckets(checks)
+    if buckets is None:
         return None
-    rollup_icon, rollup_tone, rollup_label = _CHECK_VISUAL.get(checks.get("state") or "", _CHECK_VISUAL["unknown"])
-    runs = checks.get("runs") or []
-    children: list[dict[str, Any]] = []
-    for run in runs[:_MAX_CHECK_ROWS]:
-        icon, tone, label = _CHECK_VISUAL.get(run.get("state") or "", _CHECK_VISUAL["unknown"])
-        child: dict[str, Any] = {
-            "kind": "row",
-            "label": run.get("name") or "check",
-            "value": label,
-            "icon": icon,
-            "tone": tone,
-        }
-        if isinstance(run.get("required"), bool):
-            child["sublabel"] = "required" if run["required"] else "optional"
-        if run.get("url"):
-            child["href"] = run["url"]
-        children.append(child)
-    title = f"Checks: {rollup_label}"
-    if len(runs) > _MAX_CHECK_ROWS:
-        title += f" ({len(runs)} total)"
-    # Icon + tone on the title give an at-a-glance rollup state even when folded.
-    section: dict[str, Any] = {
+    children: list[dict[str, Any]] = [_check_row(run, compact=False) for run in buckets["attention"][:_MAX_CHECK_ROWS]]
+    passing = buckets["passing"]
+    if passing:
+        children.append(
+            {
+                "kind": "section",
+                "title": f"{len(passing)} checks passing" if len(passing) != 1 else "1 check passing",
+                "icon": _CHECK_VISUAL["succeeded"][0],
+                "tone": "success",
+                "collapsible": True,
+                # Folded by default: a pass needs no reading, and the attention
+                # rows above it are the point of the card.
+                "collapsed": True,
+                "children": [_check_row(run, compact=True) for run in passing[:_MAX_CHECK_ROWS]],
+            }
+        )
+    skipped = buckets["skipped"]
+    if skipped:
+        children.append(
+            {
+                "kind": "row",
+                "icon": "circle-slash",
+                "label": f"{len(skipped)} skipped" if len(skipped) != 1 else "1 skipped",
+                "tone": "neutral",
+            }
+        )
+    if not children:
+        return None
+    return {
         "kind": "section",
-        "title": title,
+        "title": "Checks",
+        "badges": _check_count_badges(buckets),
+        "boxed": True,
+        "scroll": True,
         "children": children,
-        "collapsible": True,
-        "icon": rollup_icon,
-        "tone": rollup_tone,
     }
-    # Fold when everything passed; stay open when something needs attention
-    # (failing/running/queued/unknown) so the actionable rows are visible.
-    if checks.get("state") == "succeeded" and all(run.get("state") == "succeeded" for run in runs):
-        section["collapsed"] = True
-    return section
 
 
 def _comment_block(item: dict[str, Any]) -> dict[str, Any]:
@@ -437,100 +586,339 @@ def _comments_section(comments: Any) -> dict[str, Any] | None:
         "title": f"Unresolved comments: {comments['unresolved']}",
         "children": children,
         "collapsible": True,
+        "boxed": True,
+    }
+
+
+def _review_section(pull: dict[str, Any]) -> dict[str, Any] | None:
+    """The Review card: one row per reviewer with their initials and current
+    position, under the summary GitHub itself would show. Falls back to the single
+    aggregate review-state row when per-reviewer data is absent (the no-token shape,
+    or a PR nobody has been asked to review)."""
+    people = [p for p in (pull.get("reviewers") or []) if isinstance(p, dict) and p.get("name")]
+    if not people:
+        state = pull.get("review_state")
+        visual = _REVIEW_VISUAL.get(state) if isinstance(state, str) else None
+        if visual is None:
+            return None
+        icon, tone, label = visual
+        return {
+            "kind": "section",
+            "title": "Review",
+            "value": label,
+            "value_tone": tone,
+            "boxed": True,
+            "children": [{"kind": "row", "label": label, "icon": icon, "tone": tone}],
+        }
+    children: list[dict[str, Any]] = []
+    for person in people:
+        icon, tone, label = _REVIEW_VISUAL.get(person.get("state") or "", _REVIEW_VISUAL["waiting"])
+        children.append(
+            {
+                "kind": "row",
+                "avatar": _initials(str(person["name"])),
+                "label": str(person["name"]),
+                "value": label,
+                "tone": tone,
+                "icon": icon,
+            }
+        )
+    summary = pull.get("review_summary") or ""
+    section: dict[str, Any] = {"kind": "section", "title": "Review", "boxed": True, "children": children}
+    if summary:
+        section["value"] = summary
+        section["value_tone"] = _REVIEW_VISUAL.get(pull.get("review_state") or "", _REVIEW_VISUAL["waiting"])[1]
+    return section
+
+
+def _initials(name: str) -> str:
+    """Up to two initials from a display name, for a reviewer row's avatar bubble.
+    A single-word handle contributes its first character, so every reviewer gets
+    a non-empty bubble."""
+    words = [w for w in name.replace("-", " ").replace("_", " ").split() if w]
+    if not words:
+        return "?"
+    if len(words) == 1:
+        return words[0][:2].upper()
+    return (words[0][0] + words[1][0]).upper()
+
+
+def _context_columns(pull: dict[str, Any]) -> dict[str, Any] | None:
+    """The side-by-side Diff and Linked cards. Either can be absent (no diff stats
+    without a token, no linked issues on most PRs); a lone survivor spans the full
+    width rather than leaving a gap, and with neither the block is omitted."""
+    cards: list[dict[str, Any]] = []
+    diff = pull.get("diff")
+    if isinstance(diff, dict):
+        added = diff.get("added", 0)
+        removed = diff.get("removed", 0)
+        files = diff.get("files", 0)
+        cards.append(
+            {
+                "kind": "section",
+                "title": "Diff",
+                "badges": [
+                    {"text": f"+{added}", "tone": "success"},
+                    {"text": f"-{removed}", "tone": "danger"},
+                ],
+                "boxed": True,
+                "children": [
+                    {
+                        "kind": "bar",
+                        "segments": [
+                            {"value": added, "tone": "success"},
+                            {"value": removed, "tone": "danger"},
+                        ],
+                        "caption": f"{files} files" if files != 1 else "1 file",
+                    }
+                ],
+            }
+        )
+    issues = [i for i in (pull.get("issues") or []) if isinstance(i, dict)]
+    if issues:
+        rows: list[dict[str, Any]] = []
+        for issue in issues:
+            closed = issue.get("state") == "closed"
+            row: dict[str, Any] = {
+                "kind": "row",
+                "prefix": f"#{issue.get('number', '?')}",
+                "label": issue.get("title") or "",
+                "icon": "circle-check" if closed else "circle-dot",
+                "tone": "neutral" if closed else "success",
+                "mono": True,
+            }
+            if issue.get("url"):
+                row["href"] = issue["url"]
+            rows.append(row)
+        cards.append({"kind": "section", "title": "Linked", "boxed": True, "children": rows})
+    if not cards:
+        return None
+    return {"kind": "columns", "children": cards}
+
+
+# Timeline item kind -> (lucide icon, host Tone). An unlisted kind is skipped by
+# the normalizer, so this only needs the kinds it emits.
+_TIMELINE_VISUAL: dict[str, tuple[str, str]] = {
+    "commit": ("arrow-up", "neutral"),
+    "comment": ("message-square", "info"),
+    "review": ("badge-check", "info"),
+    "push": ("triangle-alert", "warn"),
+    "merge": (_ICON_MERGED, "info"),
+}
+# Rows in the Activity card. The query already caps the window; this bounds what
+# a drifted response can push into the pane.
+_MAX_TIMELINE_ROWS = 10
+
+
+def _activity_section(pull: dict[str, Any]) -> dict[str, Any] | None:
+    """The Activity card: recent events, newest first, each with its local
+    wall-clock time. Absent without a token, since the timeline is token-gated."""
+    items = [t for t in (pull.get("timeline") or []) if isinstance(t, dict) and t.get("text")]
+    if not items:
+        return None
+    rows: list[dict[str, Any]] = []
+    for item in items[:_MAX_TIMELINE_ROWS]:
+        icon, tone = _TIMELINE_VISUAL.get(item.get("kind") or "", ("dot", "neutral"))
+        row: dict[str, Any] = {"kind": "row", "label": str(item["text"]), "icon": icon, "tone": tone}
+        at = _format_refreshed_at(item.get("at"))
+        if at:
+            row["value"] = at
+            # The timestamp is a scalar, not a status: keep it dim rather than
+            # inheriting the event's tone.
+            row["value_tone"] = "neutral"
+        rows.append(row)
+    return {"kind": "section", "title": "Activity", "boxed": True, "children": rows}
+
+
+def _failing_names(runs: list[dict[str, Any]]) -> str:
+    """ "X and Y" / "X and 3 others" over check names, for the verdict detail."""
+    names = [str(r.get("name") or "check") for r in runs]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return f"{names[0]} and {len(names) - 1} others"
+
+
+def _verdict(title: str, detail: str, visual: tuple[str, str], short: str, *, ready: bool = False) -> dict[str, Any]:
+    """One rung of the merge ladder. ``visual`` is the ``(icon, tone)`` pair, which
+    the ``_CHECK_VISUAL`` / ``_REVIEW_VISUAL`` tables already hand out."""
+    icon, tone = visual
+    return {"title": title, "detail": detail, "icon": icon, "tone": tone, "short": short, "ready": ready}
+
+
+def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
+    """Whether the selected PR can merge, and why not when it cannot.
+
+    Derived from what the plugin already fetches (conflicts, the review decision,
+    the check rollup, unresolved threads) rather than GitHub's ``mergeStateStatus``,
+    which conflates all of those causes into one enum and so cannot say which one
+    is blocking (the reason #80 left it unselected). ``short`` is the footer's
+    one-word version.
+
+    The rungs are ordered by who can clear the block: a state only the author can
+    change (draft, conflicts) outranks one a reviewer owns, which outranks one CI
+    will resolve on its own. First match wins, so the pane always names the thing
+    to do next rather than the worst thing that is true.
+    """
+    buckets = _check_buckets(pull.get("checks")) or {k: [] for k in ("failing", "running", "queued", "passing")}
+    base = pull.get("base") or "the base branch"
+    failing, in_flight = buckets["failing"], buckets["running"] + buckets["queued"]
+    passing, unresolved = len(buckets["passing"]), _unresolved_count(pull)
+
+    def plural(count: int) -> str:
+        return "check" if count == 1 else "checks"
+
+    ladder: tuple[tuple[bool, dict[str, Any]], ...] = (
+        (
+            _is_merged(pull),
+            _verdict("Merged", f"This PR is merged into {base}.", (_ICON_MERGED, "neutral"), "merged"),
+        ),
+        (
+            bool(pull.get("draft")),
+            _verdict("Draft", "Mark the PR ready for review to merge it.", (_ICON_DRAFT, "warn"), "draft"),
+        ),
+        (
+            pull.get("merge_state") == "conflicts",
+            _verdict(
+                "Conflicts with base",
+                f"This branch conflicts with {base}.",
+                ("triangle-alert", "danger"),
+                "conflicts",
+            ),
+        ),
+        (
+            pull.get("review_state") == "changes-requested",
+            _verdict(
+                "Changes requested",
+                "A reviewer asked for changes before this can merge.",
+                _REVIEW_VISUAL["changes-requested"][:2],
+                "changes requested",
+            ),
+        ),
+        (
+            bool(failing),
+            _verdict(
+                f"{len(failing)} {plural(len(failing))} failing",
+                f"Merging is blocked until {_failing_names(failing)} pass.",
+                _CHECK_VISUAL["failing"][:2],
+                "blocked",
+            ),
+        ),
+        (
+            bool(in_flight),
+            _verdict(
+                f"{len(in_flight)} {plural(len(in_flight))} running",
+                f"Waiting on {_failing_names(in_flight)}.",
+                _CHECK_VISUAL["running"][:2],
+                "in progress",
+            ),
+        ),
+        (
+            bool(unresolved),
+            _verdict(
+                f"{unresolved} unresolved {'comment' if unresolved == 1 else 'comments'}",
+                "Resolve the open review threads before merging.",
+                ("message-square", "warn"),
+                "unresolved",
+            ),
+        ),
+        (
+            pull.get("review_state") == "approved",
+            _verdict(
+                "Ready to merge",
+                f"{passing} checks passing, approved, no conflicts with {base}."
+                if passing
+                else f"Approved, no conflicts with {base}.",
+                _CHECK_VISUAL["succeeded"][:2],
+                "ready",
+                ready=True,
+            ),
+        ),
+    )
+    for matched, verdict in ladder:
+        if matched:
+            return verdict
+    return _verdict(
+        "Awaiting review",
+        f"No approvals yet. No conflicts with {base}.",
+        _REVIEW_VISUAL["waiting"][:2],
+        "awaiting review",
+    )
+
+
+def _merge_callout(pull: dict[str, Any]) -> dict[str, Any]:
+    """The pane's headline verdict card. Its button is deliberately not a merge:
+    this plugin is read-only, so a mergeable PR gets a link out to GitHub and a
+    blocked one gets an inert button naming the block."""
+    verdict = _merge_verdict(pull)
+    if verdict["ready"] and pull.get("url"):
+        action = {
+            "kind": "action",
+            "label": "Merge on GitHub",
+            "variant": "primary",
+            "icon": _ICON_MERGED,
+            "href": pull["url"],
+            "tooltip": "Opens the PR on GitHub; this plugin never merges for you.",
+        }
+    else:
+        action = {"kind": "action", "label": verdict["title"], "disabled": True}
+    return {
+        "kind": "callout",
+        "title": verdict["title"],
+        "detail": verdict["detail"],
+        "icon": verdict["icon"],
+        "tone": verdict["tone"],
+        "actions": [action],
     }
 
 
 def _pull_detail_blocks(pull: dict[str, Any]) -> list[dict[str, Any]]:
-    """Review/CI/comment blocks for one PR. Empty for the basic (no-token) shape,
-    where these fields are absent, so the same code renders either source.
-
-    A merged PR is a terminal state: its headline row already says MERGED, and
-    its review decision / CI rollup / unresolved threads are historical, not
-    actionable, so they are suppressed to avoid presenting a closed PR as live.
-    """
-    if _is_merged(pull):
-        return []
-    candidates = (
-        _merge_row(pull.get("merge_state")),
-        _review_row(pull.get("review_state")),
-        _checks_section(pull.get("checks")),
-        _comments_section(pull.get("comments")),
-    )
-    return [b for b in candidates if b is not None]
-
-
-def _pane_repo_blocks(repo: dict[str, Any]) -> list[dict[str, Any]]:
-    """Blocks for one repo: an error/empty row, or a headline plus detail per PR."""
-    name = repo.get("name") or repo.get("repo") or "repo"
-    branch = repo.get("branch")
-    sublabel = f"{repo['repo']} · {branch}" if repo.get("repo") and branch else repo.get("repo")
-
-    if repo.get("error"):
-        row: dict[str, Any] = {"kind": "row", "label": name, "icon": _ICON_ERROR, "tone": "danger"}
-        row["value"] = str(repo["error"].get("hint", "error")).splitlines()[0]
-        return [row]
-    if not repo.get("repo"):
-        return [{"kind": "row", "label": name, "value": "not a GitHub remote"}]
-
-    pulls = repo.get("pulls") or []
-    if not pulls:
-        empty: dict[str, Any] = {"kind": "row", "label": name, "value": "no open PR"}
-        if sublabel:
-            empty["sublabel"] = sublabel
-        return [empty]
-
-    blocks: list[dict[str, Any]] = []
-    for pull in pulls:
-        head = _headline_row(name, pull)
-        if sublabel:
-            head["sublabel"] = sublabel
-        blocks.append(head)
-        blocks.extend(_pull_detail_blocks(pull))
-    return blocks
-
-
-def _pane_repo_attention_rank(repo: dict[str, Any]) -> int | None:
-    """Rank for actionable repos in the pane. ``None`` means no open PR signal."""
-    if repo.get("error"):
-        return _ATTENTION_VISUAL["error"][0]
-    top = _top_attention_pull(repo, _ALL_CHIPS)
-    if top is None:
-        return None
-    return _ATTENTION_VISUAL[top[1]][0]
-
-
-def _pane_repo_blocks_ordered(repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    indexed = list(enumerate(repos))
-    active: list[tuple[int, int, dict[str, Any]]] = []
-    inactive: list[tuple[int, dict[str, Any]]] = []
-    for index, repo in indexed:
-        rank = _pane_repo_attention_rank(repo)
-        if rank is None:
-            inactive.append((index, repo))
-        else:
-            active.append((rank, index, repo))
-
-    blocks: list[dict[str, Any]] = []
-    for _, _, repo in sorted(active, key=lambda item: (item[0], item[1])):
-        blocks.extend(_pane_repo_blocks(repo))
-
-    inactive_blocks: list[dict[str, Any]] = []
-    for _, repo in inactive:
-        inactive_blocks.extend(_pane_repo_blocks(repo))
-    if inactive_blocks and active and len(repos) > 1:
-        blocks.append(
-            {
-                "kind": "section",
-                "title": f"Repos without open PRs ({len(inactive)})",
-                "children": inactive_blocks,
-                "collapsible": True,
-                "collapsed": True,
-                "tone": "neutral",
-            }
+    """The selected PR's detail stack: verdict, reviewers, checks, diff/linked, and
+    recent activity. A merged PR keeps only its verdict and activity: its review
+    decision and CI rollup are history, not something to act on."""
+    blocks: list[dict[str, Any]] = [_merge_callout(pull)]
+    if not _is_merged(pull):
+        candidates = (
+            _review_section(pull),
+            _checks_section(pull.get("checks")),
+            _comments_section(pull.get("comments")),
+            _context_columns(pull),
         )
-    else:
-        blocks.extend(inactive_blocks)
+        blocks.extend(b for b in candidates if b is not None)
+    activity = _activity_section(pull)
+    if activity is not None:
+        blocks.append(activity)
     return blocks
+
+
+def _repo_status_rows(repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rows for the repos that contribute no PR to the selector: a failed lookup, a
+    non-GitHub checkout, or a clean branch. Grouped and folded when they are only
+    context alongside repos that do have PRs."""
+    rows: list[dict[str, Any]] = []
+    for repo in repos:
+        name = repo.get("name") or repo.get("repo") or "repo"
+        if repo.get("error"):
+            rows.append(
+                {
+                    "kind": "row",
+                    "label": name,
+                    "value": str(repo["error"].get("hint", "error")).splitlines()[0],
+                    "icon": _ICON_ERROR,
+                    "tone": "danger",
+                }
+            )
+        elif not repo.get("repo"):
+            rows.append({"kind": "row", "label": name, "value": "not a GitHub remote"})
+        elif not (repo.get("pulls") or []):
+            row: dict[str, Any] = {"kind": "row", "label": name, "value": "no open PR"}
+            if repo.get("branch"):
+                row["sublabel"] = str(repo["branch"])
+            rows.append(row)
+    return rows
 
 
 # A button the host renders in the pane; clicking it forwards github.refresh to
@@ -595,23 +983,6 @@ def _format_refreshed_at(value: Any) -> str | None:
     return parsed.astimezone().strftime("%H:%M")
 
 
-def _freshness_block(freshness: Any) -> dict[str, Any] | None:
-    """Pane row describing when the displayed GitHub data was last refreshed."""
-    if not isinstance(freshness, dict):
-        return None
-    value = _format_refreshed_at(freshness.get("refreshed_at"))
-    if value is None:
-        return None
-    stale = freshness.get("stale") is True
-    return {
-        "kind": "row",
-        "label": "Last successful refresh" if stale else "Last refreshed",
-        "value": value,
-        "icon": "clock",
-        "tone": "warn" if stale else "neutral",
-    }
-
-
 def _fit_to_budget(
     head: list[dict[str, Any]], middle: list[dict[str, Any]], tail: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -634,14 +1005,37 @@ def _fit_to_budget(
     return head + kept + tail
 
 
+def _resolve_selection(
+    pulls: list[tuple[dict[str, Any], dict[str, Any]]], selected_key: Any
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """The ``(repo, pull)`` the pane details. The user's remembered choice when it
+    is still in the snapshot, else the most-actionable PR: a selection must never
+    survive the PR it named being merged, closed or renamed out of the list."""
+    if not pulls:
+        return None
+    if isinstance(selected_key, str):
+        for repo, pull in pulls:
+            if _pull_key(repo, pull) == selected_key:
+                return repo, pull
+    return pulls[0]
+
+
 def _pane_blocks(
-    repos: list[dict[str, Any]], *, auth_present: bool, freshness: Any = None, rate_limit: Any = None
+    repos: list[dict[str, Any]],
+    *,
+    auth_present: bool,
+    rate_limit: Any = None,
+    selected_key: Any = None,
 ) -> list[dict[str, Any]]:
-    head: list[dict[str, Any]] = [{"kind": "heading", "text": "GitHub"}]
+    """The pane's block list: a PR selector across the workspace, then the selected
+    PR's detail, then whatever repos contribute no PR. No leading heading block: the
+    dock tab (and the TUI overlay's own heading) already names the pane, so one here
+    only repeated it."""
+    head: list[dict[str, Any]] = []
     has_github_repo = any(repo.get("repo") for repo in repos)
-    # Surface an active rate-limit right under the heading, on background refreshes
-    # too (#62): the pane, not just a forced-refresh toast, explains why the data
-    # is stale. Only when there is a GitHub repo whose data the limit affects.
+    # Surface an active rate-limit at the top, on background refreshes too (#62):
+    # the pane, not just a forced-refresh toast, explains why the data is stale.
+    # Only when there is a GitHub repo whose data the limit affects.
     if has_github_repo:
         note = _rate_limit_note(rate_limit)
         if note is not None:
@@ -649,20 +1043,70 @@ def _pane_blocks(
     # Only nag when there is actually a GitHub repo whose detail the token gates.
     if not auth_present and has_github_repo:
         head.append(dict(_TOKEN_NOTE))
-    tail = [{"kind": "divider"}]
-    freshness_row = _freshness_block(freshness)
-    if freshness_row is not None:
-        tail.append(freshness_row)
-    tail.append(dict(_REFRESH_ACTION))
+    tail = [{"kind": "divider"}, dict(_REFRESH_ACTION)]
+
     if not repos:
-        middle = [{"kind": "note", "text": "no repos in this workspace", "tone": "neutral"}]
-    else:
-        middle = _pane_repo_blocks_ordered(repos)
+        return _fit_to_budget(head, [{"kind": "note", "text": "no repos in this workspace", "tone": "neutral"}], tail)
+
+    pulls = _session_pulls(repos)
+    middle: list[dict[str, Any]] = []
+    selection = _resolve_selection(pulls, selected_key)
+    if selection is not None:
+        chosen_key = _pull_key(*selection)
+        # The selector renders even for a single PR: it is the pane's title for the
+        # detail below it, and it carries the signal strip and the link out.
+        middle.append(
+            {
+                "kind": "section",
+                "children": [_pr_row(repo, pull, selected=_pull_key(repo, pull) == chosen_key) for repo, pull in pulls],
+            }
+        )
+        middle.extend(_pull_detail_blocks(selection[1]))
+
+    status_rows = _repo_status_rows(repos)
+    if status_rows:
+        # Folded away when there is real work above them; shown outright when they
+        # are all there is to say about the workspace.
+        if selection is not None and len(repos) > 1:
+            middle.append(
+                {
+                    "kind": "section",
+                    "title": f"Other repos ({len(status_rows)})",
+                    "children": status_rows,
+                    "collapsible": True,
+                    "collapsed": True,
+                    "tone": "neutral",
+                }
+            )
+        else:
+            middle.extend(status_rows)
     return _fit_to_budget(head, middle, tail)
 
 
+def _pane_footer(freshness: Any, selection: tuple[dict[str, Any], dict[str, Any]] | None) -> dict[str, Any] | None:
+    """The pane's pinned status line: when the data was last refreshed, and the
+    selected PR's verdict in a word. ``None`` when neither half is known, so the
+    host renders no empty bar."""
+    footer: dict[str, Any] = {}
+    if isinstance(freshness, dict):
+        at = _format_refreshed_at(freshness.get("refreshed_at"))
+        if at is not None:
+            stale = freshness.get("stale") is True
+            footer["text"] = f"last good refresh {at}" if stale else f"refreshed {at}"
+            footer["icon"] = "clock" if stale else "refresh-cw"
+    if selection is not None:
+        verdict = _merge_verdict(selection[1])
+        footer["value"] = verdict["short"]
+        footer["tone"] = verdict["tone"]
+    return footer or None
+
+
 def snapshot_ui_state_params(
-    snapshot: dict[str, Any], *, chips_on: frozenset[str] = _ALL_CHIPS, show_column: bool = True
+    snapshot: dict[str, Any],
+    *,
+    chips_on: frozenset[str] = _ALL_CHIPS,
+    show_column: bool = True,
+    selected: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """``ui.state.set`` params for a refresh snapshot: per session, a ``row-badge``
     (a chip sequence per PR), a ``row-column`` (the status summary), and a ``pane``
@@ -712,23 +1156,30 @@ def snapshot_ui_state_params(
                 "payload": status_payload,
             }
         )
+        selected_key = (selected or {}).get(sid)
+        pane_payload: dict[str, Any] = {
+            "title": "GitHub",
+            "default_location": PANE_DEFAULT_LOCATION,
+            # No per-pane icon: the manifest's icon_asset (the real GitHub logo)
+            # wins unconditionally in the activity bar and dock tab, falling back
+            # to the manifest icon (git-branch) below that. A per-pane icon here
+            # would only ever shadow both.
+            "blocks": _pane_blocks(
+                repos,
+                auth_present=auth_present,
+                rate_limit=rate_limit,
+                selected_key=selected_key,
+            ),
+        }
+        footer = _pane_footer(session.get("freshness"), _resolve_selection(_session_pulls(repos), selected_key))
+        if footer is not None:
+            pane_payload["footer"] = footer
         params.append(
             {
                 "slot": PANE_SLOT[0],
                 "id": PANE_SLOT[1],
                 "session_id": sid,
-                "payload": {
-                    "title": "GitHub",
-                    "default_location": PANE_DEFAULT_LOCATION,
-                    # No per-pane icon: the manifest's icon_asset (the real
-                    # GitHub logo) wins unconditionally in the activity bar
-                    # and dock tab, falling back to the manifest icon
-                    # (git-branch) below that. A per-pane icon here would
-                    # only ever shadow both.
-                    "blocks": _pane_blocks(
-                        repos, auth_present=auth_present, freshness=session.get("freshness"), rate_limit=rate_limit
-                    ),
-                },
+                "payload": pane_payload,
             }
         )
     return params
