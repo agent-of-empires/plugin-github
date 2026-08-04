@@ -295,7 +295,15 @@ class Runtime:
             return
         self._selected_pr[sid] = key
         if self._last_snapshot is not None:
-            self._push_snapshot(self._last_snapshot)
+            # Fail-soft like the other two push sites. ``handle_inbound`` wraps only
+            # its ``dispatch`` call, so this runs unguarded and a raise would reach
+            # the equally unguarded ``handle_inbound`` call in ``run``, ending the
+            # main loop: one bad click would freeze every session's pane until the
+            # daemon restarted the worker. The mapper is total against absent
+            # fields, not wrongly typed ones, and ``_last_snapshot`` can hold a
+            # drifted shape replayed from the on-disk cache.
+            with contextlib.suppress(Exception):
+                self._push_snapshot(self._last_snapshot)
 
     def list_sessions(self, timeout: float = HOST_RPC_TIMEOUT) -> list[dict[str, Any]] | None:
         """Active session list, or ``None`` if the host did not answer with one.

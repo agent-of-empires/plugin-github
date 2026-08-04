@@ -507,3 +507,27 @@ def test_startup_replays_cached_before_network(monkeypatch):
     monkeypatch.setattr(rt, "run_refresh", lambda *_a, **_kw: order.append("refresh"))
     rt.run()
     assert order == ["replay", "refresh"]
+
+
+def test_select_pr_survives_a_drifted_cached_snapshot(monkeypatch):
+    # handle_inbound wraps only its dispatch call, and run() does not wrap
+    # handle_inbound, so an unguarded raise here would end the main loop and freeze
+    # every session's pane. A drifted cached snapshot (a truthy non-dict `error`,
+    # which the mapper reads with .get) is a reachable source of one.
+    sent: list = []
+    rt = main.Runtime(send=sent.append)
+    rt.call_host = lambda *_a, **_kw: {"value": True}
+    monkeypatch.setattr(main.refresh, "build_snapshot", lambda _sessions, **_k: _two_pr_snapshot())
+    rt.run_refresh(sessions=[{"id": "s1"}], force=True)
+    rt._last_snapshot = {
+        "sessions": [{"session_id": "s1", "repos": [{"name": "r", "repo": "o/r", "error": "not-a-dict"}]}],
+        "auth": {"present": True},
+    }
+    sent.clear()
+
+    rt.handle_inbound({"method": main.SELECT_PR_METHOD, "params": {"session_id": "s1", "pr": "o/r#1"}})
+
+    # The click is absorbed: the selection is still recorded, nothing was pushed,
+    # and crucially no exception escaped to the caller.
+    assert rt._selected_pr == {"s1": "o/r#1"}
+    assert not [m for m in sent if m["method"] == "ui.state.set"]
