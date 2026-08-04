@@ -69,6 +69,9 @@ IGNORE_SUBMODULES_SETTING_KEY = "ignore_submodules"
 # Toggle for the CI rollup semantics. Defaults off so existing row attention
 # keeps treating every failing check as actionable unless the user opts in.
 REQUIRED_CHECKS_SETTING_KEY = "ci_required_checks_only"
+# The pane's PR selector fires this with the clicked row's `params` (`{"pr": key}`);
+# `uistate.SELECT_METHOD` is the same name on the block-building side.
+SELECT_PR_METHOD = uistate.SELECT_METHOD
 # Default NETWORK poll interval. Sized so worst-case (every key changes every
 # tick, so each spends a REST + a GraphQL query) stays well under the user's
 # shared 5000/hr budgets: at 120s a 20-key workspace tops out around 600 REST
@@ -128,6 +131,8 @@ def dispatch(method: str, params: dict[str, Any]) -> Any:
         return handlers.github_open(_checkout_path(params))
     if method == "github.refresh":
         return {"accepted": True}
+    if method == SELECT_PR_METHOD:
+        return {"accepted": True}
     raise LookupError(method)
 
 
@@ -186,6 +191,16 @@ class Runtime:
         # Session ids we last pushed UI state for, so a vanished session's
         # row-badge + pane can be removed (ui.state.remove) rather than linger.
         self.pushed_session_ids: set[str] = set()
+        # Which PR each session's pane is detailing, keyed by session id. Set by a
+        # `github.select_pr` click, and only ever a hint: uistate falls back to the
+        # most-actionable PR when the remembered one is no longer in the snapshot,
+        # so a merged or closed PR cannot strand the pane on a dead selection.
+        # Deliberately in-memory: a stale choice is worth less than the confusion
+        # of a restart reopening a PR the user has since moved past.
+        self._selected_pr: dict[str, str] = {}
+        # The most recent snapshot pushed, so a selection click can repaint without
+        # a network round trip. None until the first push (cached replay or refresh).
+        self._last_snapshot: dict[str, Any] | None = None
         # Loop state, initialized in run(): the session-id set seen by the fast
         # tick, the resolved poll interval, and the next-fire monotonic deadlines.
         self._seen_ids: set[str] = set()
@@ -263,6 +278,24 @@ class Runtime:
             sid = params.get("session_id")
             self._refresh_target = sid if isinstance(sid, str) else None
             self.refresh_due = True
+        elif method == SELECT_PR_METHOD:
+            self._select_pr(params)
+
+    def _select_pr(self, params: dict[str, Any]) -> None:
+        """Point one session's pane at a different PR and repaint from cache.
+
+        No network: the snapshot already holds every PR in the session, so this only
+        changes which one the pane details. Repainting from the cached snapshot is
+        also what keeps the host's UI revision moving, which is how the clicked row
+        stops spinning; a refresh here would make picking a PR cost GitHub quota.
+        """
+        sid = params.get("session_id")
+        key = params.get("pr")
+        if not isinstance(sid, str) or not isinstance(key, str) or not key:
+            return
+        self._selected_pr[sid] = key
+        if self._last_snapshot is not None:
+            self._push_snapshot(self._last_snapshot)
 
     def list_sessions(self, timeout: float = HOST_RPC_TIMEOUT) -> list[dict[str, Any]] | None:
         """Active session list, or ``None`` if the host did not answer with one.
@@ -303,9 +336,15 @@ class Runtime:
         """Emit ``ui.state.set`` for every session in the snapshot and return the
         set of session ids pushed. Shared by the live refresh and the startup
         replay so both render through the same offline-pure UI mapping."""
+        # Kept so a PR selection can repaint from what is already on screen without
+        # spending GitHub quota (see _select_pr).
+        self._last_snapshot = snapshot
         current_ids: set[str] = set()
         for params in uistate.snapshot_ui_state_params(
-            snapshot, chips_on=self._chip_flags, show_column=self._show_status_text
+            snapshot,
+            chips_on=self._chip_flags,
+            show_column=self._show_status_text,
+            selected=self._selected_pr,
         ):
             sid = params.get("session_id")
             if isinstance(sid, str):

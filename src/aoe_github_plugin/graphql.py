@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from datetime import datetime
+from datetime import timezone
 
 # The per-PR node selection, shared by every aliased ``pullRequests`` field in a
 # batched query (#25). Kept as a fragment so only the top-level aliases and their
@@ -40,6 +42,8 @@ _PR_CONNECTION_FRAGMENT = """
 fragment PRConnection on PullRequestConnection {
   nodes {
     id number title url state isDraft merged mergeable reviewDecision updatedAt headRefOid
+    baseRefName additions deletions changedFiles
+    author { login }
     baseRef { branchProtectionRule {
       requiresStatusChecks
       requiredStatusCheckContexts
@@ -49,11 +53,39 @@ fragment PRConnection on PullRequestConnection {
       __typename
       ... on CheckRun {
         name status conclusion detailsUrl startedAt completedAt
-        checkSuite { app { databaseId slug name } }
+        checkSuite {
+          app { databaseId slug name }
+          # The workflow name is the group a check belongs to ("Lint", "CodeQL"),
+          # which is what a reader scans by; `app.name` is "GitHub Actions" for
+          # every Actions check and so groups nothing. Plain object fields, not
+          # connections, so they add no GraphQL points.
+          workflowRun { workflow { name } }
+        }
       }
       ... on StatusContext { context state targetUrl createdAt }
     } } } } } }
     reviews(last: 1, states: [COMMENTED]) { nodes { state } }
+    latestReviews(first: 20) { nodes { state author { login } } }
+    reviewRequests(first: 20) { nodes { requestedReviewer {
+      __typename
+      ... on User { login }
+      ... on Team { name }
+    } } }
+    closingIssuesReferences(first: 5) { nodes { number title url state } }
+    timelineItems(last: 10, itemTypes: [
+      PULL_REQUEST_COMMIT, PULL_REQUEST_REVIEW, ISSUE_COMMENT,
+      HEAD_REF_FORCE_PUSHED_EVENT, REVIEW_REQUESTED_EVENT, MERGED_EVENT
+    ]) { nodes {
+      __typename
+      ... on PullRequestCommit { commit {
+        abbreviatedOid committedDate messageHeadline author { user { login } name }
+      } }
+      ... on PullRequestReview { state createdAt author { login } }
+      ... on IssueComment { createdAt author { login } }
+      ... on HeadRefForcePushedEvent { createdAt actor { login } }
+      ... on ReviewRequestedEvent { createdAt actor { login } }
+      ... on MergedEvent { createdAt actor { login } }
+    } }
     reviewThreads(first: 100) {
       totalCount
       pageInfo { hasNextPage endCursor }
@@ -290,6 +322,32 @@ def _context_state(ctx: dict[str, Any]) -> str:
     return _STATUS_STATE.get(ctx.get("state") or "", "unknown")
 
 
+def _parse_iso(value: Any) -> datetime | None:
+    """An ISO 8601 GraphQL timestamp to an aware ``datetime``, or ``None`` for
+    anything unparseable. Total, so a drifted field degrades a display detail."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _run_duration(started: Any, completed: Any) -> str | None:
+    """A check run's wall time as ``"6m 40s"`` / ``"48s"``, or ``None`` when either
+    endpoint is missing (a still-running check) or the pair is inverted."""
+    start = _parse_iso(started)
+    end = _parse_iso(completed)
+    if start is None or end is None:
+        return None
+    seconds = int((end - start).total_seconds())
+    if seconds < 0:
+        return None
+    minutes, secs = divmod(seconds, 60)
+    return f"{minutes}m {secs:02d}s" if minutes else f"{secs}s"
+
+
 def _app_key(app: Any) -> str | None:
     if not isinstance(app, dict):
         return None
@@ -300,6 +358,17 @@ def _app_key(app: Any) -> str | None:
         if isinstance(value, int):
             return str(value)
     return None
+
+
+def _workflow_name(suite: Any) -> str | None:
+    """The workflow a check run belongs to, used as its display group. ``None`` for
+    a non-Actions check (a StatusContext, an external app) which has no workflow."""
+    if not isinstance(suite, dict):
+        return None
+    run = suite.get("workflowRun")
+    workflow = run.get("workflow") if isinstance(run, dict) else None
+    name = workflow.get("name") if isinstance(workflow, dict) else None
+    return name if isinstance(name, str) and name else None
 
 
 def _branch_protection_rule(pr: dict[str, Any]) -> dict[str, Any] | None:
@@ -385,6 +454,42 @@ def _mark_required_runs(runs: list[dict[str, Any]], required: list[Requirement])
         run["required"] = any(_matches_requirement(run, requirement) for requirement in required)
 
 
+def _context_run(ctx: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """One check context (a `CheckRun` or a `StatusContext`) as a display run plus
+    the timestamp same-name runs are deduped by. A StatusContext is the sparse
+    case: it has no suite, so no app, workflow group, duration or skipped flag."""
+    if ctx.get("__typename") != "CheckRun":
+        return (
+            {
+                "name": ctx.get("context") or "check",
+                "state": _context_state(ctx),
+                "url": ctx.get("targetUrl"),
+            },
+            ctx.get("createdAt") or "",
+        )
+    suite = ctx.get("checkSuite")
+    run: dict[str, Any] = {
+        "name": ctx.get("name") or "check",
+        "state": _context_state(ctx),
+        "url": ctx.get("detailsUrl"),
+    }
+    app = _app_key(suite.get("app") if isinstance(suite, dict) else None)
+    if app is not None:
+        run["app"] = app
+    # A skipped run still reads as ``succeeded`` in the rollup (it does not block a
+    # merge), but the pane lists it apart from real passes. Kept as a separate
+    # display flag rather than a state so the rollup and attention math stay put.
+    if ctx.get("conclusion") == "SKIPPED":
+        run["skipped"] = True
+    duration = _run_duration(ctx.get("startedAt"), ctx.get("completedAt"))
+    if duration is not None:
+        run["duration"] = duration
+    group = _workflow_name(suite)
+    if group is not None:
+        run["group"] = group
+    return run, ctx.get("completedAt") or ctx.get("startedAt") or ""
+
+
 def check_summary(pr: dict[str, Any], *, required_checks_only: bool = False) -> dict[str, Any] | None:
     """``{"state", "runs": [{name, state, url}]}`` for the PR head commit, or
     ``None`` when the head commit has no checks configured."""
@@ -401,20 +506,8 @@ def check_summary(pr: dict[str, Any], *, required_checks_only: bool = False) -> 
     latest: dict[tuple[str, str], dict[str, Any]] = {}
     ts: dict[tuple[str, str], str] = {}
     for ctx in _nodes(rollup, "contexts"):
-        run: dict[str, Any]
-        if ctx.get("__typename") == "CheckRun":
-            name = ctx.get("name") or "check"
-            when = ctx.get("completedAt") or ctx.get("startedAt") or ""
-            suite = ctx.get("checkSuite")
-            app = _app_key(suite.get("app") if isinstance(suite, dict) else None)
-            run = {"name": name, "state": _context_state(ctx), "url": ctx.get("detailsUrl")}
-            if app is not None:
-                run["app"] = app
-        else:
-            name = ctx.get("context") or "check"
-            when = ctx.get("createdAt") or ""
-            run = {"name": name, "state": _context_state(ctx), "url": ctx.get("targetUrl")}
-        key = (name, run.get("app") or "")
+        run, when = _context_run(ctx)
+        key = (run["name"], run.get("app") or "")
         if key not in latest:
             latest[key] = run
             ts[key] = when
@@ -459,7 +552,180 @@ def comment_summary(pr: dict[str, Any]) -> dict[str, Any]:
     return {"unresolved": len(items), "items": items}
 
 
+# Per-reviewer review state -> our vocabulary. PENDING is a review the author has
+# started but not submitted, which is not a signal about this PR, so it reads the
+# same as no review at all.
+_REVIEW_NODE_STATE = {
+    "APPROVED": "approved",
+    "CHANGES_REQUESTED": "changes-requested",
+    "COMMENTED": "commented",
+    "DISMISSED": "pending",
+    "PENDING": "pending",
+}
+
+
+def _reviewer_name(reviewer: Any) -> str | None:
+    """A requested reviewer's display handle: a user's login or a team's name."""
+    if not isinstance(reviewer, dict):
+        return None
+    for key in ("login", "name"):
+        value = reviewer.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def reviewers(pr: dict[str, Any]) -> list[dict[str, str]]:
+    """One entry per person whose opinion this PR is waiting on or has:
+    ``[{"name", "state"}]`` where state is ``approved`` / ``changes-requested`` /
+    ``commented`` / ``pending``.
+
+    ``latestReviews`` already collapses a reviewer's history to their current
+    position, so it needs no de-duplication of its own; outstanding
+    ``reviewRequests`` are appended as ``pending``. A reviewer who has both (a
+    re-request after a review) keeps their submitted state, since that is the
+    position still on record. Total: malformed nodes are skipped, never raised.
+    """
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for node in _nodes(pr, "latestReviews"):
+        name = _reviewer_name(node.get("author"))
+        if name is None or name in seen:
+            continue
+        seen.add(name)
+        out.append({"name": name, "state": _REVIEW_NODE_STATE.get(node.get("state") or "", "pending")})
+    for node in _nodes(pr, "reviewRequests"):
+        name = _reviewer_name(node.get("requestedReviewer"))
+        if name is None or name in seen:
+            continue
+        seen.add(name)
+        out.append({"name": name, "state": "pending"})
+    return out
+
+
+def review_summary(people: list[dict[str, str]]) -> str:
+    """The one-line headline over a reviewer list, matching how GitHub reads it:
+    a blocking "changes requested" wins, then an approval count, then how many are
+    still outstanding. Empty for no reviewers, so the caller can omit the line."""
+    if not people:
+        return ""
+    if any(p["state"] == "changes-requested" for p in people):
+        return "changes requested"
+    approved = sum(1 for p in people if p["state"] == "approved")
+    if approved == len(people):
+        return f"{approved} approved" if approved != 1 else "1 approved"
+    if approved:
+        return f"{approved} of {len(people)} approved"
+    return f"{len(people)} pending"
+
+
+def diff_summary(pr: dict[str, Any]) -> dict[str, int] | None:
+    """``{"added", "removed", "files"}`` for the PR, or ``None`` when GitHub did
+    not report them (the no-token REST shape, or a drifted response)."""
+    values: dict[str, int] = {}
+    for key, field in (("added", "additions"), ("removed", "deletions"), ("files", "changedFiles")):
+        value = pr.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        values[key] = value
+    return values
+
+
+def linked_issues(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    """Issues this PR closes on merge, from GitHub's own resolution of the
+    ``Closes #n`` links in the body. Entries without a number are skipped."""
+    out: list[dict[str, Any]] = []
+    for node in _nodes(pr, "closingIssuesReferences"):
+        number = node.get("number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            continue
+        out.append(
+            {
+                "number": number,
+                "title": node.get("title") or "",
+                "url": node.get("url"),
+                # OPEN / CLOSED, so a linked issue already closed reads differently.
+                "state": (node.get("state") or "").lower() or None,
+            }
+        )
+    return out
+
+
+def _actor_login(node: Any, key: str) -> str:
+    holder = node.get(key) if isinstance(node, dict) else None
+    login = holder.get("login") if isinstance(holder, dict) else None
+    return login if isinstance(login, str) else ""
+
+
+def _commit_timeline_item(node: dict[str, Any]) -> dict[str, Any] | None:
+    commit = node.get("commit")
+    if not isinstance(commit, dict):
+        return None
+    raw_author = commit.get("author")
+    author: dict[str, Any] = raw_author if isinstance(raw_author, dict) else {}
+    raw_user = author.get("user")
+    user: dict[str, Any] = raw_user if isinstance(raw_user, dict) else {}
+    # A commit author is a git identity: the GitHub login when the email matches an
+    # account, else the raw name from the commit itself.
+    who = user.get("login") or author.get("name") or ""
+    oid = commit.get("abbreviatedOid") or ""
+    headline = commit.get("messageHeadline") or ""
+    text = f"{who} pushed {oid}".strip() if oid else f"{who} pushed a commit".strip()
+    return {
+        "kind": "commit",
+        "text": f"{text}: {headline}" if headline else text,
+        "at": commit.get("committedDate"),
+    }
+
+
+# One timeline node type -> (our kind, a template over the actor login). The
+# review branch is special-cased below because its wording depends on the state.
+_TIMELINE_TEXT = {
+    "IssueComment": ("comment", "{who} commented"),
+    "HeadRefForcePushedEvent": ("push", "{who} force-pushed"),
+    "ReviewRequestedEvent": ("review", "{who} requested a review"),
+    "MergedEvent": ("merge", "{who} merged this"),
+}
+
+_REVIEW_EVENT_TEXT = {
+    "APPROVED": "{who} approved",
+    "CHANGES_REQUESTED": "{who} requested changes",
+    "DISMISSED": "{who}'s review was dismissed",
+}
+
+
+def timeline(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    """Recent activity on the PR, newest first: ``[{"kind", "text", "at"}]``.
+
+    ``timelineItems`` returns oldest-first within the requested window, so the
+    list is reversed for display. A node whose type carries no wording here (a
+    newly added item type, a drifted shape) is skipped rather than rendered blank.
+    """
+    out: list[dict[str, Any]] = []
+    for node in _nodes(pr, "timelineItems"):
+        kind_name = node.get("__typename")
+        if kind_name == "PullRequestCommit":
+            item = _commit_timeline_item(node)
+            if item is not None:
+                out.append(item)
+            continue
+        if kind_name == "PullRequestReview":
+            who = _actor_login(node, "author")
+            template = _REVIEW_EVENT_TEXT.get(node.get("state") or "", "{who} reviewed")
+            out.append({"kind": "review", "text": template.format(who=who).strip(), "at": node.get("createdAt")})
+            continue
+        entry = _TIMELINE_TEXT.get(kind_name or "")
+        if entry is None:
+            continue
+        kind, template = entry
+        who = _actor_login(node, "author") or _actor_login(node, "actor")
+        out.append({"kind": kind, "text": template.format(who=who).strip(), "at": node.get("createdAt")})
+    out.reverse()
+    return out
+
+
 def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -> dict[str, Any]:
+    people = reviewers(pr)
     return {
         "number": pr.get("number"),
         "url": pr.get("url"),
@@ -471,6 +737,13 @@ def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -
         "review_state": review_state(pr),
         "checks": check_summary(pr, required_checks_only=required_checks_only),
         "comments": comment_summary(pr),
+        "author": (pr.get("author") or {}).get("login") or "",
+        "base": pr.get("baseRefName"),
+        "reviewers": people,
+        "review_summary": review_summary(people),
+        "diff": diff_summary(pr),
+        "issues": linked_issues(pr),
+        "timeline": timeline(pr),
     }
 
 

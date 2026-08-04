@@ -412,3 +412,161 @@ def test_digest_signature_tracks_conflict_not_transient_unknown():
     sig_conflict = graphql.digest_signature(_conn(node("CONFLICTING")))
     assert sig_clean == sig_unknown == sig_missing
     assert sig_conflict != sig_clean
+
+
+# --- api_version 12 pane data: reviewers, diff, linked issues, timeline ---
+
+
+def test_reviewers_merge_latest_reviews_with_outstanding_requests():
+    pr = {
+        "latestReviews": {
+            "nodes": [
+                {"state": "APPROVED", "author": {"login": "nate"}},
+                {"state": "CHANGES_REQUESTED", "author": {"login": "jules"}},
+                {"state": "PENDING", "author": {"login": "half-written"}},
+                {"state": "APPROVED", "author": None},
+            ]
+        },
+        # `jules` was re-requested after reviewing: the submitted position is what
+        # is still on record, so it must not be downgraded to pending.
+        "reviewRequests": {
+            "nodes": [
+                {"requestedReviewer": {"login": "jules"}},
+                {"requestedReviewer": {"name": "platform-team"}},
+                {"requestedReviewer": None},
+            ]
+        },
+    }
+    assert graphql.reviewers(pr) == [
+        {"name": "nate", "state": "approved"},
+        {"name": "jules", "state": "changes-requested"},
+        {"name": "half-written", "state": "pending"},
+        {"name": "platform-team", "state": "pending"},
+    ]
+    # Total: a malformed PR yields no reviewers rather than raising.
+    assert graphql.reviewers({}) == []
+
+
+def test_review_summary_reads_the_way_github_does():
+    cases = [
+        ([], ""),
+        ([{"name": "a", "state": "approved"}], "1 approved"),
+        ([{"name": "a", "state": "approved"}, {"name": "b", "state": "approved"}], "2 approved"),
+        ([{"name": "a", "state": "approved"}, {"name": "b", "state": "pending"}], "1 of 2 approved"),
+        ([{"name": "a", "state": "pending"}, {"name": "b", "state": "pending"}], "2 pending"),
+        # A blocking review wins regardless of how many approvals sit beside it.
+        ([{"name": "a", "state": "approved"}, {"name": "b", "state": "changes-requested"}], "changes requested"),
+    ]
+    for people, expected in cases:
+        assert graphql.review_summary(people) == expected, people
+
+
+def test_diff_summary_needs_every_field_to_be_a_count():
+    assert graphql.diff_summary({"additions": 842, "deletions": 317, "changedFiles": 18}) == {
+        "added": 842,
+        "removed": 317,
+        "files": 18,
+    }
+    # The no-token REST shape carries none of these, and a partial/odd shape must
+    # not render half a diff card.
+    for bad in (
+        {},
+        {"additions": 1, "deletions": 2},
+        {"additions": 1, "deletions": -2, "changedFiles": 3},
+        {"additions": True, "deletions": 0, "changedFiles": 0},
+    ):
+        assert graphql.diff_summary(bad) is None, bad
+
+
+def test_linked_issues_keep_number_title_url_and_state():
+    pr = {
+        "closingIssuesReferences": {
+            "nodes": [
+                {"number": 3180, "title": "Stale daemon", "url": "https://gh/i/3180", "state": "OPEN"},
+                {"number": 3204, "title": "Drift", "url": "https://gh/i/3204", "state": "CLOSED"},
+                {"title": "no number"},
+            ]
+        }
+    }
+    assert graphql.linked_issues(pr) == [
+        {"number": 3180, "title": "Stale daemon", "url": "https://gh/i/3180", "state": "open"},
+        {"number": 3204, "title": "Drift", "url": "https://gh/i/3204", "state": "closed"},
+    ]
+    assert graphql.linked_issues({}) == []
+
+
+def test_timeline_reverses_to_newest_first_and_skips_unknown_types():
+    pr = {
+        "timelineItems": {
+            "nodes": [
+                {
+                    "__typename": "PullRequestCommit",
+                    "commit": {
+                        "abbreviatedOid": "4f9a1c2",
+                        "committedDate": "2026-06-29T11:40:00Z",
+                        "messageHeadline": "fix the thing",
+                        "author": {"user": {"login": "njbrake"}, "name": "N B"},
+                    },
+                },
+                {"__typename": "IssueComment", "createdAt": "2026-06-29T11:52:00Z", "author": {"login": "seluj78"}},
+                {
+                    "__typename": "PullRequestReview",
+                    "state": "CHANGES_REQUESTED",
+                    "createdAt": "2026-06-29T11:58:00Z",
+                    "author": {"login": "nate"},
+                },
+                {"__typename": "SomeFutureEvent", "createdAt": "2026-06-29T12:00:00Z"},
+            ]
+        }
+    }
+    assert graphql.timeline(pr) == [
+        {"kind": "review", "text": "nate requested changes", "at": "2026-06-29T11:58:00Z"},
+        {"kind": "comment", "text": "seluj78 commented", "at": "2026-06-29T11:52:00Z"},
+        {"kind": "commit", "text": "njbrake pushed 4f9a1c2: fix the thing", "at": "2026-06-29T11:40:00Z"},
+    ]
+    assert graphql.timeline({}) == []
+
+
+def test_check_runs_carry_duration_workflow_group_and_a_skipped_flag():
+    def ctx(name, conclusion, started, completed, workflow):
+        return {
+            "__typename": "CheckRun",
+            "name": name,
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+            "detailsUrl": "https://ci/1",
+            "startedAt": started,
+            "completedAt": completed,
+            "checkSuite": {"app": {"slug": "github-actions"}, "workflowRun": {"workflow": {"name": workflow}}},
+        }
+
+    pr = {
+        "commits": {
+            "nodes": [
+                {
+                    "commit": {
+                        "statusCheckRollup": {
+                            "state": "SUCCESS",
+                            "contexts": {
+                                "nodes": [
+                                    ctx("Clippy", "SUCCESS", "2026-01-01T00:00:00Z", "2026-01-01T00:01:28Z", "Lint"),
+                                    ctx("Vitest", "SUCCESS", "2026-01-01T00:00:00Z", "2026-01-01T00:00:48Z", "Web"),
+                                    ctx("close-stale", "SKIPPED", None, None, "Meta"),
+                                ]
+                            },
+                        }
+                    }
+                }
+            ]
+        }
+    }
+    runs = {r["name"]: r for r in graphql.check_summary(pr)["runs"]}
+    assert runs["Clippy"]["duration"] == "1m 28s"
+    assert runs["Vitest"]["duration"] == "48s"
+    assert runs["Clippy"]["group"] == "Lint"
+    # A skipped run still reads as succeeded for the rollup (it blocks nothing),
+    # but carries the flag so the pane can list it apart from the real passes.
+    assert runs["close-stale"]["state"] == "succeeded"
+    assert runs["close-stale"]["skipped"] is True
+    assert "duration" not in runs["close-stale"]
+    assert "skipped" not in runs["Clippy"]

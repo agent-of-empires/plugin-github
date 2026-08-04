@@ -144,12 +144,10 @@ session-less `github.refresh` cover every session and prune vanished ones:
    `sort_value` lets the dashboard sort sessions by GitHub PR attention, even
    when `show_status_text` hides the visible words), and
    a `pane`
-   (`{title, default_location, icon, blocks: [...]}` -- the in-session GitHub
-   tool-window listing, per PR, a headline row, a review-state row, a Checks
-   section, an unresolved-comments section, a last-refresh row, and an `action`
-   block ("Refresh") whose click POSTs back to the host, which forwards
-   `github.refresh` to this worker; `icon` is a lucide name for its activity-bar
-   button).
+   (`{title, default_location, blocks: [...], footer}` -- the in-session GitHub
+   tool-window, described in [The pane](#the-pane) below. Its `action` blocks POST
+   back to the host, which forwards the named method (`github.refresh`,
+   `github.select_pr`) to this worker).
 
 On restart: each successful full refresh is persisted to an on-disk cache
 (`${XDG_CACHE_HOME:-~/.cache}/agent-of-empires/github-plugin/snapshot.json`). On
@@ -212,18 +210,60 @@ Each push is `params: { slot, id, session_id, payload }`. A badge item is
 `{ icon, tone?, href?, tooltip? }` (`icon` is a lucide name, e.g.
 `git-pull-request-arrow`; `tone` colors it; `href` opens the PR). A pane block
 is one of a small, extensible set (`heading`, `row`, `note`, `divider`,
-`section`, `action`, `comment`) -- a `row` is
-`{ label, value?, sublabel?, icon?, tone?, color?, href? }`, a `comment` is
-`{ author, body, path?, line?, resolved?, href? }` (read-only), and an `action`
-is `{ label, method, icon? }` (a button that forwards `method` to this worker).
+`section`, `action`, `comment`, `callout`, `bar`, `columns`); the full field list
+per kind is in the host's
+[plugin API reference](https://github.com/agent-of-empires/agent-of-empires/blob/main/docs/plugin-api.md#pane-payload).
 The host renders the block kinds it knows and ignores the rest, so the pane can
-grow without a lockstep host change. `tone` is one of the host's `Tone` set
+grow without a lockstep host change; the kinds used here need `api_version >= 12`,
+which is why the manifest declares it. `tone` is one of the host's `Tone` set
 (`neutral`, `info`, `success`, `warn`, `danger`): a non-draft open PR is
 `success`, a draft `warn`, a hard error (auth/rate-limit/network) `danger`. A
-merged PR has no semantic tone, so its headline row carries a validated hex
+merged PR has no semantic tone, so its selector row carries a validated hex
 `color` (`#8957e5`, GitHub purple) instead; `color` accepts only `#rgb`/`#rrggbb`
 literals so it can never carry arbitrary CSS. When no token is present the pane
 prepends a warn `note` telling the user a token unlocks review/CI/comments/merged.
+
+### The pane
+
+The pane is one-PR-focused, and reads top to bottom:
+
+1. **PR selector.** Every PR in the session, most-actionable first (the same
+   attention ladder the session row uses, with merged PRs sinking below every open
+   one). Each row carries `#number`, the title, `branch · author`, and a glyph
+   strip for CI / review / conflicts / unresolved-comment count. Clicking a row
+   fires `github.select_pr { pr }`; the trailing arrow is a separate link to
+   GitHub, so picking a PR never navigates away. The selection is remembered in
+   memory per session, and falls back to the top of the list whenever the PR it
+   named is no longer in the snapshot (merged, closed, renamed).
+2. **Merge verdict** (`callout`). Why the PR can or cannot merge, derived here
+   rather than fetched: `mergeStateStatus` collapses conflicts, policy, CI and
+   review into one enum and so cannot say which is blocking. The ladder is
+   draft, conflicts, changes requested, failing checks, running checks, unresolved
+   comments, ready, awaiting review, ordered by who can clear the block. **This
+   plugin never merges for you:** a mergeable PR gets a link out to GitHub, and a
+   blocked one an inert button naming the block.
+3. **Review.** One row per reviewer (initials, name, current position), from
+   `latestReviews` plus any outstanding `reviewRequests`, under the summary GitHub
+   itself would show. Degrades to the single aggregate review-state row when
+   per-reviewer data is absent.
+4. **Checks.** Count pills in the header; the runs needing attention (failing,
+   running, queued) listed outright with `workflow · duration`; the passes folded
+   into a collapsed group; skipped runs on their own line. The body scrolls in
+   place, so a twenty-check repo does not bury everything below it. A skipped run
+   still counts as passing for the rollup (it blocks nothing) but is listed apart
+   from the real passes.
+5. **Unresolved comments**, as read-only `comment` blocks.
+6. **Diff and Linked** (`columns`), side by side: `+added / -removed` with a
+   proportional bar and a file count, and the issues the PR closes on merge (from
+   GitHub's own `closingIssuesReferences`). Either can be absent, and a lone
+   survivor spans the full width.
+7. **Activity.** Recent timeline events, newest first, with local wall-clock times.
+8. **Footer**, pinned below the scroll: the last refresh time and the verdict in a
+   word.
+
+Repos that contribute no PR (a failed lookup, a non-GitHub checkout, a clean
+branch) collect in a folded "Other repos" section, or render outright when they are
+all there is to say.
 The host replies on stdin; the worker ignores the reply (a push is best-effort).
 
 The network poll interval comes from the `ui_refresh_secs` setting, which the
