@@ -4,6 +4,16 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [2.0.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.0.0) - 2026-08-04
+
+
+
+### Features
+
+- **pane:** Rebuild the pane around the selected PR in [#86](https://github.com/agent-of-empires/plugin-github/pull/86) by [@Seluj78](https://github.com/Seluj78) ([`3ceb33c`](https://github.com/agent-of-empires/plugin-github/commit/3ceb33c8197742b7479ab8a947c741fb0e2ac046))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v1.8.0...v2.0.0
 ## [1.8.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v1.8.0) - 2026-07-16
 
 
@@ -155,3 +165,6 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - Multi-session multi-repo GitHub UI refresh (+ manifest/worker fixes) in [#6](https://github.com/agent-of-empires/plugin-github/pull/6) by [@Seluj78](https://github.com/Seluj78) ([`352a981`](https://github.com/agent-of-empires/plugin-github/commit/352a981eca8473059dbc4f171f2570d70b28b07d))
 - Dockable pane slot, fresh-on-session-change, and a Refresh button in [#7](https://github.com/agent-of-empires/plugin-github/pull/7) by [@Seluj78](https://github.com/Seluj78) ([`795c6d3`](https://github.com/agent-of-empires/plugin-github/commit/795c6d367f5e81be0bf32aa3aff63c639cff8e27))
 - **pane:** Rich per-PR state (merged/review/CI/comments) via token-gated GraphQL in [#13](https://github.com/agent-of-empires/plugin-github/pull/13) by [@Seluj78](https://github.com/Seluj78) ([`4b66d82`](https://github.com/agent-of-empires/plugin-github/commit/4b66d8212709a4dca18185f35e78db490ea5fc04))
+
+
+
