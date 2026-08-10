@@ -48,7 +48,7 @@ jobs:
         run: uv run pytest
 
       - name: Install git-cliff
-        uses: taiki-e/install-action@v2.82.2
+        uses: taiki-e/install-action@v2.85.7
         with:
           tool: git-cliff
 
