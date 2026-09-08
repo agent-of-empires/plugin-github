@@ -89,7 +89,16 @@ So REST keeps its relative paths, and only GraphQL changes to an absolute URL.
 
 ## Host discovery and trust
 
-Discovery runs once per refresh, not once per repo.
+Discovery runs once per worker lifetime, not once per refresh. The runtime
+object resolves the trusted map at startup, holds it, and passes it down to
+both the refresh path and the direct handlers (`github.status`,
+`github.open`), which call `parse_owner_repo` outside any refresh. A manual
+`github.refresh` re-discovers, so a user who runs `gh auth login` mid-session
+has a way to pick the new host up without a worker restart.
+
+The reason for the lifetime cache is cost: the background tick defaults to 120
+seconds, and each `gh` call can hit the keyring. Per-refresh discovery would
+add a shell-out every two minutes for a map that almost never changes.
 
 ```python
 def discover_trusted_hosts(env: TokenEnvironment) -> dict[str, GitHubHost]
@@ -149,7 +158,9 @@ unchanged.
 
 `gh auth token` gains `--hostname <host>`. Tokens resolve once per refresh per
 host and are held in a local dict for that refresh only. They are never written
-to disk and never put in the snapshot.
+to disk and never put in the snapshot. Unlike the trusted-host map, tokens are
+NOT cached for the worker's lifetime: a token can expire or rotate, and the
+per-refresh resolve is what today's code already does.
 
 `errors.py` needs the host in its hints. `NoTokenNoGhError` and
 `GhNotAuthenticatedError` currently suggest `gh auth login`, which is wrong
@@ -220,6 +231,10 @@ server returns, so a GHES PR already arrives with a GHES link. The
 `github_pr_badge` href and the `open_pr` client command therefore work on GHES
 with no edit.
 
+The direct handlers (`github.status`, `github.open`) receive the trusted map
+from the runtime object, the same one the refresh path uses, so a GHES checkout
+resolves identically on both paths.
+
 One link in the codebase is built by hand, `handlers.py:131`. It takes
 `host.web_base`:
 
@@ -266,8 +281,15 @@ Then, per module:
   map and never raises.
 - `test_refresh.py` — cache keys separate two hosts that share an
   `owner/repo/branch`; a rate-limit trip on one host does not gate the other.
+- `test_gitctx.py` and `test_handlers.py` — both change, because
+  `parse_owner_repo` changes shape and the handlers take the trusted map. The
+  handlers' tests cover a GHES checkout end to end: `github.status` summary and
+  the `github.open` compare URL built from `host.web_base`.
 - `test_uistate.py` — the note fires only for the selected PR's host, and its
-  hint matches that host's kind.
+  hint matches that host's kind. Before the pane work starts, grep for every
+  reader of the snapshot's `auth` key and update each in the same change: the
+  version gate in `load_snapshot` protects the disk cache, not in-memory
+  consumers inside the release.
 - A GHES-style partial GraphQL error on `mergeable`, proving the existing
   `_error_aliases` and `_fallback_pulls` path already covers an older GHES
   schema. No schema probing is added.
