@@ -27,7 +27,7 @@ Four product decisions were settled before design:
 | Decision | Choice |
 | --- | --- |
 | Host scope | Multi-host. github.com and one or more GHES hosts work in the same AoE instance, in the same refresh tick. |
-| Host trust | Discovered from `gh auth status --json hosts`. No new setting. |
+| Host trust | Discovered offline from the host names in gh's local `hosts.yml`. No new setting. |
 | Token order | `gh`'s own documented rules, per host. |
 | Auth banner | Per host, naming the host and the matching hint. |
 
@@ -96,39 +96,56 @@ both the refresh path and the direct handlers (`github.status`,
 `github.refresh` re-discovers, so a user who runs `gh auth login` mid-session
 has a way to pick the new host up without a worker restart.
 
-The reason for the lifetime cache is cost: the background tick defaults to 120
-seconds, and each `gh` call can hit the keyring. Per-refresh discovery would
-add a shell-out every two minutes for a map that almost never changes.
+The lifetime cache avoids reading a configuration that rarely changes on every
+120-second background tick. Discovery reads local configuration only; it does
+not check credentials, contact a host, or unlock a keyring.
 
 ```python
-def discover_trusted_hosts(env: TokenEnvironment) -> dict[str, GitHubHost]
+def discover_trusted_hosts(
+    env: TokenEnvironment,
+    previous: dict[str, GitHubHost] | None = None,
+) -> dict[str, GitHubHost]
 ```
 
-It shells out to `gh auth status --json hosts` and parses the map:
+Read the top-level host keys from gh's `hosts.yml`. Resolve its directory using
+[gh's configuration path precedence](https://github.com/cli/go-gh/blob/trunk/pkg/config/config.go):
+non-empty `GH_CONFIG_DIR`, then `XDG_CONFIG_HOME/gh`, then
+`AppData/GitHub CLI` on Windows, otherwise `~/.config/gh`.
 
-```json
-{"hosts": {"github.mycorp.com": [{"state": "success", "active": true, ...}],
-           "github.com":        [{"state": "error", "error": "HTTP 401: Bad credentials", ...}]}}
-```
+Use `yaml.safe_load` (add PyYAML to the runtime dependencies and lockfile),
+validate a mapping with hostname keys, and return only those names from the
+environment seam. Do not log the file contents, retain account/token fields,
+or use them for token resolution; that remains the responsibility of `auth.py`.
+
+`gh auth status --json hosts` is unsuitable for discovery: it checks accounts
+over the network and emits JSON only after the checks finish. A five-second
+subprocess timeout can therefore discard every host when just one VPN-only
+server is unreachable. Discovery must not invoke that command, even at startup.
 
 Rules:
 
-- `github.com` is always present in the result, whether or not `gh` lists it.
+- `github.com` is always present in the result, whether or not the file lists it.
   Today's behaviour must never regress when `gh` is absent.
-- Every other key becomes `GitHubHost.enterprise(name)`.
-- A host with `state: "error"` is still trusted. The host is a real GitHub host;
-  only its token fails. The 401 then flows through the existing
-  `UnauthorizedError` path, which the pane already renders. Dropping the host
-  instead would hide the repo entirely and give the user no clue why.
-- `gh` missing, a `gh` too old for `--json hosts`, a non-zero exit, and
-  unparseable JSON all degrade to `{"github.com": dotcom()}`. Never an
-  exception.
-- The shell-out reuses the existing `GH_AUTH_TIMEOUT` of 5 seconds, so a wedged
-  `gh` degrades rather than stalling the refresh.
+- Every other valid hostname becomes `GitHubHost.enterprise(name)`. Validate
+  hostnames before constructing URLs; a URL, path, or userinfo is not a host key.
+- A configured host remains trusted when offline or when its token is invalid.
+  Subsequent API requests surface network or authorization errors in the pane;
+  discovery never hides a repo because an authentication check failed.
+- A successful read replaces the map, so manual refresh picks up logins and
+  removals. An empty file, empty mapping, or missing file is a successful empty
+  configuration and produces only github.com.
+- An unreadable file, malformed YAML, or invalid mapping preserves a copy of
+  `previous`; at startup with no previous map, fall back to github.com. These
+  failures never raise or erase a previously discovered enterprise host. The
+  runtime passes its current map on manual refresh and atomically publishes the
+  result for both refresh and direct handlers.
+- Discovery works without an installed `gh` binary if its configuration remains
+  available. `GH_AUTH_TIMEOUT` still bounds token-resolution shell-outs only.
 
-`TokenEnvironment` gains one method, `gh_auth_status_hosts()`, beside the
-existing `gh_auth_token()`. This keeps discovery testable with no real `gh`,
-matching the seam the module already uses.
+`TokenEnvironment` gains `gh_config_hosts() -> list[str] | None`, beside the
+existing `gh_auth_token()`. An empty list means a successful empty configuration;
+`None` means a read or parse failure. This keeps discovery testable with fixture
+configuration and no real `gh`, network, or user credentials.
 
 ### Remote matching
 
@@ -193,23 +210,36 @@ for host_name, host_keys in sorted(by_host.items()):
     host  = trusted[host_name]
     token = _resolve_optional_token(env, host)   # existing helper, gains host
     with GitHubClient(host=host, token=token) as client:
-        results |= _fetch_rich(client, host_keys, ...)   # unchanged
+        results |= _fetch_rich(client, host_keys, ...)
 ```
 
 Hosts are iterated in sorted order for determinism, matching how `ordered` is
 already sorted today. `_fetch_rich`, `_probe_all`, `_fetch_chunk`, and the digest
-tier need no logic change: each receives a client already aimed at one host, and
-their keys already carry that host.
+tier retain their pipeline, but must pass the host through cache-key unpacking,
+backoff checks, budget observations, and freshness calculations.
 
 `token_present` becomes a per-host map rather than one boolean.
 
-### Backoff must become per host
+### Backoff and budget pacing must become per host
 
 `_backoff` is a module dict with the fixed keys `rest`, `graphql`, and
 `notified`. Today a github.com rate limit would also gate GHES polling, which is
 wrong: the two budgets are unrelated, and a GHES install often has a far larger
 one. So `_backoff` nests one level, `_backoff[host_name][api]`, created on
 demand. `_set_backoff` and `_active_backoff_locked` take a host.
+
+Partition `_graphql_budget` as well: `_graphql_budget[host_name]` holds that
+host's `remaining` and `valid_until`, created on demand under `_cache_lock`.
+`_observe_rate_limit` and `_budget_multiplier` take the host, as do
+`_digest_stale` and `_full_stale`. Thread the host through every rich and digest
+query observation and every freshness check. An expired observation clears only
+that host's budget; a host with no observation uses multiplier 1.
+
+The existing multiplier of 4 below 1,000 remaining points applies only to the
+host that reported that budget. A low-budget host must not stretch another
+host's refresh intervals, and a healthy response from another host must not
+remove the depleted host's pacing. Adding the host to `RepoKey` alone does not
+partition this module-level state.
 
 The `notified` one-shot flag stays global, so the user still gets one message per
 window rather than one per host. When exactly one host is limited, the message
@@ -276,11 +306,19 @@ Then, per module:
   right variable and the right `gh auth login` form for its host kind.
 - `test_client.py` — GraphQL posts to the absolute `graphql_url`; REST joins onto
   `/api/v3`.
-- Discovery degradation — no `gh`; a `gh` that rejects `--json hosts`; a non-zero
-  exit; malformed JSON; a `state: "error"` host. Each yields a usable trusted
-  map and never raises.
+- Discovery — fixture `hosts.yml` files cover configuration-directory precedence,
+  multiple hosts, invalid hostname keys, empty/missing files, malformed YAML,
+  and read failures. Verify failed rereads retain the previous map, successful
+  reads apply additions/removals, and startup failures fall back to github.com.
+  Assert discovery never invokes a subprocess or network request: with one
+  offline/VPN-only host configured, every configured host is still discovered
+  on a cold start. Include invalid credentials and an absent `gh` binary.
 - `test_refresh.py` — cache keys separate two hosts that share an
   `owner/repo/branch`; a rate-limit trip on one host does not gate the other.
+  In one refresh, give host A 100 remaining GraphQL points and host B 5,000;
+  verify only A's digest and full-refresh intervals stretch by 4, regardless of
+  observation order. Reset A's observation and verify B's budget is untouched;
+  a host with no observation keeps multiplier 1.
 - `test_gitctx.py` and `test_handlers.py` — both change, because
   `parse_owner_repo` changes shape and the handlers take the trusted map. The
   handlers' tests cover a GHES checkout end to end: `github.status` summary and
@@ -310,14 +348,15 @@ start.
 
 - No new plugin setting. Discovery is automatic, so the manifest's settings list
   is untouched.
-- No new capability. Discovery shells out to `gh`, which the `net` grant already
-  covers.
+- No new host RPC. Discovery reads gh's local configuration in the worker,
+  alongside its existing local git and snapshot reads.
 - No GraphQL schema probing for older GHES versions. The existing partial-error
   tolerance handles it.
 - No GitHub App or OAuth device-flow work. Token sources stay as they are.
 
 ## Docs to update
 
+- `pyproject.toml` and `uv.lock` — add PyYAML for safe configuration parsing.
 - `aoe-plugin.toml` — the `net` capability comment names `api.github.com`.
 - `README.md` lines 80 and 81 — "null outside a github.com checkout" becomes
   "outside a trusted GitHub host".
