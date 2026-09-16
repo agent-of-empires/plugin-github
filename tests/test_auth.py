@@ -16,10 +16,12 @@ class FakeEnv(TokenEnvironment):
     """``gh_result`` is ``(success, stdout, stderr)`` or an Exception to raise;
     ``None`` means ``gh`` must not be consulted (raises if it is)."""
 
-    def __init__(self, github_token=None, gh_token=None, gh_available=False, gh_result=None):
+    def __init__(self, github_token=None, gh_token=None, gh_available=False, gh_result=None, gh_user_result=None):
         self._vars = {"GITHUB_TOKEN": github_token, "GH_TOKEN": gh_token}
         self._gh_available = gh_available
         self._gh_result = gh_result
+        self._gh_user_result = gh_user_result
+        self.asked_for = []
 
     def env_var(self, key):
         return self._vars.get(key)
@@ -123,3 +125,87 @@ def test_gh_not_authenticated_hint_says_login_not_install():
     assert "gh auth login" in msg
     assert "brew install" not in msg
     assert "install the GitHub CLI" not in msg
+
+
+# --- per-owner accounts (#91) -------------------------------------------------
+
+
+class _UserEnv(FakeEnv):
+    """``gh_auth_token_for_user`` seam; ``gh_auth_token`` must not be consulted."""
+
+    def gh_auth_token(self):
+        raise AssertionError("the account path must not fall back to the default gh token")
+
+    def gh_auth_token_for_user(self, login):
+        self.asked_for.append(login)
+        if isinstance(self._gh_user_result, Exception):
+            raise self._gh_user_result
+        return self._gh_user_result
+
+
+def test_account_token_comes_from_gh_for_that_login():
+    env = _UserEnv(gh_available=True, gh_user_result=(True, "acct-tok\n", ""))
+    assert auth.resolve_token_for_account("octocat", env) == ("acct-tok", "gh-cli:octocat")
+    assert env.asked_for == ["octocat"]
+
+
+def test_account_token_ignores_env_vars():
+    """``GITHUB_TOKEN`` carries no account identity, so honouring it here would
+    authenticate as the wrong user -- the exact bug per-owner accounts fix."""
+    env = _UserEnv(github_token="global", gh_available=True, gh_user_result=(True, "acct-tok", ""))
+    token, source = auth.resolve_token_for_account("octocat", env)
+    assert (token, source) == ("acct-tok", "gh-cli:octocat")
+
+
+def test_account_token_without_gh_raises_no_gh():
+    env = _UserEnv(github_token="global", gh_available=False)
+    with pytest.raises(errors.NoTokenNoGhError):
+        auth.resolve_token_for_account("octocat", env)
+
+
+def test_account_token_not_signed_in():
+    env = _UserEnv(gh_available=True, gh_user_result=(False, "", "no oauth token found"))
+    with pytest.raises(errors.GhNotAuthenticatedError):
+        auth.resolve_token_for_account("octocat", env)
+
+
+def test_account_token_empty_output():
+    env = _UserEnv(gh_available=True, gh_user_result=(True, "   ", ""))
+    with pytest.raises(errors.GhReturnedEmptyTokenError):
+        auth.resolve_token_for_account("octocat", env)
+
+
+def test_account_token_real_gh_failure_is_not_mislabeled():
+    env = _UserEnv(gh_available=True, gh_user_result=(False, "", "unknown user octocat"))
+    with pytest.raises(errors.GhCommandFailedError) as excinfo:
+        auth.resolve_token_for_account("octocat", env)
+    assert "unknown user octocat" in str(excinfo.value)
+
+
+def test_account_token_oserror_becomes_command_failed():
+    env = _UserEnv(gh_available=True, gh_user_result=OSError("boom"))
+    with pytest.raises(errors.GhCommandFailedError):
+        auth.resolve_token_for_account("octocat", env)
+
+
+def test_system_environment_passes_user_flag(monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, "tok", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ok, out, _ = SystemEnvironment().gh_auth_token_for_user("octocat")
+    assert (ok, out) == (True, "tok")
+    assert seen["argv"] == ["gh", "auth", "token", "--user", "octocat"]
+
+
+def test_system_environment_user_timeout_degrades(monkeypatch):
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, 5.0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ok, _, err = SystemEnvironment().gh_auth_token_for_user("octocat")
+    assert ok is False
+    assert "timed out" in err

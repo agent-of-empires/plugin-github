@@ -531,3 +531,67 @@ def test_select_pr_survives_a_drifted_cached_snapshot(monkeypatch):
     # and crucially no exception escaped to the caller.
     assert rt._selected_pr == {"s1": "o/r#1"}
     assert not [m for m in sent if m["method"] == "ui.state.set"]
+
+
+# --- per-owner accounts setting (#91) ----------------------------------------
+
+
+def _owner_accounts_from(reply):
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: reply
+    return rt.resolve_owner_accounts()
+
+
+def test_owner_accounts_reads_rows_in_order():
+    rows = [
+        {"id": "a", "owner": "acme-corp", "gh_account": "work-acct"},
+        {"id": "b", "owner": "hobby-org", "gh_account": "home-acct"},
+    ]
+    assert _owner_accounts_from({"value": rows}) == (
+        ("acme-corp", "work-acct"),
+        ("hobby-org", "home-acct"),
+    )
+
+
+def test_owner_accounts_absent_setting_is_empty():
+    # Empty means "one token for everything", i.e. the pre-#91 behaviour.
+    assert _owner_accounts_from(None) == ()
+    assert _owner_accounts_from({"value": None}) == ()
+
+
+def test_owner_accounts_skips_half_filled_and_malformed_rows():
+    # A row mid-edit in the settings UI must not cost the user every badge.
+    rows = [
+        {"id": "a", "owner": "acme-corp"},
+        {"id": "b", "gh_account": "home-acct"},
+        {"id": "c", "owner": "  ", "gh_account": "home-acct"},
+        {"id": "d", "owner": "eliraz", "gh_account": 7},
+        "not-a-row",
+        {"id": "e", "owner": " hobby-org ", "gh_account": " home-acct "},
+    ]
+    assert _owner_accounts_from({"value": rows}) == (("hobby-org", "home-acct"),)
+
+
+def test_owner_accounts_first_row_for_an_owner_wins():
+    rows = [
+        {"id": "a", "owner": "hobby-org", "gh_account": "home-acct"},
+        {"id": "b", "owner": "HOBBY-org", "gh_account": "other-acct"},
+    ]
+    assert _owner_accounts_from({"value": rows}) == (("hobby-org", "home-acct"),)
+
+
+def test_owner_accounts_reach_refresh(monkeypatch):
+    seen = []
+
+    def spy_build_snapshot(sessions, **kwargs):
+        seen.append(kwargs["settings"].owner_accounts)
+        return {"sessions": [], "auth": {"present": True}}
+
+    monkeypatch.setattr(main.refresh, "build_snapshot", spy_build_snapshot)
+    rt = main.Runtime(send=lambda _m: None)
+    rows = [{"id": "a", "owner": "hobby-org", "gh_account": "home-acct"}]
+    rt.call_host = lambda _method, params, **_kw: (
+        {"value": rows} if params.get("key") == "owner_accounts" else {"value": True}
+    )
+    rt.run_refresh(sessions=[])
+    assert seen == [(("hobby-org", "home-acct"),)]

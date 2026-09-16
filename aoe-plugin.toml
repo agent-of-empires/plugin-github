@@ -176,6 +176,37 @@ description = "Show the words summary at the end of each session row (e.g. \"CI 
 type = "boolean"
 default = true
 
+# Per-owner GitHub accounts (#91). A token belongs to exactly one GitHub
+# account, so a user whose work repos live under one login and personal repos
+# under another cannot cover both with a single token -- whichever account is
+# active wins and the other owner's repos answer 404, indistinguishable from
+# "no PR". Map an owner to a `gh` account and its repos are fetched with
+# `gh auth token --user <account>`; owners with no row keep the global token, so
+# an empty list is exactly the previous behaviour. An account that is not signed
+# in falls back to the global token rather than dropping the owner.
+[[settings]]
+key = "owner_accounts"
+label = "Per-owner GitHub accounts"
+description = "Fetch a repository owner's PRs with a specific `gh` account instead of the default token. Needed when work and personal repos live under different GitHub accounts; requires `gh auth login` for each account."
+type = "object_list"
+item_id_key = "id"
+max_items = 20
+advanced = true
+
+[[settings.fields]]
+key = "owner"
+label = "Repository owner"
+description = "GitHub user or organization, e.g. `acme-corp`. Matched case-insensitively."
+type = "string"
+required = true
+
+[[settings.fields]]
+key = "gh_account"
+label = "gh account"
+description = "The `gh` CLI account to authenticate as, as shown by `gh auth status`."
+type = "string"
+required = true
+
 [[settings]]
 key = "ignore_submodules"
 label = "Ignore Git submodules"

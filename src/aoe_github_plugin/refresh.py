@@ -51,8 +51,11 @@ import httpx
 
 from aoe_github_plugin import graphql
 from aoe_github_plugin.auth import TokenEnvironment
+from aoe_github_plugin.auth import SystemEnvironment
+from aoe_github_plugin.auth import resolve_token_for_account
 from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import GitHubError
+from aoe_github_plugin.errors import GitHubAuthError
 from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.handlers import _resolve_optional_token
 from aoe_github_plugin.utils.gitctx import parse_owner_repo
@@ -131,6 +134,10 @@ RichCacheKey = tuple[str, str, str, bool]
 class SnapshotSettings:
     ignore_submodules: bool = True
     required_checks_only: bool = False
+    # Owner -> `gh` account login, as ordered pairs so the frozen dataclass
+    # stays hashable (#91). Empty means "one token for everything", the
+    # pre-#91 behaviour.
+    owner_accounts: tuple[tuple[str, str], ...] = ()
 
 
 DEFAULT_SNAPSHOT_SETTINGS = SnapshotSettings()
@@ -996,13 +1003,64 @@ def _session_freshness(
     return None
 
 
+def _group_by_token(
+    ordered: list[RepoKey],
+    env: TokenEnvironment | None,
+    owner_accounts: tuple[tuple[str, str], ...],
+) -> dict[str | None, list[RepoKey]]:
+    """Split keys by the identity that should fetch them (#91).
+
+    Without ``owner_accounts`` every key lands in one group under the global
+    token, which is the pre-#91 single-client path. With a mapping, an owner's
+    keys move to that ``gh`` account's token; two owners naming the same account
+    share one group, so the client count tracks identities, not owners.
+
+    A mapping whose account cannot produce a token (not signed in, ``gh``
+    missing) falls back to the global token rather than dropping the repo: a
+    stale identity should degrade to "maybe unauthenticated", never to silence.
+    Owner comparison is case-insensitive, matching GitHub logins.
+
+    Insertion order follows ``ordered``, so group iteration -- and therefore the
+    serialized GraphQL sequence -- stays deterministic.
+    """
+    accounts = {owner.lower(): login for owner, login in owner_accounts if owner.strip() and login.strip()}
+    resolved = env or SystemEnvironment()
+    default_token: str | None = None
+    default_done = False
+    per_account: dict[str, str | None] = {}
+
+    def account_token(login: str) -> str | None:
+        if login not in per_account:
+            try:
+                token, _ = resolve_token_for_account(login, resolved)
+                per_account[login] = token
+            except GitHubAuthError as exc:
+                _LOG.warning("no token for gh account %s (%s); using the default token", login, exc)
+                per_account[login] = None
+        return per_account[login]
+
+    groups: dict[str | None, list[RepoKey]] = {}
+    for key in ordered:
+        token: str | None = None
+        login = accounts.get(key[0].lower())
+        if login is not None:
+            token = account_token(login)
+        if token is None:
+            if not default_done:
+                default_token = _resolve_optional_token(env)
+                default_done = True
+            token = default_token
+        groups.setdefault(token, []).append(key)
+    return groups
+
+
 def _fetch_all(
     keys: set[RepoKey],
     env: TokenEnvironment | None,
     transport: httpx.BaseTransport | None,
     *,
     force: bool = False,
-    required_checks_only: bool = False,
+    settings: SnapshotSettings = DEFAULT_SNAPSHOT_SETTINGS,
 ) -> tuple[dict[RepoKey, dict[str, Any]], bool]:
     """Fetch every unique key. Returns ``(results, token_present)`` where results
     is ``key -> {"pulls": [...]}`` or ``key -> {"error": {...}}``. With a token,
@@ -1016,16 +1074,23 @@ def _fetch_all(
     none of this touches stdin or host RPCs."""
     if not keys:
         return {}, True
-    token = _resolve_optional_token(env)
-    present = token is not None
     ordered = sorted(keys)
+    groups = _group_by_token(ordered, env, settings.owner_accounts)
+    present = any(token is not None for token in groups)
     results: dict[RepoKey, dict[str, Any]] = {}
-    with GitHubClient(token=token, transport=transport) as client:
-        if present:
-            results = _fetch_rich(client, ordered, force=force, required_checks_only=required_checks_only)
-        else:
-            with ThreadPoolExecutor(max_workers=REST_PROBE_WORKERS) as pool:
-                results = dict(zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True))
+    # One client per identity. GraphQL was already batched per repo, never
+    # across repos, so splitting the key set by token costs no extra queries.
+    for token, group in groups.items():
+        with GitHubClient(token=token, transport=transport) as client:
+            if token is not None:
+                results.update(
+                    _fetch_rich(client, group, force=force, required_checks_only=settings.required_checks_only)
+                )
+            else:
+                with ThreadPoolExecutor(max_workers=REST_PROBE_WORKERS) as pool:
+                    results.update(
+                        dict(zip(group, pool.map(lambda key: _fetch_one_basic(client, key), group), strict=True))
+                    )
     return results, present
 
 
@@ -1079,7 +1144,7 @@ def build_snapshot(
         env,
         transport,
         force=force,
-        required_checks_only=settings.required_checks_only,
+        settings=settings,
     )
     refreshed_at = _utc_now_iso()
 

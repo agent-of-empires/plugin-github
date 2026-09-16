@@ -66,6 +66,13 @@ CHIP_SETTING_KEYS = {
 # badge icons but clears the text. Defaults on.
 STATUS_TEXT_SETTING_KEY = "show_status_text"
 IGNORE_SUBMODULES_SETTING_KEY = "ignore_submodules"
+# Per-owner `gh` accounts (#91). One token cannot span two GitHub accounts, so a
+# user whose work and personal repos live under different logins needs a token
+# per owner. Rows are `{owner, gh_account}`; an owner with no row keeps the
+# global token.
+OWNER_ACCOUNTS_SETTING_KEY = "owner_accounts"
+OWNER_ACCOUNTS_OWNER_FIELD = "owner"
+OWNER_ACCOUNTS_LOGIN_FIELD = "gh_account"
 # Toggle for the CI rollup semantics. Defaults off so existing row attention
 # keeps treating every failing check as actionable unless the user opts in.
 REQUIRED_CHECKS_SETTING_KEY = "ci_required_checks_only"
@@ -212,6 +219,7 @@ class Runtime:
         self._show_status_text = True
         self._ignore_submodules = True
         self._required_checks_only = False
+        self._owner_accounts: tuple[tuple[str, str], ...] = ()
         self._next_network: float | None = None
         self._next_poll: float | None = None
 
@@ -424,12 +432,14 @@ class Runtime:
         with contextlib.suppress(Exception):
             self._ignore_submodules = self.resolve_ignore_submodules()
             self._required_checks_only = self.resolve_required_checks_only()
+            self._owner_accounts = self.resolve_owner_accounts()
             snapshot = refresh.build_snapshot(
                 sessions,
                 force=force,
                 settings=refresh.SnapshotSettings(
                     ignore_submodules=self._ignore_submodules,
                     required_checks_only=self._required_checks_only,
+                    owner_accounts=self._owner_accounts,
                 ),
             )
             current_ids = self._push_snapshot(snapshot)
@@ -497,6 +507,36 @@ class Runtime:
 
     def resolve_required_checks_only(self) -> bool:
         return self._setting_bool(REQUIRED_CHECKS_SETTING_KEY, default=self._required_checks_only)
+
+    def resolve_owner_accounts(self) -> tuple[tuple[str, str], ...]:
+        """Read the ``owner_accounts`` object-list into ordered pairs.
+
+        Rows missing either field, or carrying non-strings, are skipped rather
+        than failing the refresh: a half-filled row in the settings UI must not
+        cost the user every badge. The first row for an owner wins, so a
+        duplicate cannot silently shadow the one above it.
+        """
+        if self.stopped:
+            return self._owner_accounts
+        result = self.call_host(CONFIG_GET, {"key": OWNER_ACCOUNTS_SETTING_KEY})
+        rows = result.get("value") if isinstance(result, dict) else None
+        if not isinstance(rows, list):
+            return ()
+        pairs: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            owner = row.get(OWNER_ACCOUNTS_OWNER_FIELD)
+            login = row.get(OWNER_ACCOUNTS_LOGIN_FIELD)
+            if not isinstance(owner, str) or not isinstance(login, str):
+                continue
+            owner, login = owner.strip(), login.strip()
+            if not owner or not login or owner.lower() in seen:
+                continue
+            seen.add(owner.lower())
+            pairs.append((owner, login))
+        return tuple(pairs)
 
     def _setting_bool(self, key: str, *, default: bool) -> bool:
         if self.stopped:
