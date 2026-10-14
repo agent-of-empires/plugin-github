@@ -785,6 +785,37 @@ def test_conflict_chip_is_ungated_by_categories():
     assert "triangle-alert" in _badge_icons_with(repos, frozenset())
 
 
+def test_merge_queue_is_visible_in_badge_column_and_verdict():
+    pull = _rich_pull(review="approved", merge_state="conflicts")
+    pull["merge_queue"] = {"position": 2, "state": "queued"}
+    repo = _repo(pulls=[pull])
+    payload = _column_payload([repo])
+    assert payload["text"] == "in merge queue"
+    assert payload["sort_value"] == uistate._ATTENTION_VISUAL["queue"][0]
+    chips = uistate._pr_badge_chips("r", pull, frozenset({"review", "ci", "comments"}))
+    assert any("position 2" in chip["tooltip"] for chip in chips)
+    verdict = uistate._merge_verdict(pull)
+    assert verdict["title"] == "In merge queue"
+    assert verdict["detail"] == (
+        "GitHub will merge this pull request when it reaches the front of the queue. It is position 2."
+    )
+    assert verdict["ready"] is False
+
+
+def test_merge_queue_state_renders_in_pr_selector_and_not_as_direct_merge():
+    pull = _rich_pull(review="approved")
+    pull["merge_queue"] = {"position": 1, "state": "awaiting-checks"}
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])])))
+    blocks = _pane(params)["payload"]["blocks"]
+    row = _rows(blocks)[0]
+    callout = next(block for block in blocks if block.get("kind") == "callout")
+    assert any("awaiting merge queue checks" in badge["tooltip"] for badge in row["badges"])
+    assert callout["title"] == "Awaiting merge queue checks"
+    assert callout["actions"][0]["label"] == "View queue on GitHub"
+    assert callout["actions"][0]["href"] == pull["url"]
+    assert "disabled" not in callout["actions"][0]
+
+
 def _callout(repos):
     blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos))))["payload"]["blocks"]
     return next(b for b in blocks if b.get("kind") == "callout")

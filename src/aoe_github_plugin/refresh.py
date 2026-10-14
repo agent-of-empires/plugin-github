@@ -501,14 +501,14 @@ def _rich_cache_key(key: RepoKey, *, required_checks_only: bool) -> RichCacheKey
 
 
 def _is_active(pulls: list[dict[str, Any]]) -> bool:
-    """A branch's cached rich state is ACTIVE when a non-merged PR has a CI check
-    running or queued (#26). That state finishes in seconds yet does not bump the
-    ``/pulls`` ETag, so it earns the shorter staleness ceiling. A PR merely
-    awaiting review is deliberately NOT active: it can idle for days, so polling
-    it every tick would burn budget for no signal."""
+    """A branch is ACTIVE when a non-merged PR has running CI or is in a merge
+    queue. Those transitions can happen without the REST pull-list ETag changing,
+    so they earn the shorter staleness ceiling."""
     for pull in pulls:
         if pull.get("merged"):
             continue
+        if pull.get("merge_queue") is not None:
+            return True
         checks = pull.get("checks")
         if not isinstance(checks, dict):
             continue
