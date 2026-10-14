@@ -23,8 +23,11 @@ def _conn(*prs):
     return {"nodes": list(prs)}
 
 
-def _rollup(state, contexts):
-    return {"state": state, "contexts": {"nodes": list(contexts)}}
+def _rollup(state, contexts, total=None):
+    out = {"state": state, "contexts": {"nodes": list(contexts)}}
+    if total is not None:
+        out["contexts"]["totalCount"] = total
+    return out
 
 
 def _branch_rule(*, requires=True, contexts=(), checks=()):
@@ -154,6 +157,59 @@ def test_check_summary_tie_keeps_worst_state():
     )
     summary = graphql.check_summary(_pr(rollup=rollup))
     assert [(r["name"], r["state"], r["url"]) for r in summary["runs"]] == [("tie", "failing", "bad")]
+
+
+def test_check_summary_state_ignores_superseded_failure_in_sticky_rollup():
+    # GitHub keeps the rollup at FAILURE after a failed run is re-run green (#98),
+    # so the headline state must follow the latest run per check, not the rollup.
+    rollup = _rollup(
+        "FAILURE",
+        [
+            _checkrun("build", "COMPLETED", "FAILURE", completed_at="2024-01-01T00:00:00Z"),
+            _checkrun("test", "COMPLETED", "CANCELLED", completed_at="2024-01-01T00:00:00Z"),
+            _checkrun("build", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:05:00Z"),
+            _checkrun("test", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:05:00Z"),
+        ],
+        total=4,
+    )
+    summary = graphql.check_summary(_pr(rollup=rollup))
+    assert summary["state"] == "succeeded"
+
+
+def test_check_summary_state_failing_when_latest_run_fails():
+    rollup = _rollup(
+        "FAILURE",
+        [
+            _checkrun("build", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:00:00Z"),
+            _checkrun("build", "COMPLETED", "FAILURE", completed_at="2024-01-01T00:05:00Z"),
+        ],
+        total=2,
+    )
+    assert graphql.check_summary(_pr(rollup=rollup))["state"] == "failing"
+
+
+def test_check_summary_state_running_when_rerun_in_flight():
+    rollup = _rollup(
+        "FAILURE",
+        [
+            _checkrun("build", "COMPLETED", "FAILURE", completed_at="2024-01-01T00:00:00Z"),
+            _checkrun("build", "IN_PROGRESS", completed_at="2024-01-01T00:05:00Z"),
+        ],
+        total=2,
+    )
+    assert graphql.check_summary(_pr(rollup=rollup))["state"] == "running"
+
+
+def test_check_summary_state_keeps_rollup_when_contexts_truncated():
+    # More contexts exist than were fetched: a failing run may sit past the cap,
+    # so the raw rollup stays authoritative rather than risk a false green.
+    rollup = _rollup("FAILURE", [_checkrun("build", "COMPLETED", "SUCCESS")], total=60)
+    assert graphql.check_summary(_pr(rollup=rollup))["state"] == "failing"
+
+
+def test_check_summary_state_falls_back_to_rollup_without_runs():
+    assert graphql.check_summary(_pr(rollup=_rollup("SUCCESS", [])))["state"] == "succeeded"
+    assert graphql.check_summary(_pr(rollup=_rollup("PENDING", [])))["state"] == "running"
 
 
 def test_required_check_mode_ignores_optional_failures_for_rollup():

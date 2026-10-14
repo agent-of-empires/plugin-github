@@ -49,7 +49,7 @@ fragment PRConnection on PullRequestConnection {
       requiredStatusCheckContexts
       requiredStatusChecks { context app { databaseId slug name } }
     } }
-    commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 50) { nodes {
+    commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 50) { totalCount nodes {
       __typename
       ... on CheckRun {
         name status conclusion detailsUrl startedAt completedAt
@@ -429,6 +429,17 @@ def _matches_requirement(run: dict[str, Any], requirement: Requirement) -> bool:
     return app is None or run.get("app") == app
 
 
+def _worst_state(states: list[str]) -> str:
+    for worst in ("failing", "running", "queued", "unknown"):
+        if worst in states:
+            return worst
+    return "succeeded"
+
+
+def _runs_state(runs: list[dict[str, Any]]) -> str:
+    return _worst_state([run.get("state", "unknown") for run in runs])
+
+
 def _required_rollup_state(runs: list[dict[str, Any]], required: list[Requirement]) -> str:
     if not required:
         return "unknown"
@@ -438,15 +449,7 @@ def _required_rollup_state(runs: list[dict[str, Any]], required: list[Requiremen
         states.extend(run.get("state", "unknown") for run in matches)
         if not matches:
             states.append("running")
-    if "failing" in states:
-        return "failing"
-    if "running" in states:
-        return "running"
-    if "queued" in states:
-        return "queued"
-    if "unknown" in states:
-        return "unknown"
-    return "succeeded"
+    return _worst_state(states)
 
 
 def _mark_required_runs(runs: list[dict[str, Any]], required: list[Requirement]) -> None:
@@ -523,6 +526,14 @@ def check_summary(pr: dict[str, Any], *, required_checks_only: bool = False) -> 
     # surfacing failures at the top.
     runs.sort(key=lambda r: _STATE_RANK.get(r["state"], 5))
     state = _STATUS_STATE.get(rollup.get("state") or "", "unknown")
+    # GitHub's rollup stays FAILURE after a failed run is re-run green (#98), so
+    # when every context was fetched, derive the headline from the deduped runs
+    # (what GitHub's own PR page shows). A truncated page may hide a failing run,
+    # so it keeps the raw rollup: a false "failing" beats a false green.
+    contexts = rollup.get("contexts")
+    total = contexts.get("totalCount") if isinstance(contexts, dict) else None
+    if runs and not (isinstance(total, int) and total > len(_nodes(rollup, "contexts"))):
+        state = _runs_state(runs)
     if required_checks_only:
         required = _required_checks(pr)
         if required is not None:
