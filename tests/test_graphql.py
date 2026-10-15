@@ -109,6 +109,30 @@ def test_review_state_changes_pushed_only_when_every_blocking_review_is_stale():
         assert graphql.review_state(pr(*latest)) == expected, latest
 
 
+def test_review_state_sees_block_dropped_from_latest_reviews_by_a_re_request():
+    # Real shape (agent-of-empires#4518): njbrake was re-requested, so GitHub drops
+    # his review from `latestReviews`, but `reviewDecision` stays CHANGES_REQUESTED
+    # and `decidedReviews` still carries it.
+    def pr(blocked_on):
+        out = _pr(decision="CHANGES_REQUESTED")
+        out["headRefOid"] = "new"
+        out["latestReviews"] = {"nodes": [_latest("COMMENTED", "x", "coderabbitai")]}
+        out["decidedReviews"] = {"nodes": [_latest("CHANGES_REQUESTED", blocked_on, "njbrake")]}
+        out["reviewRequests"] = {"nodes": [{"requestedReviewer": {"login": "njbrake"}}]}
+        return out
+
+    assert graphql.review_state(pr("old")) == "changes-pushed"
+    assert graphql.review_state(pr("new")) == "changes-requested"
+    assert graphql.reviewers(pr("old")) == [
+        {"name": "coderabbitai", "state": "commented"},
+        {"name": "njbrake", "state": "changes-pushed"},
+    ]
+    # A later approval from the same reviewer clears their block.
+    cleared = pr("old")
+    cleared["decidedReviews"]["nodes"].append(_latest("APPROVED", "new", "njbrake"))
+    assert graphql.review_state(cleared) == "changes-requested"  # decision still says so; no blocking review known
+
+
 def test_review_state_infers_commented_from_review_or_thread():
     assert graphql.review_state(_pr(reviews=[{"state": "COMMENTED"}])) == "commented"
     assert graphql.review_state(_pr(threads=[_thread(resolved=False)])) == "commented"

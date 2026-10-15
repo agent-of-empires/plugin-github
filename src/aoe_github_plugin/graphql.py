@@ -68,6 +68,9 @@ fragment PRConnection on PullRequestConnection {
     } } } } } }
     reviews(last: 1, states: [COMMENTED]) { nodes { state } }
     latestReviews(first: 20) { nodes { state author { login } commit { oid } } }
+    decidedReviews: reviews(last: 30, states: [CHANGES_REQUESTED, APPROVED, DISMISSED]) {
+      nodes { state author { login } commit { oid } }
+    }
     reviewRequests(first: 20) { nodes { requestedReviewer {
       __typename
       ... on User { login }
@@ -255,6 +258,21 @@ def excerpt(text: Any, limit: int = EXCERPT_LEN) -> str:
     return collapsed if len(collapsed) <= limit else collapsed[: limit - 1].rstrip() + "…"
 
 
+def _blocking_reviews(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    """Each reviewer's standing ``CHANGES_REQUESTED`` review.
+
+    ``latestReviews`` drops a reviewer's review once they are re-requested, yet
+    ``reviewDecision`` stays ``CHANGES_REQUESTED``; ``decidedReviews`` (oldest
+    first) still carries it, so the latest of those per author is authoritative.
+    ``latestReviews`` fills in for a response without ``decidedReviews``."""
+    latest: dict[str, dict[str, Any]] = {}
+    for node in [*_nodes(pr, "latestReviews"), *_nodes(pr, "decidedReviews")]:
+        name = _reviewer_name(node.get("author"))
+        if name is not None:
+            latest[name] = node
+    return [n for n in latest.values() if n.get("state") == "CHANGES_REQUESTED"]
+
+
 def _review_is_stale(pr: dict[str, Any], review: dict[str, Any]) -> bool:
     """True when a review was made on a commit other than the PR's current head.
     Unknown commits (a drifted or partial response) are never stale."""
@@ -278,7 +296,7 @@ def review_state(pr: dict[str, Any]) -> str:
     if decision == "APPROVED":
         return "approved"
     if decision == "CHANGES_REQUESTED":
-        blocking = [r for r in _nodes(pr, "latestReviews") if r.get("state") == "CHANGES_REQUESTED"]
+        blocking = _blocking_reviews(pr)
         if blocking and all(_review_is_stale(pr, r) for r in blocking):
             return "changes-pushed"
         return "changes-requested"
@@ -610,7 +628,8 @@ def reviewers(pr: dict[str, Any]) -> list[dict[str, str]]:
     ``changes-pushed`` / ``commented`` / ``pending``.
 
     ``latestReviews`` already collapses a reviewer's history to their current
-    position, so it needs no de-duplication of its own; outstanding
+    position, so it needs no de-duplication of its own; a standing block that
+    ``latestReviews`` dropped (re-requested reviewer) is restored; outstanding
     ``reviewRequests`` are appended as ``pending``. A reviewer who has both (a
     re-request after a review) keeps their submitted state, since that is the
     position still on record. Total: malformed nodes are skipped, never raised.
@@ -626,6 +645,14 @@ def reviewers(pr: dict[str, Any]) -> list[dict[str, str]]:
         if state == "changes-requested" and _review_is_stale(pr, node):
             state = "changes-pushed"
         out.append({"name": name, "state": state})
+    # A re-requested reviewer is gone from `latestReviews` but their block stands.
+    for node in _blocking_reviews(pr):
+        name = _reviewer_name(node.get("author"))
+        if name is None or name in seen:
+            continue
+        seen.add(name)
+        stale = _review_is_stale(pr, node)
+        out.append({"name": name, "state": "changes-pushed" if stale else "changes-requested"})
     for node in _nodes(pr, "reviewRequests"):
         name = _reviewer_name(node.get("requestedReviewer"))
         if name is None or name in seen:
