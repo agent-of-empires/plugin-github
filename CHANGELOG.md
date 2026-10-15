@@ -4,6 +4,16 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [2.0.2](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.0.2) - 2026-10-15
+
+
+
+### Bug Fixes
+
+- **graphql:** Fetch up to 100 check contexts so the CI fix covers large PRs in [#103](https://github.com/agent-of-empires/plugin-github/pull/103) by [@Seluj78](https://github.com/Seluj78) ([`361ee1a`](https://github.com/agent-of-empires/plugin-github/commit/361ee1ab317073d2ca0639cf66b1337c5bf5e02e))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.0.1...v2.0.2
 ## [2.0.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.0.1) - 2026-10-14
 
 
