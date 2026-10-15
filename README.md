@@ -227,15 +227,25 @@ prepends a warn `note` telling the user a token unlocks review/CI/comments/merge
 
 The pane is one-PR-focused, and reads top to bottom:
 
-1. **PR selector.** Every PR in the session, most-actionable first (the same
-   attention ladder the session row uses, with merged PRs sinking below every open
-   one). Each row carries `#number`, the title, `branch · author`, and a glyph
-   strip for CI / review / conflicts / unresolved-comment count. Clicking a row
-   fires `github.select_pr { pr }`; the trailing arrow is a separate link to
-   GitHub, so picking a PR never navigates away. The selection is remembered in
-   memory per session, and falls back to the top of the list whenever the PR it
-   named is no longer in the snapshot (merged, closed, renamed).
-2. **Merge verdict** (`callout`). Why the PR can or cannot merge, derived here
+1. **PR selector.** Every PR in the session plus any additional members of its
+   GitHub-native stacks, most-actionable first (merged PRs sink below open ones).
+   Each row carries `#number`, the title, `branch · author`, and a glyph strip
+   for CI / review / conflicts / unresolved-comment count. Clicking a row fires
+   `github.select_pr { pr }`; the trailing arrow is a separate link to GitHub,
+   so picking a PR never navigates away or changes a checkout. Selection is
+   remembered per session and falls back to the top of the list if the PR leaves
+   the snapshot.
+2. **Stack map.** GitHub's native stack membership and ordering show the selected
+   PR's position and provide one-click selection of every layer. The readiness
+   row covers only unmerged PRs from the bottom through the selected PR: GitHub
+   must report each as `clean` (or already merged). A draft or known non-clean
+   merge state blocks the range; missing/unknown status is shown as unknown.
+   A fully merged range reads `Already merged`; closed, unmerged members are
+   blocked and do not count as open PRs or show an inferred review verdict.
+   PRs above the selected one do not affect its readiness. Stack data is cached
+   for up to five minutes (a manual refresh fetches it again) and may be absent
+   when GitHub does not return it.
+3. **Merge verdict** (`callout`). Why the PR can or cannot merge, derived here
    rather than fetched: `mergeStateStatus` collapses conflicts, policy, CI and
    review into one enum and so cannot say which is blocking. The ladder is
    draft, conflicts, changes requested, awaiting re-review, failing checks, running

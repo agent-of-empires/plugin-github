@@ -125,6 +125,7 @@ MAX_BACKOFF_SECS = 3600.0
 
 RepoKey = tuple[str, str, str]  # (owner, repo, branch)
 RichCacheKey = tuple[str, str, str, bool]
+StackCacheKey = tuple[str, str, int]
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,11 @@ _etag_cache: dict[RepoKey, dict[str, Any]] = {}  # key -> {"etag", "pulls"}
 # Last-good rich (GraphQL) result per key: {"pulls", "fetched_at"}. Serves the
 # TTL window and is the stale fallback while rate-limited.
 _graphql_cache: dict[RichCacheKey, dict[str, Any]] = {}
+# Last successful stack response per PR. The REST stack endpoint is separate
+# from the conditional open-PR poll, so bound its refresh cadence independently.
+_stack_cache: dict[StackCacheKey, dict[str, Any]] = {}
+STACK_CACHE_TTL = 300.0
+STACK_API_VERSION = "2026-03-10"
 # Last successful full refresh per session id, scoped to the repo-key set so a
 # changed workspace never inherits a timestamp from unrelated data.
 _session_refresh_cache: dict[str, dict[str, Any]] = {}
@@ -315,6 +321,170 @@ def _trim(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for pr in raw
         if isinstance(pr, dict)
     ]
+
+
+def _stack_pull(raw: dict[str, Any], owner: str, repo: str) -> dict[str, Any] | None:
+    """Trim one full REST PR response for stack navigation and readiness."""
+    number = raw.get("number")
+    head = raw.get("head")
+    base = raw.get("base")
+    mergeable_state = raw.get("mergeable_state")
+    if not isinstance(number, int) or isinstance(number, bool):
+        return None
+    return {
+        "number": number,
+        "url": raw.get("html_url") or f"https://github.com/{owner}/{repo}/pull/{number}",
+        "title": raw.get("title") or "",
+        "state": raw.get("state"),
+        "draft": bool(raw.get("draft")),
+        "merged": raw.get("merged_at") is not None,
+        "mergeable_state": mergeable_state if isinstance(mergeable_state, str) else None,
+        "head": (head.get("ref") if isinstance(head, dict) else None),
+        "base": (base.get("ref") if isinstance(base, dict) else None),
+    }
+
+
+def _stack_for_number(response: list[Any], number: int) -> dict[str, Any] | None:
+    return next(
+        (
+            item
+            for item in response
+            if isinstance(item, dict)
+            and isinstance(item.get("pull_requests"), list)
+            and any(isinstance(member, dict) and member.get("number") == number for member in item["pull_requests"])
+        ),
+        None,
+    )
+
+
+def _fetch_stack_members(client: GitHubClient, key: RepoKey, members: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(members, list) or not members:
+        return None
+    pulls: list[dict[str, Any]] = []
+    for member in members:
+        if not isinstance(member, dict):
+            return None
+        number = member.get("number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            return None
+        raw = client.get_json(
+            f"/repos/{key[0]}/{key[1]}/pulls/{number}",
+            api_version=STACK_API_VERSION,
+        )
+        if not isinstance(raw, dict):
+            return None
+        trimmed = _stack_pull(raw, key[0], key[1])
+        if trimmed is None:
+            return None
+        pulls.append(trimmed)
+    return pulls
+
+
+def _cache_stack(key: StackCacheKey, pulls: list[dict[str, Any]], fetched_at: float) -> None:
+
+    ttl = STACK_CACHE_TTL
+    if any(
+        pull.get("state") == "open" and not pull.get("draft") and pull.get("mergeable_state") in (None, "unknown")
+        for pull in pulls
+    ):
+        ttl = 15.0
+    with _cache_lock:
+        for pull in pulls:
+            _stack_cache[(key[0], key[1], pull["number"])] = {
+                "pulls": pulls,
+                "fetched_at": fetched_at,
+                "retry_at": 0.0,
+                "ttl": ttl,
+            }
+        if not pulls:
+            _stack_cache[key] = {"pulls": [], "fetched_at": fetched_at, "retry_at": 0.0, "ttl": STACK_CACHE_TTL}
+
+
+def _stale_stack(cache_key: StackCacheKey, cached: dict[str, Any] | None, now: float) -> list[dict[str, Any]] | None:
+    if cached is None:
+        return None
+    pulls = cached["pulls"]
+    with _cache_lock:
+        for pull in pulls:
+            key = (cache_key[0], cache_key[1], pull["number"])
+            if key in _stack_cache:
+                _stack_cache[key]["retry_at"] = now + STACK_CACHE_TTL
+        cached["retry_at"] = now + STACK_CACHE_TTL
+    return pulls
+
+
+def _fetch_stack(  # noqa: PLR0911
+    client: GitHubClient, key: RepoKey, number: int, *, force: bool = False
+) -> list[dict[str, Any]] | None:
+    """Return a stack in GitHub's bottom-to-top order, or ``None`` if unavailable."""
+    cache_key = (key[0], key[1], number)
+    now = time.monotonic()
+    with _cache_lock:
+        cached = _stack_cache.get(cache_key)
+        backoff = now < _backoff["rest"]["until"]
+    if backoff or (cached is not None and now < cached.get("retry_at", 0.0)):
+        return cached["pulls"] if cached is not None else None
+    if not force and cached is not None and now - cached["fetched_at"] < cached.get("ttl", STACK_CACHE_TTL):
+        return cached["pulls"]
+    try:
+        response = client.get_json(
+            f"/repos/{key[0]}/{key[1]}/stacks",
+            {"pull_request": str(number)},
+            api_version=STACK_API_VERSION,
+        )
+        if not isinstance(response, list):
+            return _stale_stack(cache_key, cached, now)
+        stack = _stack_for_number(response, number)
+        pulls = [] if stack is None else _fetch_stack_members(client, key, stack.get("pull_requests"))
+        if pulls is None:
+            return _stale_stack(cache_key, cached, now)
+        _cache_stack(cache_key, pulls, now)
+        return pulls
+    except RateLimitedError:
+        _set_backoff("rest")
+        return _stale_stack(cache_key, cached, now)
+    except GitHubError:
+        return _stale_stack(cache_key, cached, now)
+
+
+def _attach_stacks(  # noqa: C901
+    client: GitHubClient,
+    keys: list[RepoKey],
+    results: dict[RepoKey, dict[str, Any]],
+    *,
+    force: bool,
+) -> None:
+    """Attach native stack metadata and missing members to each fetched branch."""
+    refreshed: set[StackCacheKey] = set()
+    for key in keys:
+        result = results.get(key)
+        if not isinstance(result, dict):
+            continue
+        raw_pulls = result.get("pulls")
+        if not isinstance(raw_pulls, list):
+            continue
+        pulls = [dict(pull) for pull in raw_pulls if isinstance(pull, dict)]
+        result["pulls"] = pulls
+        for pull in list(pulls):
+            number = pull.get("number")
+            if not isinstance(number, int) or isinstance(number, bool):
+                continue
+            cache_key = (key[0], key[1], number)
+            stack = _fetch_stack(client, key, number, force=force and cache_key not in refreshed)
+            if stack:
+                refreshed.update((key[0], key[1], member["number"]) for member in stack)
+            if not stack:
+                if stack == []:
+                    pull["stack"] = []
+                continue
+            pull["stack"] = stack
+            for member in stack:
+                existing = next((item for item in pulls if item.get("number") == member["number"]), None)
+                if existing is None:
+                    pulls.append(dict(member, stack=stack, stack_only=True))
+                else:
+                    existing["stack"] = stack
+                    existing["mergeable_state"] = member["mergeable_state"]
 
 
 def _reset_to_monotonic(reset_at: Any) -> float | None:
@@ -1019,13 +1189,13 @@ def _fetch_all(
     token = _resolve_optional_token(env)
     present = token is not None
     ordered = sorted(keys)
-    results: dict[RepoKey, dict[str, Any]] = {}
     with GitHubClient(token=token, transport=transport) as client:
         if present:
             results = _fetch_rich(client, ordered, force=force, required_checks_only=required_checks_only)
         else:
             with ThreadPoolExecutor(max_workers=REST_PROBE_WORKERS) as pool:
                 results = dict(zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True))
+        _attach_stacks(client, ordered, results, force=force)
     return results, present
 
 

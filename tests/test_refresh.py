@@ -71,6 +71,7 @@ def _clear_cache():
     def _reset():
         refresh._etag_cache.clear()
         refresh._graphql_cache.clear()
+        refresh._stack_cache.clear()
         refresh._session_refresh_cache.clear()
         refresh._backoff["rest"].update({"until": 0.0, "reset_known": False})
         refresh._backoff["graphql"].update({"until": 0.0, "reset_known": False})
@@ -176,7 +177,8 @@ def test_dedup_fetches_a_shared_key_once(tmp_path):
         {"id": "s2", "project_path": str(ws2)},
     ]
     refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull()], capture=captured))
-    assert len(captured) == 1  # (o, r, feature) fetched once, not twice
+    assert sum(request.url.path.endswith("/pulls") for request in captured) == 1
+    assert sum(request.url.path.endswith("/stacks") for request in captured) == 1
 
 
 def test_etag_304_reuses_cached_pulls(tmp_path):
@@ -604,6 +606,112 @@ def test_required_check_mode_uses_separate_rich_cache(tmp_path):
     )
     assert len(gql) == 2
     assert required_snap["sessions"][0]["repos"][0]["pulls"][0]["checks"]["state"] == "succeeded"
+
+
+def test_snapshot_includes_native_stack_order_and_mergeability(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+
+    stack = {
+        "pull_requests": [
+            {"number": 11},
+            {"number": 12},
+            {"number": 13},
+        ]
+    }
+    details = {
+        11: {
+            "number": 11,
+            "html_url": "https://github.com/o/r/pull/11",
+            "title": "base",
+            "state": "open",
+            "merged_at": None,
+            "draft": False,
+            "mergeable_state": "clean",
+            "head": {"ref": "base"},
+            "base": {"ref": "main"},
+        },
+        12: {
+            "number": 12,
+            "html_url": "https://github.com/o/r/pull/12",
+            "title": "selected",
+            "state": "open",
+            "merged_at": None,
+            "draft": False,
+            "mergeable_state": "clean",
+            "head": {"ref": "middle"},
+            "base": {"ref": "base"},
+        },
+        13: {
+            "number": 13,
+            "html_url": "https://github.com/o/r/pull/13",
+            "title": "top",
+            "state": "open",
+            "merged_at": None,
+            "draft": True,
+            "mergeable_state": "draft",
+            "head": {"ref": "top"},
+            "base": {"ref": "middle"},
+        },
+    }
+
+    def handler(request):
+        if request.url.path.endswith("/stacks"):
+            return httpx.Response(200, json=[stack])
+        if "/pulls/" in request.url.path:
+            return httpx.Response(200, json=details[int(request.url.path.rsplit("/", 1)[1])])
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=12)])
+
+    snapshot = refresh.build_snapshot(
+        [{"id": "s1", "project_path": str(ws)}], env=_NoToken(), transport=httpx.MockTransport(handler)
+    )
+    pulls = snapshot["sessions"][0]["repos"][0]["pulls"]
+    selected = next(pull for pull in pulls if pull["number"] == 12)
+    assert [pull["number"] for pull in selected["stack"]] == [11, 12, 13]
+    assert [pull["number"] for pull in pulls] == [12, 11, 13]
+    assert selected["stack"][1]["mergeable_state"] == "clean"
+
+
+def test_stack_cache_revalidates_on_forced_refresh():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json=[])
+
+    with refresh.GitHubClient(transport=httpx.MockTransport(handler)) as client:
+        assert refresh._fetch_stack(client, ("o", "r", "feature"), 12) == []
+        assert refresh._fetch_stack(client, ("o", "r", "feature"), 12) == []
+        assert refresh._fetch_stack(client, ("o", "r", "feature"), 12, force=True) == []
+
+    assert len(requests) == 2
+    assert all(request.url.params["pull_request"] == "12" for request in requests)
+
+
+def test_stack_fetch_obeys_rest_backoff_and_uses_stale_cache():
+    key = ("o", "r", 12)
+    stale = [{"number": 12, "state": "open"}]
+    refresh._stack_cache[key] = {"pulls": stale, "fetched_at": 0.0, "retry_at": 0.0, "ttl": 1.0}
+    refresh._backoff["rest"]["until"] = time.monotonic() + 60
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json=[])
+
+    with refresh.GitHubClient(transport=httpx.MockTransport(handler)) as client:
+        assert refresh._fetch_stack(client, ("o", "r", "feature"), 12) == stale
+    assert requests == []
+
+
+def test_stack_rate_limit_arms_rest_backoff():
+    def handler(_request):
+        return httpx.Response(429, json={"message": "rate limited"})
+
+    with refresh.GitHubClient(transport=httpx.MockTransport(handler)) as client:
+        assert refresh._fetch_stack(client, ("o", "r", "feature"), 12) is None
+    assert refresh._backoff["rest"]["until"] > time.monotonic()
 
 
 def test_graphql_rate_limit_serves_stale(tmp_path):
