@@ -81,6 +81,34 @@ def test_review_state_decision_wins():
     assert graphql.review_state(_pr(decision="CHANGES_REQUESTED")) == "changes-requested"
 
 
+def _latest(state, oid, login="jules"):
+    return {"state": state, "author": {"login": login}, "commit": {"oid": oid}}
+
+
+def test_review_state_changes_pushed_only_when_every_blocking_review_is_stale():
+    def pr(*latest):
+        out = _pr(decision="CHANGES_REQUESTED")
+        out["headRefOid"] = "new"
+        out["latestReviews"] = {"nodes": list(latest)}
+        return out
+
+    cases = [
+        # Pushed since the only blocking review.
+        ([_latest("CHANGES_REQUESTED", "old")], "changes-pushed"),
+        # Reviewed the current head: still a live block.
+        ([_latest("CHANGES_REQUESTED", "new")], "changes-requested"),
+        # One blocking reviewer is current, so the PR is not yet "pushed since".
+        ([_latest("CHANGES_REQUESTED", "old"), _latest("CHANGES_REQUESTED", "new", "nate")], "changes-requested"),
+        # An approval does not count as blocking, however old.
+        ([_latest("CHANGES_REQUESTED", "old"), _latest("APPROVED", "old", "nate")], "changes-pushed"),
+        # Unknown commit or no review data degrades to the conservative state.
+        ([{"state": "CHANGES_REQUESTED", "author": {"login": "jules"}}], "changes-requested"),
+        ([], "changes-requested"),
+    ]
+    for latest, expected in cases:
+        assert graphql.review_state(pr(*latest)) == expected, latest
+
+
 def test_review_state_infers_commented_from_review_or_thread():
     assert graphql.review_state(_pr(reviews=[{"state": "COMMENTED"}])) == "commented"
     assert graphql.review_state(_pr(threads=[_thread(resolved=False)])) == "commented"
@@ -516,6 +544,8 @@ def test_reviewers_merge_latest_reviews_with_outstanding_requests():
         {"name": "half-written", "state": "pending"},
         {"name": "platform-team", "state": "pending"},
     ]
+    stale = {"headRefOid": "new", "latestReviews": {"nodes": [_latest("CHANGES_REQUESTED", "old")]}}
+    assert graphql.reviewers(stale) == [{"name": "jules", "state": "changes-pushed"}]
     # Total: a malformed PR yields no reviewers rather than raising.
     assert graphql.reviewers({}) == []
 
@@ -529,6 +559,8 @@ def test_review_summary_reads_the_way_github_does():
         ([{"name": "a", "state": "pending"}, {"name": "b", "state": "pending"}], "2 pending"),
         # A blocking review wins regardless of how many approvals sit beside it.
         ([{"name": "a", "state": "approved"}, {"name": "b", "state": "changes-requested"}], "changes requested"),
+        ([{"name": "a", "state": "approved"}, {"name": "b", "state": "changes-pushed"}], "pushed since review"),
+        ([{"name": "a", "state": "changes-pushed"}, {"name": "b", "state": "changes-requested"}], "changes requested"),
     ]
     for people, expected in cases:
         assert graphql.review_summary(people) == expected, people

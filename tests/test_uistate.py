@@ -447,6 +447,19 @@ def test_activity_card_renders_timeline_rows_newest_first(monkeypatch):
     ]
 
 
+def test_column_shows_pushed_since_review_as_info_not_attention():
+    payload = _column_payload([_repo(pulls=[_rich_pull(review="changes-pushed")])])
+    assert payload["text"] == "pushed since review"
+    assert payload["tone"] == "info"
+    assert payload["sort_value"] == uistate._ATTENTION_VISUAL["changes-pushed"][0]
+    # Ranks below a live "changes requested" and above "awaiting review".
+    assert (
+        uistate._ATTENTION_VISUAL["changes-requested"][0]
+        < uistate._ATTENTION_VISUAL["changes-pushed"][0]
+        < uistate._ATTENTION_VISUAL["awaiting-review"][0]
+    )
+
+
 def test_merge_verdict_ladder_orders_blockers_by_who_can_clear_them():
     # One case per rung, so the precedence between them is pinned in one place.
     running = {"state": "running", "runs": [{"name": "Cargo Test", "state": "running"}]}
@@ -456,6 +469,7 @@ def test_merge_verdict_ladder_orders_blockers_by_who_can_clear_them():
         (_rich_pull(draft=True, merge_state="conflicts"), "Draft", "draft"),
         (_rich_pull(review="approved", merge_state="conflicts"), "Conflicts with base", "conflicts"),
         (_rich_pull(review="changes-requested", checks=failing), "Changes requested", "changes requested"),
+        (_rich_pull(review="changes-pushed", checks=failing), "Awaiting re-review", "pushed since review"),
         (_rich_pull(review="approved", checks=failing), "1 check failing", "blocked"),
         (_rich_pull(review="approved", checks=running), "1 check running", "in progress"),
         (_rich_pull(review="approved", comments=unresolved), "2 unresolved comments", "unresolved"),

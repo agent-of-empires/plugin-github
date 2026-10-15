@@ -85,6 +85,9 @@ _ICON_ERROR = "circle-alert"
 _REVIEW_VISUAL: dict[str, tuple[str, str, str]] = {
     "approved": ("badge-check", "success", "approved"),
     "changes-requested": ("circle-x", "danger", "changes requested"),
+    # Blocking review made on an older commit: still merge-blocking on GitHub, but
+    # likely addressed, so it reads as info rather than an alarm.
+    "changes-pushed": ("refresh-cw", "info", "pushed since review"),
     "commented": ("message-square", "info", "commented"),
     "waiting": ("clock", "neutral", "awaiting review"),
 }
@@ -115,11 +118,12 @@ _ATTENTION_VISUAL: dict[str, tuple[int, str, str, str]] = {
     "unresolved": (4, "message-square", "warn", "unresolved comments"),
     "checks-running": (5, *_CHECK_VISUAL["running"][:2], "CI running"),
     "checks-queued": (6, *_CHECK_VISUAL["queued"][:2], "CI queued"),
-    "awaiting-review": (7, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
-    "commented": (8, *_REVIEW_VISUAL["commented"][:2], "commented"),
-    "approved": (9, *_REVIEW_VISUAL["approved"][:2], "approved"),
-    "open": (10, _ICON_OPEN, "success", "open PR"),
-    "draft": (11, _ICON_DRAFT, "warn", "draft"),
+    "changes-pushed": (7, *_REVIEW_VISUAL["changes-pushed"][:2], "pushed since review"),
+    "awaiting-review": (8, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
+    "commented": (9, *_REVIEW_VISUAL["commented"][:2], "commented"),
+    "approved": (10, *_REVIEW_VISUAL["approved"][:2], "approved"),
+    "open": (11, _ICON_OPEN, "success", "open PR"),
+    "draft": (12, _ICON_DRAFT, "warn", "draft"),
 }
 
 
@@ -128,6 +132,7 @@ _ATTENTION_VISUAL: dict[str, tuple[int, str, str, str]] = {
 # a user hide a whole category from the session row; the pane still shows it.
 _KIND_CATEGORY: dict[str, str] = {
     "changes-requested": "review",
+    "changes-pushed": "review",
     "awaiting-review": "review",
     "commented": "review",
     "approved": "review",
@@ -167,6 +172,7 @@ def _pull_attention(pull: dict[str, Any], chips: frozenset[str]) -> str:
         (bool(unresolved), "unresolved"),
         (cstate == "running", "checks-running"),
         (cstate == "queued", "checks-queued"),
+        (review == "changes-pushed", "changes-pushed"),
         (review == "waiting", "awaiting-review"),
         (review == "commented", "commented"),
         (review == "approved", "approved"),
@@ -796,6 +802,15 @@ def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
                 "A reviewer asked for changes before this can merge.",
                 _REVIEW_VISUAL["changes-requested"][:2],
                 "changes requested",
+            ),
+        ),
+        (
+            pull.get("review_state") == "changes-pushed",
+            _verdict(
+                "Awaiting re-review",
+                "Changes were requested; commits were pushed since. A reviewer must re-review or dismiss.",
+                _REVIEW_VISUAL["changes-pushed"][:2],
+                "pushed since review",
             ),
         ),
         (

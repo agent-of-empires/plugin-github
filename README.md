@@ -238,8 +238,12 @@ The pane is one-PR-focused, and reads top to bottom:
 2. **Merge verdict** (`callout`). Why the PR can or cannot merge, derived here
    rather than fetched: `mergeStateStatus` collapses conflicts, policy, CI and
    review into one enum and so cannot say which is blocking. The ladder is
-   draft, conflicts, changes requested, failing checks, running checks, unresolved
-   comments, ready, awaiting review, ordered by who can clear the block. **This
+   draft, conflicts, changes requested, awaiting re-review, failing checks, running
+   checks, unresolved comments, ready, awaiting review, ordered by who can clear
+   the block. "Awaiting re-review" (`pushed since review` in the row) is a
+   changes-requested decision whose blocking reviews were all made on an older
+   commit; it still blocks the merge on GitHub until the reviewer re-reviews or
+   dismisses, but reads as info, not an alarm. **This
    plugin never merges for you:** a mergeable PR gets a link out to GitHub, and a
    blocked one an inert button naming the block.
 3. **Review.** One row per reviewer (initials, name, current position), from

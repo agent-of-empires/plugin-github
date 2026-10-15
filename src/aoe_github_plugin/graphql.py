@@ -67,7 +67,7 @@ fragment PRConnection on PullRequestConnection {
       ... on StatusContext { context state targetUrl createdAt }
     } } } } } }
     reviews(last: 1, states: [COMMENTED]) { nodes { state } }
-    latestReviews(first: 20) { nodes { state author { login } } }
+    latestReviews(first: 20) { nodes { state author { login } commit { oid } } }
     reviewRequests(first: 20) { nodes { requestedReviewer {
       __typename
       ... on User { login }
@@ -255,8 +255,21 @@ def excerpt(text: Any, limit: int = EXCERPT_LEN) -> str:
     return collapsed if len(collapsed) <= limit else collapsed[: limit - 1].rstrip() + "…"
 
 
+def _review_is_stale(pr: dict[str, Any], review: dict[str, Any]) -> bool:
+    """True when a review was made on a commit other than the PR's current head.
+    Unknown commits (a drifted or partial response) are never stale."""
+    commit = review.get("commit")
+    oid = commit.get("oid") if isinstance(commit, dict) else None
+    head = pr.get("headRefOid")
+    return isinstance(oid, str) and isinstance(head, str) and oid != head
+
+
 def review_state(pr: dict[str, Any]) -> str:
-    """``approved`` / ``changes-requested`` / ``commented`` / ``waiting``.
+    """``approved`` / ``changes-requested`` / ``changes-pushed`` / ``commented`` / ``waiting``.
+
+    ``changes-pushed`` is a ``CHANGES_REQUESTED`` decision whose blocking reviews
+    were all made on an older commit: the author has pushed since, so the review
+    still blocks the merge on GitHub but is likely addressed and awaits a re-review.
 
     ``commented`` is inferred (see module docstring): a COMMENTED review or any
     unresolved thread, when the decision is neither approved nor changes-needed.
@@ -265,6 +278,9 @@ def review_state(pr: dict[str, Any]) -> str:
     if decision == "APPROVED":
         return "approved"
     if decision == "CHANGES_REQUESTED":
+        blocking = [r for r in _nodes(pr, "latestReviews") if r.get("state") == "CHANGES_REQUESTED"]
+        if blocking and all(_review_is_stale(pr, r) for r in blocking):
+            return "changes-pushed"
         return "changes-requested"
     reviews = _nodes(pr, "reviews")
     threads = _nodes(pr, "reviewThreads")
@@ -591,7 +607,7 @@ def _reviewer_name(reviewer: Any) -> str | None:
 def reviewers(pr: dict[str, Any]) -> list[dict[str, str]]:
     """One entry per person whose opinion this PR is waiting on or has:
     ``[{"name", "state"}]`` where state is ``approved`` / ``changes-requested`` /
-    ``commented`` / ``pending``.
+    ``changes-pushed`` / ``commented`` / ``pending``.
 
     ``latestReviews`` already collapses a reviewer's history to their current
     position, so it needs no de-duplication of its own; outstanding
@@ -606,7 +622,10 @@ def reviewers(pr: dict[str, Any]) -> list[dict[str, str]]:
         if name is None or name in seen:
             continue
         seen.add(name)
-        out.append({"name": name, "state": _REVIEW_NODE_STATE.get(node.get("state") or "", "pending")})
+        state = _REVIEW_NODE_STATE.get(node.get("state") or "", "pending")
+        if state == "changes-requested" and _review_is_stale(pr, node):
+            state = "changes-pushed"
+        out.append({"name": name, "state": state})
     for node in _nodes(pr, "reviewRequests"):
         name = _reviewer_name(node.get("requestedReviewer"))
         if name is None or name in seen:
@@ -624,6 +643,8 @@ def review_summary(people: list[dict[str, str]]) -> str:
         return ""
     if any(p["state"] == "changes-requested" for p in people):
         return "changes requested"
+    if any(p["state"] == "changes-pushed" for p in people):
+        return "pushed since review"
     approved = sum(1 for p in people if p["state"] == "approved")
     if approved == len(people):
         return f"{approved} approved" if approved != 1 else "1 approved"
