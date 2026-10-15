@@ -4,6 +4,16 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [2.0.4](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.0.4) - 2026-10-15
+
+
+
+### Bug Fixes
+
+- **graphql:** Read a re-requested reviewer's standing block from decidedReviews in [#107](https://github.com/agent-of-empires/plugin-github/pull/107) by [@Seluj78](https://github.com/Seluj78) ([`3b6d984`](https://github.com/agent-of-empires/plugin-github/commit/3b6d98461c071ff0120a814367ba02f7d690e05a))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.0.3...v2.0.4
 ## [2.0.3](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.0.3) - 2026-10-15
 
 
