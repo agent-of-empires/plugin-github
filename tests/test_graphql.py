@@ -393,11 +393,13 @@ def test_normalize_pull_with_no_commit_or_threads_does_not_raise():
 def test_normalize_pull_exposes_merge_queue_and_degrades_without_entry():
     queued = _pr(decision="APPROVED")
     queued["mergeQueueEntry"] = {"position": 2, "state": "AWAITING_CHECKS"}
+    queued["mergeQueue"] = {"url": "https://github.com/o/r/queue/main"}
     without_queue = _pr()
     without_queue["mergeQueueEntry"] = None
     assert graphql.normalize_connection(_conn(queued))[0]["merge_queue"] == {
         "position": 2,
         "state": "awaiting-checks",
+        "url": "https://github.com/o/r/queue/main",
     }
     assert graphql.normalize_connection(_conn(without_queue))[0]["merge_queue"] is None
 
@@ -422,6 +424,7 @@ def test_build_query_aliases_each_branch_with_variables():
     assert "reviewThreads(first: 100)" in q
     assert "pageInfo { hasNextPage endCursor }" in q
     assert "mergeQueueEntry { position state }" in q
+    assert "mergeQueue { url }" in q
 
 
 def test_build_query_single_alias_is_just_one_branch():

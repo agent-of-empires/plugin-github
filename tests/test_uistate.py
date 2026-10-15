@@ -802,9 +802,10 @@ def test_merge_queue_is_visible_in_badge_column_and_verdict():
     assert verdict["ready"] is False
 
 
-def test_merge_queue_state_renders_in_pr_selector_and_not_as_direct_merge():
+def test_merge_queue_state_renders_in_pr_selector_and_links_to_queue():
     pull = _rich_pull(review="approved")
-    pull["merge_queue"] = {"position": 1, "state": "awaiting-checks"}
+    queue_url = "https://github.com/o/r/queue/main"
+    pull["merge_queue"] = {"position": 1, "state": "awaiting-checks", "url": queue_url}
     params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])])))
     blocks = _pane(params)["payload"]["blocks"]
     row = _rows(blocks)[0]
@@ -812,8 +813,17 @@ def test_merge_queue_state_renders_in_pr_selector_and_not_as_direct_merge():
     assert any("awaiting merge queue checks" in badge["tooltip"] for badge in row["badges"])
     assert callout["title"] == "Awaiting merge queue checks"
     assert callout["actions"][0]["label"] == "View queue on GitHub"
-    assert callout["actions"][0]["href"] == pull["url"]
+    assert callout["actions"][0]["href"] == queue_url
+    assert callout["actions"][0]["href"] != pull["url"]
     assert "disabled" not in callout["actions"][0]
+
+
+def test_merge_queue_without_queue_url_does_not_link_to_pull():
+    pull = _rich_pull(review="approved")
+    pull["merge_queue"] = {"position": 1, "state": "queued"}
+    action = _callout([_repo(pulls=[pull])])["actions"][0]
+    assert action["disabled"] is True
+    assert "href" not in action
 
 
 def _callout(repos):

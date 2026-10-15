@@ -45,6 +45,7 @@ fragment PRConnection on PullRequestConnection {
   nodes {
     id number title url state isDraft merged mergeable reviewDecision updatedAt headRefOid
     mergeQueueEntry { position state }
+    mergeQueue { url }
     baseRefName additions deletions changedFiles
     author { login }
     baseRef { branchProtectionRule {
@@ -332,10 +333,15 @@ def _merge_queue(pr: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(position, int) or isinstance(position, bool) or position < 1:
         position = None
     state = entry.get("state")
-    return {
+    queue = pr.get("mergeQueue")
+    queue_url = queue.get("url") if isinstance(queue, dict) else None
+    normalized = {
         "position": position,
         "state": state.lower().replace("_", "-") if isinstance(state, str) and state else "unknown",
     }
+    if isinstance(queue_url, str) and queue_url:
+        normalized["url"] = queue_url
+    return normalized
 
 
 # Per-check conclusion -> our state vocabulary. Anything unlisted reads "unknown".

@@ -120,11 +120,11 @@ _ATTENTION_VISUAL: dict[str, tuple[int, str, str, str]] = {
     "checks-running": (6, *_CHECK_VISUAL["running"][:2], "CI running"),
     "checks-queued": (7, *_CHECK_VISUAL["queued"][:2], "CI queued"),
     "changes-pushed": (8, *_REVIEW_VISUAL["changes-pushed"][:2], "pushed since review"),
-    "awaiting-review": (8, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
-    "commented": (9, *_REVIEW_VISUAL["commented"][:2], "commented"),
-    "approved": (10, *_REVIEW_VISUAL["approved"][:2], "approved"),
-    "open": (11, _ICON_OPEN, "success", "open PR"),
-    "draft": (12, _ICON_DRAFT, "warn", "draft"),
+    "awaiting-review": (9, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
+    "commented": (10, *_REVIEW_VISUAL["commented"][:2], "commented"),
+    "approved": (11, *_REVIEW_VISUAL["approved"][:2], "approved"),
+    "open": (12, _ICON_OPEN, "success", "open PR"),
+    "draft": (13, _ICON_DRAFT, "warn", "draft"),
 }
 
 
@@ -936,14 +936,16 @@ def _merge_callout(pull: dict[str, Any]) -> dict[str, Any]:
     and a blocked one gets an inert button.
     """
     verdict = _merge_verdict(pull)
-    if isinstance(pull.get("merge_queue"), dict) and pull.get("url"):
-        action = {
+    queue = pull.get("merge_queue")
+    queue_url = queue.get("url") if isinstance(queue, dict) else None
+    if isinstance(queue, dict) and isinstance(queue_url, str) and queue_url:
+        action: dict[str, Any] = {
             "kind": "action",
             "label": "View queue on GitHub",
             "variant": "primary",
             "icon": "git-merge",
-            "href": pull["url"],
-            "tooltip": "Opens this pull request on GitHub; this plugin never changes the merge queue.",
+            "href": queue_url,
+            "tooltip": "Opens this pull request's merge queue on GitHub.",
         }
     elif verdict["ready"] and pull.get("url"):
         action = {
