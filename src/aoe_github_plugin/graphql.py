@@ -35,9 +35,11 @@ from datetime import timezone
 # - reviewThreads first:100 with pageInfo, so a big review (e.g. a CodeRabbit
 #   pass) surfaces every unresolved comment; refresh paginates by the node ``id``
 #   for the rare PR that still has more (#28).
-# contexts stays at first:50 ON PURPOSE: the per-check rows are ranked
-# failure-first CLIENT-side (see check_summary), so truncating the connection
-# could drop a failing check past the cap and render a PR falsely green.
+# contexts is first:100 (GitHub's connection max, same point cost as first:50) ON
+# PURPOSE: the per-check rows are ranked failure-first CLIENT-side (see
+# check_summary), so truncating the connection could drop a failing check past the
+# cap and render a PR falsely green. A PR with 50+ checks is routine, and
+# check_summary keeps the raw rollup whenever the page is still truncated.
 _PR_CONNECTION_FRAGMENT = """
 fragment PRConnection on PullRequestConnection {
   nodes {
@@ -49,7 +51,7 @@ fragment PRConnection on PullRequestConnection {
       requiredStatusCheckContexts
       requiredStatusChecks { context app { databaseId slug name } }
     } }
-    commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 50) { totalCount nodes {
+    commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { totalCount nodes {
       __typename
       ... on CheckRun {
         name status conclusion detailsUrl startedAt completedAt

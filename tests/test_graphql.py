@@ -207,6 +207,23 @@ def test_check_summary_state_keeps_rollup_when_contexts_truncated():
     assert graphql.check_summary(_pr(rollup=rollup))["state"] == "failing"
 
 
+def test_check_summary_state_green_for_pr_with_more_than_fifty_checks():
+    # 56 contexts, a superseded failure, and every latest run green (#98 follow-up):
+    # the page must hold them all so the headline is not pinned to the sticky rollup.
+    runs = [_checkrun(f"job-{i}", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:05:00Z") for i in range(54)]
+    runs += [
+        _checkrun("flaky", "COMPLETED", "FAILURE", completed_at="2024-01-01T00:00:00Z"),
+        _checkrun("flaky", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:05:00Z"),
+    ]
+    summary = graphql.check_summary(_pr(rollup=_rollup("FAILURE", runs, total=56)))
+    assert summary["state"] == "succeeded"
+
+
+def test_queries_fetch_a_full_page_of_contexts():
+    # first:100 is GitHub's connection max and costs the same points as first:50.
+    assert "contexts(first: 100)" in graphql.build_query(1)
+
+
 def test_check_summary_state_falls_back_to_rollup_without_runs():
     assert graphql.check_summary(_pr(rollup=_rollup("SUCCESS", [])))["state"] == "succeeded"
     assert graphql.check_summary(_pr(rollup=_rollup("PENDING", [])))["state"] == "running"
