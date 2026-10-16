@@ -11,7 +11,7 @@
 
 id = "agent-of-empires.github"
 name = "GitHub"
-version = "2.2.0"
+version = "2.2.1"
 # Manifest schema / host API version. api_version 5 added the [[screenshots]]
 # list (declared below); 6 lets a command declare a client-executed `action`
 # (the `open_pr` command below uses `open-ui-link`); 7 adds the `icon` /
@@ -174,7 +174,7 @@ default = true
 [[settings]]
 key = "ignored_commenters"
 label = "Ignored commenters"
-description = "Comma-separated GitHub logins (e.g. bots) whose comments never mark a PR as \"commented\". Their unresolved threads still count as unresolved comments. Case-insensitive; a [bot] suffix is optional."
+description = "Comma-separated GitHub logins (e.g. bots) whose comments never mark a PR as \"commented\" (the PR author's own comments never do either). Their unresolved threads still count as unresolved comments. Case-insensitive; a [bot] suffix is optional."
 type = "string"
 default = "coderabbitai, codecov"
 advanced = true

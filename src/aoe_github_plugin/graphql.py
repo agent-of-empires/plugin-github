@@ -336,14 +336,18 @@ def parse_ignored_commenters(raw: Any) -> frozenset[str]:
 
 def drop_ignored_commenters(pull: dict[str, Any], ignored: frozenset[str]) -> dict[str, Any]:
     """``pull`` with ``commented`` downgraded to ``waiting`` when every commenter
-    is ignored (bots like CodeRabbit), so the row reads "commented" only for a
-    person. Returns a copy, never mutating the cached pull. A pull without
-    ``commenters`` (basic REST shape, an older persisted snapshot) is untouched.
-    Unresolved-comment counts are unaffected: bot threads still surface there."""
+    is ignored (bots like CodeRabbit) or is the PR author (replying to a review
+    thread posts a COMMENTED review), so the row reads "commented" only when
+    someone else did. Returns a copy, never mutating the cached pull. A pull
+    without ``commenters`` (basic REST shape, an older persisted snapshot) is
+    untouched. Unresolved-comment counts are unaffected: bot threads still
+    surface there."""
     names = pull.get("commenters")
-    if pull.get("review_state") != "commented" or not ignored or not isinstance(names, list):
+    if pull.get("review_state") != "commented" or not isinstance(names, list):
         return pull
-    if any(not isinstance(n, str) or _login_key(n) not in ignored for n in names):
+    author = pull.get("author")
+    skip = ignored | {_login_key(author)} if isinstance(author, str) and author else ignored
+    if any(not isinstance(n, str) or _login_key(n) not in skip for n in names):
         return pull
     return {**pull, "review_state": "waiting"}
 

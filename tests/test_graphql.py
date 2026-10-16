@@ -158,6 +158,10 @@ def test_ignored_commenters_only_downgrade_bot_only_commented():
     ]
     assert graphql.drop_ignored_commenters(human, ignored)["review_state"] == "commented"
     assert graphql.drop_ignored_commenters(pull, frozenset())["review_state"] == "commented"
+    # The PR author replying to threads on their own PR is not "commented".
+    own = {**human, "author": "Seluj78", "commenters": ["Seluj78", "coderabbitai"]}
+    assert graphql.drop_ignored_commenters(own, ignored)["review_state"] == "waiting"
+    assert graphql.drop_ignored_commenters({**own, "author": "lucas"}, ignored)["review_state"] == "commented"
     # An older persisted pull with no commenters is left alone.
     assert graphql.drop_ignored_commenters({"review_state": "commented"}, ignored)["review_state"] == "commented"
 
