@@ -181,7 +181,7 @@ def test_pane_leads_with_a_pr_selector_and_folds_repos_without_prs():
     # The only PR is selected by default, and clicking a row names it by key.
     assert selector[0]["selected"] is True
     assert selector[0]["method"] == uistate.SELECT_METHOD
-    assert selector[0]["params"] == {"pr": "o/r#9"}
+    assert selector[0]["params"] == {"pr": "github.com/o/r#9"}
     other = next(b for b in blocks if b.get("kind") == "section" and b.get("title") == "Other repos (1)")
     assert other["collapsed"] is True
     assert other["children"][0]["value"] == "no open PR"
@@ -290,7 +290,7 @@ def _rich_pull(  # noqa: PLR0913
 
 
 def _auth_snapshot(*sessions, present=True):
-    return {"sessions": list(sessions), "auth": {"present": present}}
+    return {"sessions": list(sessions), "version": 2, "auth": {"github.com": {"present": present}}}
 
 
 def test_merged_pr_uses_purple_color_and_is_omitted_from_badge():
@@ -381,15 +381,15 @@ def test_selection_points_the_detail_at_the_chosen_pr_and_survives_nothing_else(
     assert next(x for x in default_pane["blocks"] if x.get("kind") == "callout")["title"] == "Changes requested"
 
     # Choosing the other PR re-points the detail without touching the selector order.
-    chosen = _pane(uistate.snapshot_ui_state_params(snapshot, selected={"s1": "o/r#1"}))["payload"]
+    chosen = _pane(uistate.snapshot_ui_state_params(snapshot, selected={"s1": "github.com/o/r#1"}))["payload"]
     assert next(x for x in chosen["blocks"] if x.get("kind") == "callout")["title"] == "Ready to merge"
     selector = chosen["blocks"][0]["children"]
-    assert [r["params"]["pr"] for r in selector] == ["o/r#2", "o/r#1"]
+    assert [r["params"]["pr"] for r in selector] == ["github.com/o/r#2", "github.com/o/r#1"]
     assert [r["selected"] for r in selector] == [False, True]
 
     # A key naming a PR that is no longer in the snapshot falls back to the top of
     # the list rather than stranding the pane on a dead selection.
-    stale = _pane(uistate.snapshot_ui_state_params(snapshot, selected={"s1": "o/r#999"}))["payload"]
+    stale = _pane(uistate.snapshot_ui_state_params(snapshot, selected={"s1": "github.com/o/r#999"}))["payload"]
     assert stale["blocks"][0]["children"][0]["selected"] is True
 
 
@@ -537,7 +537,7 @@ def test_pane_selector_ranks_open_prs_above_merged_ones():
     blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(session)))["payload"]["blocks"]
     selector = blocks[0]["children"]
     # The open PR outranks the merged one and is what the pane details by default.
-    assert [r["params"]["pr"] for r in selector] == ["o/open#1", "o/merged#5"]
+    assert [r["params"]["pr"] for r in selector] == ["github.com/o/open#1", "github.com/o/merged#5"]
     assert selector[0]["selected"] is True
     assert selector[1]["selected"] is False
 
@@ -1000,3 +1000,32 @@ def test_rate_limit_note_suppressed_without_github_repo():
         "blocks"
     ]
     assert not [b for b in blocks if b.get("kind") == "note"]
+
+
+def test_auth_note_follows_selected_pr_host():
+    public = {**_repo(name="public", pulls=[_rich_pull()]), "host": "github.com"}
+    enterprise_pull = {**_rich_pull(), "url": "https://gh.corp/o/r/pull/5"}
+    server = {**_repo(name="server", pulls=[enterprise_pull]), "host": "gh.corp"}
+    snap = {
+        "version": 2,
+        "sessions": [_session(repos=[public, server])],
+        "auth": {"github.com": {"present": True}, "gh.corp": {"present": False}},
+    }
+
+    def notes_for(repo, pull):
+        selected = {"s1": uistate._pull_key(repo, pull)}
+        blocks = _pane(uistate.snapshot_ui_state_params(snap, selected=selected))["payload"]["blocks"]
+        return "\n".join(b.get("text", "") for b in blocks if b["kind"] == "note")
+
+    assert "No token" not in notes_for(public, public["pulls"][0])
+    note = notes_for(server, enterprise_pull)
+    assert "No token for gh.corp" in note
+    assert "gh auth login --hostname gh.corp" in note
+    assert "GH_HOST=gh.corp" in note
+
+
+def test_ghes_auth_note_with_no_pulls():
+    repo = {**_repo(), "host": "gh.corp"}
+    snap = {"version": 2, "sessions": [_session(repos=[repo])], "auth": {"gh.corp": {"present": False}}}
+    blocks = _pane(uistate.snapshot_ui_state_params(snap))["payload"]["blocks"]
+    assert any("No token for gh.corp" in b.get("text", "") for b in blocks)

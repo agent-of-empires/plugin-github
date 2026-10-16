@@ -6,6 +6,7 @@ import json
 import subprocess
 
 from aoe_github_plugin import main
+from aoe_github_plugin.auth import TokenEnvironment
 
 
 def _run(*lines):
@@ -98,7 +99,7 @@ def _runtime_with_snapshot(monkeypatch, snapshot):
     rt.call_host = lambda *_a, **_kw: {"value": True}
 
     def fake_build_snapshot(sessions, force=False, **_kwargs):
-        out = {"sessions": [], "auth": {"present": True}}
+        out = {"sessions": [], "version": 2, "auth": {"github.com": {"present": True}}}
         if force and snapshot.get("rate_limit_notice") is not None:
             out["rate_limit_notice"] = snapshot["rate_limit_notice"]
         return out
@@ -156,7 +157,7 @@ def test_required_checks_setting_reaches_refresh(monkeypatch):
 
     def spy_build_snapshot(sessions, **kwargs):
         seen.append(kwargs["settings"].required_checks_only)
-        return {"sessions": [], "auth": {"present": True}}
+        return {"sessions": [], "version": 2, "auth": {"github.com": {"present": True}}}
 
     monkeypatch.setattr(main.refresh, "build_snapshot", spy_build_snapshot)
     rt = main.Runtime(send=lambda _m: None)
@@ -221,7 +222,7 @@ def test_archived_session_never_reaches_build_snapshot(monkeypatch):
 
     def spy_build_snapshot(sessions, force=False, **_kwargs):
         seen_sessions.append([s.get("id") for s in sessions])
-        return {"sessions": [], "auth": {"present": True}}
+        return {"sessions": [], "version": 2, "auth": {"github.com": {"present": True}}}
 
     monkeypatch.setattr(main.refresh, "build_snapshot", spy_build_snapshot)
     rt = main.Runtime(send=lambda _m: None)
@@ -240,7 +241,7 @@ def test_run_refresh_passes_ignore_submodules_setting(monkeypatch):
 
     def spy_build_snapshot(_sessions, **kwargs):
         seen.append(kwargs["settings"].ignore_submodules)
-        return {"sessions": [], "auth": {"present": True}}
+        return {"sessions": [], "version": 2, "auth": {"github.com": {"present": True}}}
 
     monkeypatch.setattr(main.refresh, "build_snapshot", spy_build_snapshot)
     rt = main.Runtime(send=lambda _m: None)
@@ -339,7 +340,8 @@ def test_pr_less_session_removes_row_column_not_empty_set(monkeypatch):
     rt.call_host = lambda *_a, **_kw: {"value": True}
     snapshot = {
         "sessions": [{"session_id": "s1", "repos": [{"name": "r", "repo": "o/r", "pulls": []}]}],
-        "auth": {"present": True},
+        "version": 2,
+        "auth": {"github.com": {"present": True}},
     }
     monkeypatch.setattr(main.refresh, "build_snapshot", lambda _sessions, **_k: snapshot)
 
@@ -376,7 +378,8 @@ def _two_pr_snapshot():
                 ],
             }
         ],
-        "auth": {"present": True},
+        "version": 2,
+        "auth": {"github.com": {"present": True}},
     }
 
 
@@ -398,9 +401,9 @@ def test_select_pr_repaints_from_cache_without_a_network_refresh(monkeypatch):
     assert _pane_callout(sent)["title"] == "Awaiting review"
 
     sent.clear()
-    rt.handle_inbound({"method": main.SELECT_PR_METHOD, "params": {"session_id": "s1", "pr": "o/r#1"}})
+    rt.handle_inbound({"method": main.SELECT_PR_METHOD, "params": {"session_id": "s1", "pr": "github.com/o/r#1"}})
 
-    assert rt._selected_pr == {"s1": "o/r#1"}
+    assert rt._selected_pr == {"s1": "github.com/o/r#1"}
     assert rt.refresh_due is False, "selecting a PR must not schedule a network refresh"
     assert _pane_callout(sent)["title"] == "Ready to merge"
 
@@ -415,8 +418,8 @@ def test_select_pr_ignores_a_malformed_click_and_acks_it(monkeypatch):
 
     for params in (
         {"session_id": "s1"},
-        {"pr": "o/r#1"},
-        {"session_id": 5, "pr": "o/r#1"},
+        {"pr": "github.com/o/r#1"},
+        {"session_id": 5, "pr": "github.com/o/r#1"},
         {"session_id": "s1", "pr": ""},
     ):
         rt.handle_inbound({"method": main.SELECT_PR_METHOD, "params": params})
@@ -441,7 +444,8 @@ def test_replay_cached_pushes_only_live_sessions_marked_stale(tmp_path, monkeypa
                 {"session_id": "s1", "freshness": {"refreshed_at": "t", "stale": False}, "repos": []},
                 {"session_id": "gone", "repos": []},
             ],
-            "auth": {"present": True},
+            "version": 2,
+            "auth": {"github.com": {"present": True}},
         }
     )
     seen = {}
@@ -475,7 +479,7 @@ def test_replay_cached_without_cache_is_noop(tmp_path, monkeypatch):
 
 def test_full_refresh_persists_snapshot(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    snap = {"sessions": [{"session_id": "s1", "repos": []}], "auth": {"present": True}}
+    snap = {"sessions": [{"session_id": "s1", "repos": []}], "version": 2, "auth": {"github.com": {"present": True}}}
     monkeypatch.setattr(main.refresh, "build_snapshot", lambda *_a, **_kw: snap)
     monkeypatch.setattr(main.uistate, "snapshot_ui_state_params", lambda *_a, **_kw: [])
     rt = main.Runtime(send=lambda _m: None)
@@ -488,7 +492,7 @@ def test_scoped_refresh_does_not_persist(tmp_path, monkeypatch):
     # A scoped (single-pane) refresh is partial; it must not overwrite the full
     # aggregate cache used for the next restart's repaint.
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    snap = {"sessions": [{"session_id": "s1", "repos": []}], "auth": {"present": True}}
+    snap = {"sessions": [{"session_id": "s1", "repos": []}], "version": 2, "auth": {"github.com": {"present": True}}}
     monkeypatch.setattr(main.refresh, "build_snapshot", lambda *_a, **_kw: snap)
     monkeypatch.setattr(main.uistate, "snapshot_ui_state_params", lambda *_a, **_kw: [])
     rt = main.Runtime(send=lambda _m: None)
@@ -521,13 +525,59 @@ def test_select_pr_survives_a_drifted_cached_snapshot(monkeypatch):
     rt.run_refresh(sessions=[{"id": "s1"}], force=True)
     rt._last_snapshot = {
         "sessions": [{"session_id": "s1", "repos": [{"name": "r", "repo": "o/r", "error": "not-a-dict"}]}],
-        "auth": {"present": True},
+        "version": 2,
+        "auth": {"github.com": {"present": True}},
     }
     sent.clear()
 
-    rt.handle_inbound({"method": main.SELECT_PR_METHOD, "params": {"session_id": "s1", "pr": "o/r#1"}})
+    rt.handle_inbound({"method": main.SELECT_PR_METHOD, "params": {"session_id": "s1", "pr": "github.com/o/r#1"}})
 
     # The click is absorbed: the selection is still recorded, nothing was pushed,
     # and crucially no exception escaped to the caller.
-    assert rt._selected_pr == {"s1": "o/r#1"}
+    assert rt._selected_pr == {"s1": "github.com/o/r#1"}
     assert not [m for m in sent if m["method"] == "ui.state.set"]
+
+
+def test_runtime_reuses_trust_until_manual_refresh(monkeypatch):
+
+    class Env(TokenEnvironment):
+        def __init__(self):
+            self.names = ["a.corp"]
+            self.reads = 0
+
+        def gh_config_hosts(self):
+            self.reads += 1
+            return self.names
+
+    env = Env()
+    rt = main.Runtime(send=lambda _m: None, env=env)
+    rt.call_host = lambda *_a, **_kw: {"value": True}
+    captured = []
+
+    def build(sessions, **kwargs):
+        captured.append(kwargs["trusted"])
+        return {"version": 2, "sessions": [], "auth": {}}
+
+    monkeypatch.setattr(main.refresh, "build_snapshot", build)
+    rt.run_refresh([])
+    env.names = ["b.corp"]
+    rt.run_refresh([])
+    assert env.reads == 1
+    assert set(captured[-1]) == {"github.com", "a.corp"}
+    rt.run_refresh([], force=True)
+    assert env.reads == 2
+    assert set(captured[-1]) == {"github.com", "b.corp"}
+    env.names = None
+    rt.run_refresh([], force=True)
+    assert set(captured[-1]) == {"github.com", "b.corp"}
+
+    def status(path, **kwargs):
+        assert kwargs["trusted"] is rt.trusted_hosts
+        assert kwargs["env"] is env
+        return {"host": "b.corp"}
+
+    monkeypatch.setattr(main.handlers, "github_status", status)
+    sent = []
+    rt.send = sent.append
+    rt.handle_inbound({"jsonrpc": "2.0", "id": 42, "method": "github.status"})
+    assert sent[-1]["result"]["host"] == "b.corp"

@@ -51,7 +51,7 @@ one is blocking (see ``graphql.merge_state``, #80). The ladder in
 ``_merge_verdict`` orders blockers by who can clear them.
 
 The rich fields (review_state/checks/comments/merged) are present only when the
-worker had a GitHub token; without one the snapshot's ``auth.present`` is
+worker had a GitHub token; without one the snapshot's ``auth[host].present`` is
 ``False``, the pulls are the basic open-PR shape, and the pane shows a banner
 note telling the user a token unlocks the rest.
 
@@ -67,6 +67,7 @@ from typing import Any
 from datetime import datetime
 from datetime import timezone
 
+from aoe_github_plugin.hosts import GitHubHost
 from aoe_github_plugin.graphql import MERGED_COLOR
 
 ROW_BADGE_SLOT = ("row-badge", "github_pr_badge")
@@ -445,7 +446,7 @@ def _pull_key(repo: dict[str, Any], pull: dict[str, Any]) -> str:
     """Stable id for one PR within a session. Round-trips through the selector
     row's ``params`` and back as the worker's remembered selection, so it has to
     be derived from the snapshot alone (no index into a list that reorders)."""
-    return f"{repo.get('repo') or repo.get('name') or '?'}#{pull.get('number', '?')}"
+    return f"{repo.get('host') or 'github.com'}/{repo.get('repo') or repo.get('name') or '?'}#{pull.get('number', '?')}"
 
 
 def _session_pulls(repos: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -1065,6 +1066,8 @@ def _rate_limit_note(rate_limit: Any) -> dict[str, Any] | None:
     budget = rate_limit.get("budget")
     key = budget if isinstance(budget, str) else "mixed"
     text = _RATE_LIMIT_NOTE_TEXT.get(key, _RATE_LIMIT_NOTE_TEXT["mixed"])
+    if rate_limit.get("host"):
+        text = f"{rate_limit['host']}: {text}"
     return {"kind": "note", "tone": "warn", "text": text}
 
 
@@ -1125,7 +1128,7 @@ def _resolve_selection(
 def _pane_blocks(
     repos: list[dict[str, Any]],
     *,
-    auth_present: bool,
+    auth: dict[str, Any],
     rate_limit: Any = None,
     selected_key: Any = None,
 ) -> list[dict[str, Any]]:
@@ -1142,17 +1145,34 @@ def _pane_blocks(
         note = _rate_limit_note(rate_limit)
         if note is not None:
             head.append(note)
-    # Only nag when there is actually a GitHub repo whose detail the token gates.
-    if not auth_present and has_github_repo:
-        head.append(dict(_TOKEN_NOTE))
+    pulls = _session_pulls(repos)
+    selection = _resolve_selection(pulls, selected_key)
+    relevant = [selection[0]] if selection is not None else [r for r in repos if r.get("repo")]
+    noted: set[str] = set()
+    for repo in relevant:
+        name = repo.get("host") or "github.com"
+        if name in noted or (auth.get(name) or {}).get("present", True):
+            continue
+        noted.add(name)
+        if name == "github.com":
+            head.append(dict(_TOKEN_NOTE))
+        else:
+            host = GitHubHost.enterprise(name)
+            head.append(
+                {
+                    "kind": "note",
+                    "tone": "warn",
+                    "text": (
+                        f"No token for {name}: showing open PRs only. Run: {host.login_hint}. Or {host.token_hint}."
+                    ),
+                }
+            )
     tail = [{"kind": "divider"}, dict(_REFRESH_ACTION)]
 
     if not repos:
         return _fit_to_budget(head, [{"kind": "note", "text": "no repos in this workspace", "tone": "neutral"}], tail)
 
-    pulls = _session_pulls(repos)
     middle: list[dict[str, Any]] = []
-    selection = _resolve_selection(pulls, selected_key)
     if selection is not None:
         chosen_key = _pull_key(*selection)
         # The selector renders even for a single PR: it is the pane's title for the
@@ -1223,7 +1243,7 @@ def snapshot_ui_state_params(
     if not isinstance(raw_sessions, list):
         return []
     sessions = raw_sessions
-    auth_present = bool((snapshot.get("auth") or {}).get("present", True))
+    auth = snapshot.get("auth") or {}
     rate_limit = snapshot.get("rate_limit")
     params: list[dict[str, Any]] = [
         {"slot": SORT_KEY_SLOT[0], "id": SORT_KEY_SLOT[1], "payload": dict(SORT_KEY_PAYLOAD)},
@@ -1270,7 +1290,7 @@ def snapshot_ui_state_params(
             # would only ever shadow both.
             "blocks": _pane_blocks(
                 repos,
-                auth_present=auth_present,
+                auth=auth,
                 rate_limit=rate_limit,
                 selected_key=selected_key,
             ),

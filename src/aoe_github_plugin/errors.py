@@ -8,6 +8,8 @@ on) and a human, actionable ``message`` (== ``str(self)``), never a generic
 
 from __future__ import annotations
 
+from aoe_github_plugin.hosts import GitHubHost
+
 
 class GitHubError(Exception):
     """Base for every GitHub client / auth failure."""
@@ -24,47 +26,49 @@ class GitHubAuthError(GitHubError):
 class NoTokenNoGhError(GitHubAuthError):
     kind = "no_token_no_gh"
 
-    def __init__(self) -> None:
+    def __init__(self, host: GitHubHost | None = None) -> None:
+        self.host = host or GitHubHost.dotcom()
         super().__init__(
             "No GitHub token found and the GitHub CLI is not installed.\n"
-            "Set a token: export GITHUB_TOKEN=<token> (or GH_TOKEN).\n"
-            "Or install the GitHub CLI and sign in:\n"
-            "  macOS:  brew install gh\n"
-            "  Linux:  see https://github.com/cli/cli#installation\n"
-            "then run: gh auth login"
+            "Install the GitHub CLI (macOS: brew install gh).\n"
+            f"Sign in with: {self.host.login_hint}\n"
+            f"Or set a token directly: {self.host.token_hint}."
         )
 
 
 class GhNotAuthenticatedError(GitHubAuthError):
     kind = "gh_not_authenticated"
 
-    def __init__(self) -> None:
+    def __init__(self, host: GitHubHost | None = None) -> None:
+        self.host = host or GitHubHost.dotcom()
         super().__init__(
             "The GitHub CLI is installed but not authenticated.\n"
-            "Sign in with:\n"
-            "  gh auth login\n"
-            "Or set a token directly: export GITHUB_TOKEN=<token>."
+            f"Sign in with: {self.host.login_hint}\n"
+            f"Or set a token directly: {self.host.token_hint}."
         )
 
 
 class GhReturnedEmptyTokenError(GitHubAuthError):
     kind = "gh_returned_empty_token"
 
-    def __init__(self) -> None:
+    def __init__(self, host: GitHubHost | None = None) -> None:
+        self.host = host or GitHubHost.dotcom()
         super().__init__(
             "The GitHub CLI returned an empty token.\n"
-            "Re-authenticate with:\n"
-            "  gh auth login\n"
-            "Or set a token directly: export GITHUB_TOKEN=<token>."
+            f"Sign in with: {self.host.login_hint}\n"
+            f"Or set a token directly: {self.host.token_hint}."
         )
 
 
 class GhCommandFailedError(GitHubAuthError):
     kind = "gh_command_failed"
 
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, host: GitHubHost | None = None) -> None:
+        self.host = host or GitHubHost.dotcom()
         super().__init__(
-            f"Failed to run the GitHub CLI: {detail}\nSet a token directly to bypass it: export GITHUB_TOKEN=<token>."
+            f"Failed to run the GitHub CLI: {detail}\n"
+            f"Sign in with: {self.host.login_hint}\n"
+            f"Or set a token directly: {self.host.token_hint}."
         )
 
 
@@ -83,38 +87,39 @@ class NetworkError(GitHubError):
 class UnauthorizedError(GitHubError):
     kind = "unauthorized"
 
-    def __init__(self) -> None:
+    def __init__(self, host: GitHubHost | None = None) -> None:
+        self.host = host or GitHubHost.dotcom()
         super().__init__(
-            "GitHub rejected the credentials (HTTP 401).\n"
+            f"GitHub rejected the credentials for {self.host.name} (HTTP 401).\n"
             "The token is missing, invalid, or expired.\n"
-            "Re-authenticate with: gh auth login, or set a fresh GITHUB_TOKEN."
+            f"Re-authenticate with: {self.host.login_hint}, or {self.host.token_hint}."
         )
 
 
 class InsufficientScopeError(GitHubError):
     kind = "insufficient_scope"
 
-    def __init__(self, scopes: str) -> None:
+    def __init__(self, scopes: str, host: GitHubHost | None = None) -> None:
+        self.host = host or GitHubHost.dotcom()
         self.scopes = scopes
         super().__init__(
             "GitHub token is missing a required scope (HTTP 403).\n"
             f"This operation needs one of: {scopes}.\n"
             "Re-authenticate with a token that carries it, for example:\n"
-            f"  gh auth login --scopes {scopes}\n"
-            "or set GITHUB_TOKEN to a personal access token with that scope."
+            f"  {self.host.login_hint} --scopes {scopes}\n"
+            f"or {self.host.token_hint} with that scope."
         )
 
 
 class RateLimitedError(GitHubError):
     kind = "rate_limited"
 
-    def __init__(self) -> None:
+    def __init__(self, host: GitHubHost | None = None) -> None:
+        self.host = host or GitHubHost.dotcom()
         super().__init__(
-            "GitHub API rate limit exceeded.\n"
-            "Wait for the limit to reset (see the X-RateLimit-Reset header) "
-            "and retry.\n"
-            "Authenticating raises the limit: set GITHUB_TOKEN or run "
-            "gh auth login."
+            f"GitHub API rate limit exceeded for {self.host.name}.\n"
+            "Wait for the limit to reset (see the X-RateLimit-Reset header) and retry.\n"
+            f"Authenticating raises the limit: {self.host.token_hint} or run {self.host.login_hint}."
         )
 
 

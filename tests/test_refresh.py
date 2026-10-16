@@ -28,7 +28,7 @@ class _Env(TokenEnvironment):
     def gh_available(self):
         return False
 
-    def gh_auth_token(self):
+    def gh_auth_token(self, hostname="github.com"):
         raise AssertionError("gh must not be consulted")
 
 
@@ -41,7 +41,7 @@ class _NoToken(TokenEnvironment):
     def gh_available(self):
         return False
 
-    def gh_auth_token(self):
+    def gh_auth_token(self, hostname="github.com"):
         raise AssertionError("gh must not be consulted")
 
 
@@ -72,10 +72,12 @@ def _clear_cache():
         refresh._etag_cache.clear()
         refresh._graphql_cache.clear()
         refresh._session_refresh_cache.clear()
-        refresh._backoff["rest"].update({"until": 0.0, "reset_known": False})
-        refresh._backoff["graphql"].update({"until": 0.0, "reset_known": False})
-        refresh._backoff["notified"] = False
-        refresh._graphql_budget.update({"remaining": None, "valid_until": None})
+        refresh._backoff.clear()
+        refresh._graphql_budget.clear()
+        refresh._backoff["github.com"]["rest"].update({"until": 0.0, "reset_known": False})
+        refresh._backoff["github.com"]["graphql"].update({"until": 0.0, "reset_known": False})
+        refresh._backoff_notice["notified"] = False
+        refresh._graphql_budget["github.com"].update({"remaining": None, "valid_until": None})
         refresh._retry_cooldown.clear()
 
     _reset()
@@ -199,7 +201,7 @@ def test_backoff_serves_cached_and_skips_http(tmp_path):
     sessions = [{"id": "s1", "project_path": str(ws)}]
     # Seed the cache, then trip backoff: the next refresh must not hit HTTP.
     refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull(number=5)]))
-    refresh._backoff["rest"]["until"] = time.monotonic() + 60
+    refresh._backoff["github.com"]["rest"]["until"] = time.monotonic() + 60
     captured = []
 
     def boom(request):
@@ -229,7 +231,7 @@ def test_no_token_marks_auth_absent(tmp_path):
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
     snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull()]))
-    assert snap["auth"]["present"] is False
+    assert snap["auth"]["github.com"]["present"] is False
 
 
 def test_successful_basic_refresh_records_freshness(tmp_path, monkeypatch):
@@ -274,7 +276,7 @@ def test_backoff_cached_basic_refresh_keeps_prior_freshness(tmp_path, monkeypatc
     monkeypatch.setattr(refresh, "_utc_now_iso", lambda: next(times))
 
     refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport([_pull(number=5)]))
-    refresh._backoff["rest"]["until"] = time.monotonic() + 60
+    refresh._backoff["github.com"]["rest"]["until"] = time.monotonic() + 60
     snap = refresh.build_snapshot(
         sessions, env=_NoToken(), transport=httpx.MockTransport(lambda _request: httpx.Response(500))
     )
@@ -379,7 +381,7 @@ def test_graphql_path_parses_rich_fields(tmp_path):
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node()]))
-    assert snap["auth"]["present"] is True
+    assert snap["auth"]["github.com"]["present"] is True
     pull = snap["sessions"][0]["repos"][0]["pulls"][0]
     assert pull["review_state"] == "approved"
     assert pull["checks"]["state"] == "succeeded"
@@ -439,7 +441,7 @@ def test_backoff_cached_rich_refresh_keeps_prior_freshness(tmp_path, monkeypatch
     transport = _rich_transport([_gql_node(number=7)])
 
     refresh.build_snapshot(sessions, env=_Env(), transport=transport)
-    refresh._backoff["rest"]["until"] = time.monotonic() + 60
+    refresh._backoff["github.com"]["rest"]["until"] = time.monotonic() + 60
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
 
     assert snap["sessions"][0]["freshness"] == {
@@ -449,7 +451,7 @@ def test_backoff_cached_rich_refresh_keeps_prior_freshness(tmp_path, monkeypatch
 
 
 def test_session_freshness_advances_on_confirmed_current_304():
-    fingerprint = (("o", "r", "feature"),)
+    fingerprint = (("github.com", "o", "r", "feature"),)
     results = [{"pulls": [{"number": 1}], "_fresh": False, "_stale": False}]
     out = refresh._session_freshness("s1", fingerprint, results, "2026-06-29T14:05:00Z")
     assert out == {"refreshed_at": "2026-06-29T14:05:00Z", "stale": False}
@@ -459,14 +461,14 @@ def test_session_freshness_advances_on_confirmed_current_zero_prs():
     # A repo with zero open PRs, confirmed current via 304 (_fresh=False on the
     # rich-cache branch, _stale=False). The dropped not-pulls heuristic used to
     # wrongly mark this stale and freeze the stamp.
-    fingerprint = (("o", "r", "feature"),)
+    fingerprint = (("github.com", "o", "r", "feature"),)
     results = [{"pulls": [], "_fresh": False, "_stale": False}]
     out = refresh._session_freshness("s1", fingerprint, results, "2026-06-29T14:05:00Z")
     assert out == {"refreshed_at": "2026-06-29T14:05:00Z", "stale": False}
 
 
 def test_session_freshness_keeps_prior_when_stale():
-    fingerprint = (("o", "r", "feature"),)
+    fingerprint = (("github.com", "o", "r", "feature"),)
     refresh._session_refresh_cache["s1"] = {"fingerprint": fingerprint, "refreshed_at": "2026-06-29T14:00:00Z"}
     results = [{"pulls": [{"number": 1}], "_fresh": False, "_stale": True}]
     out = refresh._session_freshness("s1", fingerprint, results, "2026-06-29T14:05:00Z")
@@ -621,7 +623,7 @@ def test_graphql_rate_limit_serves_stale(tmp_path):
         transport=_rich_transport([], errors=[{"type": "RATE_LIMITED", "message": "slow down"}]),
     )
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 42
-    assert refresh._backoff["graphql"]["until"] > time.monotonic()
+    assert refresh._backoff["github.com"]["graphql"]["until"] > time.monotonic()
 
 
 def test_graphql_failure_falls_back_to_basic_pulls(tmp_path):
@@ -661,7 +663,7 @@ def test_graphql_keeps_partial_data_with_rate_limit_error(tmp_path):
 
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 99
-    assert refresh._backoff["graphql"]["until"] > time.monotonic()
+    assert refresh._backoff["github.com"]["graphql"]["until"] > time.monotonic()
 
 
 # --- rate-limit notice (issue #20) ---
@@ -698,9 +700,9 @@ def test_background_refresh_never_emits_notice(tmp_path):
     sessions = [{"id": "s1", "project_path": str(ws)}]
     # Block BOTH budgets so no HTTP fires (a graphql-only backoff would leave the
     # REST probe free to run, #62).
-    refresh._backoff["rest"].update({"until": time.monotonic() + 300, "reset_known": True})
-    refresh._backoff["graphql"].update({"until": time.monotonic() + 300, "reset_known": True})
-    refresh._backoff["notified"] = False
+    refresh._backoff["github.com"]["rest"].update({"until": time.monotonic() + 300, "reset_known": True})
+    refresh._backoff["github.com"]["graphql"].update({"until": time.monotonic() + 300, "reset_known": True})
+    refresh._backoff_notice["notified"] = False
 
     def boom(request):
         raise AssertionError("HTTP must not be called during backoff")
@@ -985,7 +987,7 @@ def test_thread_pagination_stops_and_backs_off_on_rate_limit(tmp_path):
     # The first page survives (never blanked) and the rate limit arms the backoff.
     assert comments["unresolved"] == 1
     assert [c["path"] for c in comments["items"]] == ["a.py"]
-    assert refresh._backoff["graphql"]["until"] > time.monotonic()
+    assert refresh._backoff["github.com"]["graphql"]["until"] > time.monotonic()
 
 
 def test_graphql_backoff_does_not_block_rest_probe(tmp_path):
@@ -996,7 +998,7 @@ def test_graphql_backoff_does_not_block_rest_probe(tmp_path):
     ws.mkdir()
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
-    refresh._backoff["graphql"]["until"] = time.monotonic() + 300
+    refresh._backoff["github.com"]["graphql"]["until"] = time.monotonic() + 300
 
     def handler(request):
         if str(request.url).endswith("/graphql"):
@@ -1006,7 +1008,7 @@ def test_graphql_backoff_does_not_block_rest_probe(tmp_path):
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
     # The PR is discovered via REST (basic shape) rather than hidden as "no open PR".
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 77
-    assert refresh._backoff["rest"]["until"] <= time.monotonic()  # REST budget never gated
+    assert refresh._backoff["github.com"]["rest"]["until"] <= time.monotonic()  # REST budget never gated
 
 
 def test_changed_rest_overrides_stale_empty_rich_cache(tmp_path):
@@ -1034,7 +1036,7 @@ def test_snapshot_reports_active_rate_limit_regardless_of_force(tmp_path):
     ws.mkdir()
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
-    refresh._backoff["graphql"]["until"] = time.monotonic() + 300
+    refresh._backoff["github.com"]["graphql"]["until"] = time.monotonic() + 300
 
     snap = refresh.build_snapshot(
         sessions, env=_Env(), transport=httpx.MockTransport(lambda _r: httpx.Response(304)), force=False
@@ -1056,7 +1058,7 @@ def test_snapshot_omits_rate_limit_when_clear(tmp_path):
 
 def test_save_load_snapshot_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    snap = {"sessions": [{"session_id": "s1", "repos": []}], "auth": {"present": True}}
+    snap = {"sessions": [{"session_id": "s1", "repos": []}], "version": 2, "auth": {"github.com": {"present": True}}}
     refresh.save_snapshot(snap)
     assert refresh._snapshot_cache_path().parent == tmp_path / "agent-of-empires" / "github-plugin"
     assert refresh.load_snapshot() == snap
@@ -1065,7 +1067,7 @@ def test_save_load_snapshot_roundtrip(tmp_path, monkeypatch):
 def test_save_snapshot_skips_empty_sessions(tmp_path, monkeypatch):
     # A transient "no sessions" blip must not erase a useful cache.
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    refresh.save_snapshot({"sessions": [{"session_id": "s1", "repos": []}]})
+    refresh.save_snapshot({"version": 2, "sessions": [{"session_id": "s1", "repos": []}]})
     refresh.save_snapshot({"sessions": []})
     assert refresh.load_snapshot()["sessions"] == [{"session_id": "s1", "repos": []}]
 
@@ -1234,10 +1236,10 @@ def test_budget_pressure_stretches_ceilings(tmp_path):
 
 def test_budget_multiplier_resets_after_window(tmp_path):
     now = time.monotonic()
-    refresh._graphql_budget.update({"remaining": 600, "valid_until": now + 60})
+    refresh._graphql_budget["github.com"].update({"remaining": 600, "valid_until": now + 60})
     assert refresh._budget_multiplier(now) == refresh.BUDGET_PRESSURE_MULTIPLIER
     assert refresh._budget_multiplier(now + 61) == 1.0  # window reset, budget refilled
-    assert refresh._graphql_budget["remaining"] is None
+    assert refresh._graphql_budget["github.com"]["remaining"] is None
 
 
 def test_graphql_cost_is_logged_per_query(tmp_path, caplog):
@@ -1252,7 +1254,7 @@ def test_graphql_cost_is_logged_per_query(tmp_path, caplog):
         refresh.build_snapshot(sessions, env=_Env(), transport=transport)
         _expire_graphql_cache()
         refresh.build_snapshot(sessions, env=_Env(), transport=transport)
-    kinds = [r.getMessage() for r in caplog.records if "graphql kind=" in r.getMessage()]
+    kinds = [r.getMessage() for r in caplog.records if "graphql host=" in r.getMessage()]
     assert any("kind=full" in m and "cost=1" in m and "remaining=5000" in m for m in kinds)
     assert any("kind=digest" in m for m in kinds)
 
@@ -1389,3 +1391,152 @@ def test_parallel_discovery_output_matches_serial_shape(tmp_path):
         ("a", "o/a", "b1"),
         ("b", "o/b", "b2"),
     ]
+
+
+class _MultiHostEnv(TokenEnvironment):
+    def env_var(self, key):
+        return {"GH_TOKEN": "public", "GH_ENTERPRISE_TOKEN": "only-a", "GH_HOST": "a.corp"}.get(key)
+
+    def gh_config_hosts(self):
+        return ["a.corp", "b.corp"]
+
+    def gh_available(self):
+        return True
+
+    def gh_auth_token(self, hostname="github.com"):
+        assert hostname == "b.corp"
+        return True, "only-b", ""
+
+
+def test_three_host_refresh_isolates_credentials_and_caches(tmp_path):
+    ws = tmp_path / "ws"
+    for host in ("github.com", "a.corp", "b.corp"):
+        _make_repo(ws / host, remote=f"git@{host}:o/r.git")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    calls = []
+    tokens = {"api.github.com": "public", "a.corp": "only-a", "b.corp": "only-b"}
+    numbers = {"api.github.com": 1, "a.corp": 2, "b.corp": 3}
+
+    def handler(request):
+        name = request.url.host
+        calls.append(request)
+        assert request.headers["Authorization"] == f"Bearer {tokens[name]}"
+        if request.method == "POST":
+            node = _gql_node(number=numbers[name])
+            node["url"] = f"https://{name}/o/r/pull/{numbers[name]}"
+            return httpx.Response(
+                200,
+                json={
+                    "data": {"rateLimit": {"remaining": 5000}, "repository": _alias_repo(request, {"feature": [node]})}
+                },
+            )
+        if "If-None-Match" in request.headers:
+            assert request.headers["If-None-Match"] == name
+            return httpx.Response(304)
+        return httpx.Response(200, headers={"ETag": name}, json=[_pull(numbers[name])])
+
+    transport = httpx.MockTransport(handler)
+    snap = refresh.build_snapshot(sessions, env=_MultiHostEnv(), transport=transport)
+    assert snap["version"] == 2
+    assert snap["auth"] == {name: {"present": True} for name in ("github.com", "a.corp", "b.corp")}
+    assert {r["host"]: r["pulls"][0]["number"] for r in snap["sessions"][0]["repos"]} == {
+        "github.com": 1,
+        "a.corp": 2,
+        "b.corp": 3,
+    }
+    assert len(refresh._etag_cache) == len(refresh._graphql_cache) == 3
+    again = refresh.build_snapshot(sessions, env=_MultiHostEnv(), transport=transport)
+    assert [r["pulls"] for r in again["sessions"][0]["repos"]] == [r["pulls"] for r in snap["sessions"][0]["repos"]]
+    assert len([r for r in calls if r.method == "POST"]) == 3
+    assert len(calls) == 9
+
+
+def test_one_hosts_rate_limit_does_not_gate_others(tmp_path):
+    ws = tmp_path / "ws"
+    for host in ("a.corp", "b.corp"):
+        _make_repo(ws / host, remote=f"https://{host}/o/r")
+
+    def handler(request):
+        if request.url.host == "a.corp":
+            return httpx.Response(429)
+        if request.method == "POST":
+            return httpx.Response(200, json={"data": {"repository": _alias_repo(request, {"feature": [_gql_node(7)]})}})
+        return httpx.Response(200, json=[_pull(7)])
+
+    snap = refresh.build_snapshot(
+        [{"id": "s", "project_path": str(ws)}], env=_MultiHostEnv(), transport=httpx.MockTransport(handler), force=True
+    )
+    by_host = {r["host"]: r for r in snap["sessions"][0]["repos"]}
+    assert by_host["a.corp"]["error"]["kind"] == "rate_limited"
+    assert by_host["b.corp"]["pulls"][0]["number"] == 7
+    assert snap["rate_limit_notice"]["host"] == "a.corp"
+
+
+@pytest.mark.parametrize("order", [("a.corp", "b.corp"), ("b.corp", "a.corp")])
+def test_budget_and_freshness_are_per_host(order):
+    now = time.monotonic()
+    for host in order:
+        refresh._observe_rate_limit(
+            {"remaining": 100 if host == "a.corp" else 5000}, host=host, kind="full", repo="o/r", aliases=1
+        )
+    assert refresh._budget_multiplier(now, host="a.corp") == 4
+    assert refresh._budget_multiplier(now, host="b.corp") == 1
+    assert refresh._budget_multiplier(now, host="c.corp") == 1
+    rich = {
+        "pulls": [],
+        "fetched_at": now - refresh.GRAPHQL_FULL_MAX_STALE - 1,
+        "validated_at": now - refresh.GRAPHQL_DIGEST_STALE - 1,
+    }
+    for stale in (refresh._digest_stale, refresh._full_stale):
+        assert not stale(rich, now, host="a.corp")
+        assert stale(rich, now, host="b.corp")
+    refresh._graphql_budget["a.corp"]["valid_until"] = now - 1
+    assert refresh._budget_multiplier(now, host="a.corp") == 1
+    assert refresh._graphql_budget["b.corp"]["remaining"] == 5000
+
+
+def test_legacy_snapshot_rejected(tmp_path, monkeypatch):
+    cache = tmp_path / "snapshot.json"
+    monkeypatch.setattr(refresh, "_snapshot_cache_path", lambda: cache)
+    cache.write_text(json.dumps({"sessions": [], "auth": {"present": True}}))
+    assert refresh.load_snapshot() is None
+
+
+def test_ghes_partial_mergeable_error_keeps_basic_pr(tmp_path):
+    ws = tmp_path / "ws"
+    _make_repo(ws, remote="https://a.corp/o/r")
+
+    def handler(request):
+        assert request.url.host == "a.corp"
+        if request.method == "GET":
+            return httpx.Response(200, json=[_pull(77)])
+        return httpx.Response(
+            200,
+            json={
+                "data": {"repository": _alias_repo(request, {"feature": [_gql_node(77)]})},
+                "errors": [
+                    {"message": "mergeable is unavailable", "path": ["repository", "b0", "nodes", 0, "mergeable"]}
+                ],
+            },
+        )
+
+    snap = refresh.build_snapshot(
+        [{"id": "s", "project_path": str(ws)}], env=_MultiHostEnv(), transport=httpx.MockTransport(handler)
+    )
+    repo = snap["sessions"][0]["repos"][0]
+    assert repo["error"] is None
+    assert repo["pulls"][0]["number"] == 77
+    assert "checks" not in repo["pulls"][0]
+    assert next(iter(refresh._retry_cooldown))[0] == "a.corp"
+
+
+def test_uncached_ghes_repo_under_rest_backoff_names_own_host(tmp_path):
+    ws = tmp_path / "ws"
+    _make_repo(ws, remote="https://a.corp/o/r")
+    refresh._backoff["a.corp"]["rest"]["until"] = time.monotonic() + 60
+    transport = httpx.MockTransport(lambda _request: pytest.fail("backoff must skip HTTP"))
+    snap = refresh.build_snapshot([{"id": "s", "project_path": str(ws)}], env=_MultiHostEnv(), transport=transport)
+    error = snap["sessions"][0]["repos"][0]["error"]
+    assert error["kind"] == "rate_limited"
+    assert "gh auth login --hostname a.corp" in error["hint"]
+    assert "GH_HOST=a.corp" in error["hint"]
