@@ -328,8 +328,9 @@ fall back to the all-check rollup.
 
 ## Developing
 
-Uses [uv](https://docs.astral.sh/uv/). The one runtime dependency is `httpx`;
-`dev` brings ruff, mypy, pytest, and pre-commit.
+Uses [uv](https://docs.astral.sh/uv/). Runtime dependencies are `httpx` for API
+calls and `PyYAML` for safe gh configuration parsing. `dev` brings ruff, mypy,
+pytest, and pre-commit.
 
 ```sh
 uv sync                       # create the env
@@ -356,30 +357,6 @@ Token resolution on github.com: `GH_TOKEN`, then `GITHUB_TOKEN`, then
 never required; without a token the worker still shows open PRs (the basic REST
 view), but review state, CI checks, unresolved comments, and merged PRs need a
 token, since they come from the authenticated GraphQL query.
-
-## Releases
-
-Tagging `vX.Y.Z` runs the checks and publishes a GitHub Release with a source
-archive and its content hash (`.github/workflows/release.yml`). On a successful
-publish the `featured-pr` job then opens a PR on `agent-of-empires/agent-of-empires`
-that pins the release's source tree hash in `plugins/featured.toml`, marking it
-trusted. It no-ops if the version is already pinned.
-
-That job needs an `AOE_FEATURED_PR_TOKEN` secret (a fine-scoped PAT or App token
-with contents and pull-request write on `agent-of-empires/agent-of-empires`); it
-is skipped with a warning if the secret is unset. It runs behind the
-required-reviewer `release` environment, so it waits for maintainer approval
-before the cross-repo PR opens.
-
-## Discovery
-
-This repository is tagged with the `aoe-plugin` GitHub topic so it shows up in
-the in-app plugin discovery. Featured (curated) status is granted separately by
-the AoE maintainers via the embedded featured index.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
 
 ### GitHub Enterprise Server
 
@@ -418,3 +395,27 @@ hosts (`*.ghe.com`) are currently unsupported. Unconfigured servers are skipped.
 REST/GraphQL budgets, ETags, rich caches, and retry cooldowns are separate per
 host. A missing token produces a hint for the selected PR's server. Old disk
 snapshots are discarded once on upgrade to the version 2 snapshot format.
+
+## Releases
+
+Tagging `vX.Y.Z` runs the checks and publishes a GitHub Release with a source
+archive and its content hash (`.github/workflows/release.yml`). On a successful
+publish the `featured-pr` job then opens a PR on `agent-of-empires/agent-of-empires`
+that pins the release's source tree hash in `plugins/featured.toml`, marking it
+trusted. It no-ops if the version is already pinned.
+
+That job needs an `AOE_FEATURED_PR_TOKEN` secret (a fine-scoped PAT or App token
+with contents and pull-request write on `agent-of-empires/agent-of-empires`); it
+is skipped with a warning if the secret is unset. It runs behind the
+required-reviewer `release` environment, so it waits for maintainer approval
+before the cross-repo PR opens.
+
+## Discovery
+
+This repository is tagged with the `aoe-plugin` GitHub topic so it shows up in
+the in-app plugin discovery. Featured (curated) status is granted separately by
+the AoE maintainers via the embedded featured index.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

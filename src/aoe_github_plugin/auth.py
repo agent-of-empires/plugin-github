@@ -110,8 +110,10 @@ def resolve_token(env: TokenEnvironment, host: GitHubHost | None = None) -> tupl
     """Resolve a token in the fixed order, raising a typed error whose hint
     matches the exact failure when none is available.
 
-    Returns ``(token, source)`` where ``source`` is ``"env:GITHUB_TOKEN"``,
-    ``"env:GH_TOKEN"``, or ``"gh-cli"``.
+    Returns ``(token, source)``. For github.com, environment sources are
+    ``"env:GH_TOKEN"`` then ``"env:GITHUB_TOKEN"``. For GHES matching ``GH_HOST``,
+    they are ``"env:GH_ENTERPRISE_TOKEN"`` then ``"env:GITHUB_ENTERPRISE_TOKEN"``.
+    Stored GitHub CLI credentials return ``"gh-cli"``.
     """
     host = host or GitHubHost.dotcom()
     keys = ("GH_TOKEN", "GITHUB_TOKEN") if host.kind == "dotcom" else ()

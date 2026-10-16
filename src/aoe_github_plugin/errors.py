@@ -66,7 +66,9 @@ class GhCommandFailedError(GitHubAuthError):
     def __init__(self, detail: str, host: GitHubHost | None = None) -> None:
         self.host = host or GitHubHost.dotcom()
         super().__init__(
-            f"Failed to run the GitHub CLI: {detail}\nSign in with: {self.host.login_hint}\n{self.host.token_hint}"
+            f"Failed to run the GitHub CLI: {detail}\n"
+            f"Sign in with: {self.host.login_hint}\n"
+            f"Or set a token directly: {self.host.token_hint}."
         )
 
 
