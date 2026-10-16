@@ -17,7 +17,8 @@ common git/GitHub operations from #658 without dropping into a terminal.
 ```
 src/aoe_github_plugin/
   main.py            JSON-RPC stdio loop + method dispatch (entrypoint)
-  auth.py            token resolution (GITHUB_TOKEN/GH_TOKEN, then `gh auth token`)
+  hosts.py           host identity, offline discovery, and remote matching
+  auth.py            per-host token resolution (environment, then stored gh credentials)
   client.py          GitHubClient + header-driven error classification
   errors.py          error taxonomy, each variant with an actionable hint
   handlers.py        the plugin's features (github.status)
@@ -77,8 +78,9 @@ session.
 ```jsonc
 {
   "summary": "owner/repo: PR #12 open for my-branch",  // one line for a status bar
-  "repo": "owner/repo",      // null outside a github.com checkout
-  "branch": "my-branch",     // null outside a github.com checkout
+  "host": "github.com",     // the trusted host for this checkout
+  "repo": "owner/repo",      // null outside a trusted GitHub host
+  "branch": "my-branch",     // null outside a trusted GitHub host
   "pulls": [                 // open PRs whose head is the current branch
     { "number": 12, "url": "https://github.com/owner/repo/pull/12",
       "title": "...", "state": "open", "draft": false }
@@ -91,7 +93,7 @@ session.
 `{ "url", "kind" }`: `kind: "pull"` (an open PR exists for the branch) or
 `kind: "compare"` (the create-PR page). Finding an existing PR is best-effort:
 any API failure falls back to the compare URL so it still works offline. It
-raises a typed error only when the checkout has no github.com remote.
+raises a typed error only when the checkout has no trusted GitHub remote.
 
 ### Multi-session refresh
 
@@ -110,7 +112,7 @@ session-less `github.refresh` cover every session and prune vanished ones:
    rather than looking for a `.git` directory). Immediate child submodules are
    skipped by default; turn off `ignore_submodules` to include them again. The
    workspace root is still scanned when it is itself a submodule.
-3. Resolve each checkout to `(owner, repo, branch)`, deduplicate (a branch shared
+3. Resolve each checkout to `(host, owner, repo, branch)`, deduplicate (a branch shared
    across workspaces is fetched once), and look up its PRs. Local git identity
    and the REST lookups fan out on small bounded thread pools so a big workspace
    set refreshes in seconds; GraphQL queries stay serial to stay clear of
@@ -188,7 +190,7 @@ budget) trips a short backoff serving the last-good cached result, honoring
 
 Worst-case math (every key changes every tick, so each spends one REST request,
 and same-repo branches batch into one GraphQL query per repo): for N unique
-`(owner, repo, branch)` keys at a T-second network tick, that is `N * 3600 / T`
+`(host, owner, repo, branch)` keys at a T-second network tick, that is `N * 3600 / T`
 REST req/hr; the GraphQL queries scale with the number of distinct repos (each
 capped at `MAX_GRAPHQL_ALIASES` branches per query), not N. At the 120s default,
 a 20-worktree single-repo workspace tops out around 600 REST req/hr and ~60
@@ -315,7 +317,8 @@ echo '{"jsonrpc":"2.0","id":2,"method":"github.open","params":{"args":{"path":".
   | uv run aoe-github-worker
 ```
 
-Token resolution order: `GITHUB_TOKEN`, then `GH_TOKEN`, then `gh auth token`
+Token resolution on github.com: `GH_TOKEN`, then `GITHUB_TOKEN`, then
+`gh auth token --hostname github.com`
 (only when `gh` is installed and authenticated). `gh` is an optional source,
 never required; without a token the worker still shows open PRs (the basic REST
 view), but review state, CI checks, unresolved comments, and merged PRs need a
@@ -344,3 +347,41 @@ the AoE maintainers via the embedded featured index.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### GitHub Enterprise Server
+
+The plugin can refresh github.com and multiple GHES servers together. Trust is
+read offline from the host names in the GitHub CLI's `hosts.yml`: `GH_CONFIG_DIR`,
+then `XDG_CONFIG_HOME/gh`, then `AppData/GitHub CLI` on Windows, otherwise
+`~/.config/gh`. It never checks accounts over the network during discovery.
+Configured servers stay visible when offline or holding an invalid token.
+Click **Refresh** after adding or removing a login; a failed configuration reread
+preserves the previous hosts until a successful reread.
+
+Sign in separately for each server:
+
+```sh
+gh auth login --hostname github.mycorp.com
+```
+
+For an enterprise environment token, explicitly name the one server it belongs to:
+
+```sh
+export GH_HOST=github.mycorp.com
+export GH_ENTERPRISE_TOKEN=<token>
+# GITHUB_ENTERPRISE_TOKEN is the lower-priority alternative.
+```
+
+Enterprise environment tokens are ignored without a matching `GH_HOST`; every
+other server uses its own stored gh credentials. `GH_TOKEN`/`GITHUB_TOKEN` only
+apply to github.com. The gh subprocess does not inherit any of these four token
+variables, so it cannot accidentally reuse a shared token for another server.
+Tokens resolve on each refresh and never enter persisted snapshots.
+
+Host names are lowercase with a trailing dot removed. HTTPS, scp-style SSH, and
+`ssh://` remotes (including an explicit SSH port) work. URLs use HTTPS on port
+443; custom HTTPS ports, IP-literal servers, localhost, and GitHub Cloud tenancy
+hosts (`*.ghe.com`) are currently unsupported. Unconfigured servers are skipped.
+REST/GraphQL budgets, ETags, rich caches, and retry cooldowns are separate per
+host. A missing token produces a hint for the selected PR's server. Old disk
+snapshots are discarded once on upgrade to the version 2 snapshot format.
