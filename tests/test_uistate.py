@@ -74,6 +74,19 @@ def _sort_key(params):
     return next(p for p in params if p["slot"] == "sort-key")
 
 
+def _facet(params, facet_id):
+    return next(p for p in params if p["slot"] == "filter-facet" and p["id"] == facet_id)
+
+
+def _global_params():
+    """The session-independent pushes every snapshot leads with: the sort key and
+    the filter facets."""
+    return [
+        {"slot": uistate.SORT_KEY_SLOT[0], "id": uistate.SORT_KEY_SLOT[1], "payload": uistate.SORT_KEY_PAYLOAD},
+        *({"slot": "filter-facet", "id": fid, "payload": payload} for fid, payload in uistate.FILTER_FACETS),
+    ]
+
+
 def _rows(blocks):
     rows = []
     for block in blocks:
@@ -90,8 +103,9 @@ def test_each_session_gets_a_badge_and_a_pane_with_session_id():
     panes = {p["session_id"] for p in params if p["slot"] == "pane"}
     assert badges == {"s1", "s2"}
     assert panes == {"s1", "s2"}
-    assert all("session_id" in p for p in params if p["slot"] != "sort-key")
+    assert all("session_id" in p for p in params if p["slot"] not in {"sort-key", "filter-facet"})
     assert "session_id" not in _sort_key(params)
+    assert all("session_id" not in p for p in params if p["slot"] == "filter-facet")
 
 
 def test_no_global_status_bar():
@@ -148,7 +162,11 @@ def test_badge_keeps_href_even_when_status_column_hidden():
     session = _session(repos=[_repo(name="a", pulls=[_pull(number=7)])])
     params = uistate.snapshot_ui_state_params(_snapshot(session), show_column=False)
     assert _badge(params)["payload"]["href"] == "https://github.com/o/r/pull/7"
-    assert _column(params)["payload"] == {"text": "", "sort_value": uistate._ATTENTION_VISUAL["open"][0]}
+    assert _column(params)["payload"] == {
+        "text": "",
+        "sort_value": uistate._ATTENTION_VISUAL["open"][0],
+        "filter_values": ["pr:open"],
+    }
 
 
 def test_pane_leads_with_a_pr_selector_and_folds_repos_without_prs():
@@ -242,24 +260,12 @@ def test_empty_snapshot_yields_no_pushes():
 
 def test_empty_sessions_snapshot_emits_sort_key_only():
     params = uistate.snapshot_ui_state_params({"sessions": []})
-    assert params == [
-        {
-            "slot": uistate.SORT_KEY_SLOT[0],
-            "id": uistate.SORT_KEY_SLOT[1],
-            "payload": uistate.SORT_KEY_PAYLOAD,
-        }
-    ]
+    assert params == _global_params()
 
 
 def test_session_without_id_is_skipped():
     params = uistate.snapshot_ui_state_params(_snapshot(_session(session_id=None)))
-    assert params == [
-        {
-            "slot": uistate.SORT_KEY_SLOT[0],
-            "id": uistate.SORT_KEY_SLOT[1],
-            "payload": uistate.SORT_KEY_PAYLOAD,
-        }
-    ]
+    assert params == _global_params()
 
 
 # --- rich (token) rendering ---
@@ -735,8 +741,13 @@ def test_column_skips_disabled_category_and_falls_through():
 def test_show_column_false_clears_status_text_but_keeps_badge():
     repos = [_repo(pulls=[_rich_pull(review="changes-requested")])]
     params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos)), show_column=False)
-    # The row-column hides words but keeps the sort scalar; the badge still has chips.
-    assert _column(params)["payload"] == {"text": "", "sort_value": uistate._ATTENTION_VISUAL["changes-requested"][0]}
+    # The row-column hides words but keeps the sort scalar and the facet values;
+    # the badge still has chips.
+    assert _column(params)["payload"] == {
+        "text": "",
+        "sort_value": uistate._ATTENTION_VISUAL["changes-requested"][0],
+        "filter_values": ["pr:open", "review:changes-requested"],
+    }
     assert _badge(params)["payload"]["items"]
 
 
@@ -756,6 +767,98 @@ def test_column_picks_most_urgent_repo_across_workspace():
         _repo(name="b", repo="o/b", pulls=[_rich_pull(review="changes-requested")]),  # outranks
     ]
     assert _column_payload(repos)["text"] == "changes requested"
+
+
+# --- filter facets: row-column filter_values + global filter-facet entries ---
+
+
+def test_column_filter_values_union_every_open_pr_across_repos():
+    failing = {"state": "failing", "runs": []}
+    passing = {"state": "succeeded", "runs": []}
+    comments = {"unresolved": 2, "items": [{"author": "a", "body": "x", "resolved": False}]}
+    repos = [
+        _repo(name="a", repo="o/a", pulls=[_rich_pull(review="approved", checks=passing, comments=comments)]),
+        _repo(name="b", repo="o/b", pulls=[_rich_pull(review="changes-requested", checks=failing, draft=True)]),
+        # A merged PR is history: its facts never reach the facets.
+        _repo(name="c", repo="o/c", pulls=[_rich_pull(state="MERGED", merged=True, review="commented")]),
+    ]
+    # The text collapses to one winner, but the facets see every open PR, the
+    # draft included (a draft still reports the CI/review state its data carries).
+    assert _column_payload(repos)["filter_values"] == [
+        "ci:failing",
+        "ci:passing",
+        "comments:unresolved",
+        "pr:draft",
+        "pr:open",
+        "review:approved",
+        "review:changes-requested",
+    ]
+
+
+def test_column_filter_values_ignore_chip_toggles():
+    checks = {"state": "running", "runs": []}
+    repos = [_repo(pulls=[_rich_pull(review="waiting", checks=checks)])]
+    # Every chip category off: the text degrades to "open PR", the facts stay.
+    payload = _column_with(repos, frozenset())
+    assert payload["text"] == "open PR"
+    assert payload["filter_values"] == ["ci:running", "pr:open", "review:waiting"]
+
+
+def test_column_filter_values_map_unrecognized_ci_state_to_unknown():
+    repos = [_repo(pulls=[_rich_pull(review=None, checks={"state": "weird", "runs": []})])]
+    assert _column_payload(repos)["filter_values"] == ["ci:unknown", "pr:open"]
+
+
+def test_column_without_pr_stays_empty_and_error_has_no_filter_values():
+    assert _column_payload([_repo()]) == {}
+    error = {"kind": "network", "hint": "offline"}
+    payload = _column_payload([_repo(error=error)])
+    assert payload["text"] == "error"
+    assert "filter_values" not in payload
+
+
+def test_snapshot_emits_global_filter_facets_on_the_status_column():
+    params = uistate.snapshot_ui_state_params(_snapshot(_session()))
+    facets = [p for p in params if p["slot"] == "filter-facet"]
+    assert [f["id"] for f in facets] == ["github_ci", "github_review", "github_pr", "github_comments"]
+    assert all("session_id" not in f for f in facets)
+    assert all(f["payload"]["column"] == uistate.ROW_COLUMN_SLOT[1] for f in facets)
+    assert [f["payload"]["label"] for f in facets] == ["GitHub CI", "GitHub review", "GitHub PR", "GitHub comments"]
+    assert _facet(params, "github_ci")["payload"]["options"] == [
+        {"value": "ci:passing", "label": "passing", "tone": "success"},
+        {"value": "ci:failing", "label": "failing", "tone": "danger"},
+        {"value": "ci:running", "label": "running", "tone": "info"},
+        {"value": "ci:queued", "label": "queued", "tone": "neutral"},
+        {"value": "ci:unknown", "label": "unknown", "tone": "neutral"},
+    ]
+    assert _facet(params, "github_review")["payload"]["options"] == [
+        {"value": "review:approved", "label": "approved", "tone": "success"},
+        {"value": "review:changes-requested", "label": "changes requested", "tone": "danger"},
+        {"value": "review:changes-pushed", "label": "pushed since review", "tone": "info"},
+        {"value": "review:commented", "label": "commented", "tone": "info"},
+        {"value": "review:waiting", "label": "awaiting review", "tone": "neutral"},
+    ]
+    assert _facet(params, "github_pr")["payload"]["options"] == [
+        {"value": "pr:open", "label": "open", "tone": "success"},
+        {"value": "pr:draft", "label": "draft", "tone": "warn"},
+    ]
+    assert _facet(params, "github_comments")["payload"]["options"] == [
+        {"value": "comments:unresolved", "label": "unresolved", "tone": "warn"},
+    ]
+
+
+def test_column_filter_values_cover_every_facet_option():
+    # Every value a PR can emit is an option some facet offers, so a session is
+    # never tagged with a fact the sidebar cannot select.
+    offered = {o["value"] for _fid, payload in uistate.FILTER_FACETS for o in payload["options"]}
+    comments = {"unresolved": 1, "items": []}
+    emitted: set[str] = set()
+    for review in uistate._REVIEW_VISUAL:
+        for cstate in [*uistate._CHECK_VISUAL, "weird"]:
+            for draft in (False, True):
+                pull = _rich_pull(review=review, checks={"state": cstate, "runs": []}, comments=comments, draft=draft)
+                emitted |= uistate._pull_filter_values(pull)
+    assert emitted == offered
 
 
 def test_column_shows_healthy_state_not_empty():
