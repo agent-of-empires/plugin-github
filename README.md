@@ -288,6 +288,23 @@ to use only classic branch-protection required checks. Optional failures remain
 listed in the GitHub pane. Repos whose required-check metadata cannot be read
 fall back to the all-check rollup.
 
+`owner_accounts` (advanced) maps a repository owner to the `gh` account that can
+see it. A token belongs to exactly one GitHub account, so one token cannot cover
+work repos living under one login and personal repos under another: whichever
+account is active wins, and the other owner's repos answer `404` --
+indistinguishable from "this branch has no PR", so those badges just silently
+never appear. Each row is an `owner` (user or org, matched case-insensitively)
+and a `gh_account` as `gh auth status` names it; that owner's repos are then
+fetched with `gh auth token --user <account>`, while owners with no row keep the
+global token, so an empty list is exactly the previous behaviour. Grouping is by
+identity, not owner, so two owners naming the same account share one HTTP
+client. An account that is not signed in (or a missing `gh`) falls back to the
+global token rather than dropping the owner, degrading to "maybe
+unauthenticated" rather than silence. The named-account lookup deliberately
+skips `GITHUB_TOKEN` / `GH_TOKEN`, which carry no account identity and would
+authenticate as whichever user the environment happens to hold. Each mapped
+account needs its own `gh auth login`.
+
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol
 > (`agent-of-empires#2095`); this repo ships the data those slots consume. The
@@ -320,7 +337,10 @@ echo '{"jsonrpc":"2.0","id":2,"method":"github.open","params":{"args":{"path":".
 ```
 
 Token resolution order: `GITHUB_TOKEN`, then `GH_TOKEN`, then `gh auth token`
-(only when `gh` is installed and authenticated). `gh` is an optional source,
+(only when `gh` is installed and authenticated). That is the *global* token; a
+repository owner listed in `owner_accounts` resolves through
+`gh auth token --user <account>` instead, skipping the environment variables
+because they carry no account identity. `gh` is an optional source,
 never required; without a token the worker still shows open PRs (the basic REST
 view), but review state, CI checks, unresolved comments, and merged PRs need a
 token, since they come from the authenticated GraphQL query.

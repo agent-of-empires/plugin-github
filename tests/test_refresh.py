@@ -1389,3 +1389,109 @@ def test_parallel_discovery_output_matches_serial_shape(tmp_path):
         ("a", "o/a", "b1"),
         ("b", "o/b", "b2"),
     ]
+
+
+# --- per-owner account grouping (#91) ----------------------------------------
+
+
+class _AccountEnv(TokenEnvironment):
+    """Global token via env plus a per-account table. ``asked`` records the
+    logins queried so a test can assert the resolver is cached, not re-shelled."""
+
+    def __init__(self, accounts, global_auth="global-tok"):
+        self._accounts = accounts
+        self._global = global_auth
+        self.asked = []
+
+    def env_var(self, key):
+        return self._global if key == "GITHUB_TOKEN" and self._global else None
+
+    def gh_available(self):
+        return True
+
+    def gh_auth_token(self):
+        # With a global env token, resolution must short-circuit before `gh`.
+        # Without one, falling through to a signed-out `gh` is the real path.
+        if self._global:
+            raise AssertionError("GITHUB_TOKEN must short-circuit before gh")
+        return False, "", "no oauth token found"
+
+    def gh_auth_token_for_user(self, login):
+        self.asked.append(login)
+        token = self._accounts.get(login)
+        if token is None:
+            return False, "", "no oauth token found"
+        return True, token, ""
+
+
+WORK = ("acme-corp", "widgets", "main")
+PERSONAL = ("hobby-org", "notes", "main")
+PERSONAL2 = ("hobby-org", "other", "dev")
+
+
+def test_no_mapping_keeps_one_client():
+    """Empty mapping must reproduce the pre-#91 single-identity path exactly."""
+    env = _AccountEnv({})
+    groups = refresh._group_by_token([WORK, PERSONAL], env, ())
+    assert groups == {"global-tok": [WORK, PERSONAL]}
+    assert env.asked == []
+
+
+def test_mapping_splits_owners_onto_their_own_tokens():
+    env = _AccountEnv({"work-acct": "work-tok", "home-acct": "home-tok"})
+    groups = refresh._group_by_token(
+        [WORK, PERSONAL],
+        env,
+        (("acme-corp", "work-acct"), ("hobby-org", "home-acct")),
+    )
+    assert groups == {"work-tok": [WORK], "home-tok": [PERSONAL]}
+
+
+def test_owner_match_is_case_insensitive():
+    env = _AccountEnv({"work-acct": "work-tok"})
+    groups = refresh._group_by_token([WORK], env, (("ACME-Corp", "work-acct"),))
+    assert groups == {"work-tok": [WORK]}
+
+
+def test_same_account_for_two_owners_shares_one_group():
+    """Grouping is by identity, not by owner, so the client count stays minimal."""
+    env = _AccountEnv({"home-acct": "home-tok"})
+    groups = refresh._group_by_token(
+        [PERSONAL, ("solo-dev", "dots", "main")],
+        env,
+        (("hobby-org", "home-acct"), ("solo-dev", "home-acct")),
+    )
+    assert groups == {"home-tok": [PERSONAL, ("solo-dev", "dots", "main")]}
+
+
+def test_account_token_resolved_once_per_login():
+    env = _AccountEnv({"home-acct": "home-tok"})
+    refresh._group_by_token([PERSONAL, PERSONAL2], env, (("hobby-org", "home-acct"),))
+    assert env.asked == ["home-acct"]
+
+
+def test_unresolvable_account_falls_back_to_global_token():
+    """A signed-out account must degrade to the global token, never drop the
+    owner: silence reads as "no PR", which is the failure this feature fixes."""
+    env = _AccountEnv({})
+    groups = refresh._group_by_token([PERSONAL], env, (("hobby-org", "ghost-acct"),))
+    assert groups == {"global-tok": [PERSONAL]}
+
+
+def test_fallback_with_no_global_token_stays_unauthenticated():
+    env = _AccountEnv({}, global_auth=None)
+    groups = refresh._group_by_token([PERSONAL], env, (("hobby-org", "ghost-acct"),))
+    assert groups == {None: [PERSONAL]}
+
+
+def test_blank_rows_are_ignored():
+    env = _AccountEnv({"work-acct": "work-tok"})
+    groups = refresh._group_by_token([WORK], env, (("", "work-acct"), ("acme-corp", "  ")))
+    assert groups == {"global-tok": [WORK]}
+
+
+def test_group_order_follows_key_order_for_determinism():
+    env = _AccountEnv({"work-acct": "work-tok", "home-acct": "home-tok"})
+    mapping = (("acme-corp", "work-acct"), ("hobby-org", "home-acct"))
+    assert list(refresh._group_by_token([PERSONAL, WORK], env, mapping)) == ["home-tok", "work-tok"]
+    assert list(refresh._group_by_token([WORK, PERSONAL], env, mapping)) == ["work-tok", "home-tok"]
