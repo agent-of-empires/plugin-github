@@ -265,7 +265,7 @@ def test_session_without_id_is_skipped():
 # --- rich (token) rendering ---
 
 
-def _rich_pull(  # noqa: PLR0913
+def _rich_pull(  # noqa: PLR0913, PLR0917
     state="OPEN", merged=False, review="approved", checks=None, comments=None, merge_state=None, draft=False
 ):
     number = 5
