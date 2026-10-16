@@ -317,6 +317,11 @@ to use only classic branch-protection required checks. Optional failures remain
 listed in the GitHub pane. Repos whose required-check metadata cannot be read
 fall back to the all-check rollup.
 
+The advanced `ignored_commenters` setting (default `coderabbitai, codecov`) is a
+comma-separated list of GitHub logins whose COMMENTED reviews and unresolved
+threads never make a PR read "commented", so that state means a person
+commented. Their unresolved threads still count toward unresolved comments.
+
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol
 > (`agent-of-empires#2095`); this repo ships the data those slots consume. The
