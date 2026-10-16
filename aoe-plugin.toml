@@ -169,6 +169,16 @@ description = "Show the unresolved-review-comment chip on each session row. The 
 type = "boolean"
 default = true
 
+# Bots whose reviews and threads should not make a PR read "commented" on the
+# session row. Their unresolved threads still count as unresolved comments.
+[[settings]]
+key = "ignored_commenters"
+label = "Ignored commenters"
+description = "Comma-separated GitHub logins (e.g. bots) whose comments never mark a PR as \"commented\". Their unresolved threads still count as unresolved comments. Case-insensitive; a [bot] suffix is optional."
+type = "string"
+default = "coderabbitai, codecov"
+advanced = true
+
 [[settings]]
 key = "show_status_text"
 label = "Show PR status summary text in session row"
