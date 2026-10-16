@@ -225,7 +225,7 @@ id = "github_pr_attention"
 
 # Global filter facets over the `github_pr_status` row-column: the worker tags
 # each session's cell with `filter_values` (e.g. `ci:failing`, `review:approved`,
-# `pr:draft`, `comments:unresolved`), so the dashboard sidebar and other plugins
+# `pr:draft`, `comments:unresolved`, `conflicts:yes`), so the dashboard sidebar and other plugins
 # can filter sessions by one PR fact.
 [[ui]]
 slot = "filter-facet"
@@ -242,6 +242,10 @@ id = "github_pr"
 [[ui]]
 slot = "filter-facet"
 id = "github_comments"
+
+[[ui]]
+slot = "filter-facet"
+id = "github_conflicts"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking
 # ndjson JSON-RPC over stdio. The host requires the entrypoint to be
