@@ -23,8 +23,11 @@ def _conn(*prs):
     return {"nodes": list(prs)}
 
 
-def _rollup(state, contexts):
-    return {"state": state, "contexts": {"nodes": list(contexts)}}
+def _rollup(state, contexts, total=None):
+    out = {"state": state, "contexts": {"nodes": list(contexts)}}
+    if total is not None:
+        out["contexts"]["totalCount"] = total
+    return out
 
 
 def _branch_rule(*, requires=True, contexts=(), checks=()):
@@ -76,6 +79,58 @@ def _thread(resolved, author="al", body="hi", path="a.py", line=3):
 def test_review_state_decision_wins():
     assert graphql.review_state(_pr(decision="APPROVED")) == "approved"
     assert graphql.review_state(_pr(decision="CHANGES_REQUESTED")) == "changes-requested"
+
+
+def _latest(state, oid, login="jules"):
+    return {"state": state, "author": {"login": login}, "commit": {"oid": oid}}
+
+
+def test_review_state_changes_pushed_only_when_every_blocking_review_is_stale():
+    def pr(*latest):
+        out = _pr(decision="CHANGES_REQUESTED")
+        out["headRefOid"] = "new"
+        out["latestReviews"] = {"nodes": list(latest)}
+        return out
+
+    cases = [
+        # Pushed since the only blocking review.
+        ([_latest("CHANGES_REQUESTED", "old")], "changes-pushed"),
+        # Reviewed the current head: still a live block.
+        ([_latest("CHANGES_REQUESTED", "new")], "changes-requested"),
+        # One blocking reviewer is current, so the PR is not yet "pushed since".
+        ([_latest("CHANGES_REQUESTED", "old"), _latest("CHANGES_REQUESTED", "new", "nate")], "changes-requested"),
+        # An approval does not count as blocking, however old.
+        ([_latest("CHANGES_REQUESTED", "old"), _latest("APPROVED", "old", "nate")], "changes-pushed"),
+        # Unknown commit or no review data degrades to the conservative state.
+        ([{"state": "CHANGES_REQUESTED", "author": {"login": "jules"}}], "changes-requested"),
+        ([], "changes-requested"),
+    ]
+    for latest, expected in cases:
+        assert graphql.review_state(pr(*latest)) == expected, latest
+
+
+def test_review_state_sees_block_dropped_from_latest_reviews_by_a_re_request():
+    # Real shape (agent-of-empires#4518): njbrake was re-requested, so GitHub drops
+    # his review from `latestReviews`, but `reviewDecision` stays CHANGES_REQUESTED
+    # and `decidedReviews` still carries it.
+    def pr(blocked_on):
+        out = _pr(decision="CHANGES_REQUESTED")
+        out["headRefOid"] = "new"
+        out["latestReviews"] = {"nodes": [_latest("COMMENTED", "x", "coderabbitai")]}
+        out["decidedReviews"] = {"nodes": [_latest("CHANGES_REQUESTED", blocked_on, "njbrake")]}
+        out["reviewRequests"] = {"nodes": [{"requestedReviewer": {"login": "njbrake"}}]}
+        return out
+
+    assert graphql.review_state(pr("old")) == "changes-pushed"
+    assert graphql.review_state(pr("new")) == "changes-requested"
+    assert graphql.reviewers(pr("old")) == [
+        {"name": "coderabbitai", "state": "commented"},
+        {"name": "njbrake", "state": "changes-pushed"},
+    ]
+    # A later approval from the same reviewer clears their block.
+    cleared = pr("old")
+    cleared["decidedReviews"]["nodes"].append(_latest("APPROVED", "new", "njbrake"))
+    assert graphql.review_state(cleared) == "changes-requested"  # decision still says so; no blocking review known
 
 
 def test_review_state_infers_commented_from_review_or_thread():
@@ -154,6 +209,76 @@ def test_check_summary_tie_keeps_worst_state():
     )
     summary = graphql.check_summary(_pr(rollup=rollup))
     assert [(r["name"], r["state"], r["url"]) for r in summary["runs"]] == [("tie", "failing", "bad")]
+
+
+def test_check_summary_state_ignores_superseded_failure_in_sticky_rollup():
+    # GitHub keeps the rollup at FAILURE after a failed run is re-run green (#98),
+    # so the headline state must follow the latest run per check, not the rollup.
+    rollup = _rollup(
+        "FAILURE",
+        [
+            _checkrun("build", "COMPLETED", "FAILURE", completed_at="2024-01-01T00:00:00Z"),
+            _checkrun("test", "COMPLETED", "CANCELLED", completed_at="2024-01-01T00:00:00Z"),
+            _checkrun("build", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:05:00Z"),
+            _checkrun("test", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:05:00Z"),
+        ],
+        total=4,
+    )
+    summary = graphql.check_summary(_pr(rollup=rollup))
+    assert summary["state"] == "succeeded"
+
+
+def test_check_summary_state_failing_when_latest_run_fails():
+    rollup = _rollup(
+        "FAILURE",
+        [
+            _checkrun("build", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:00:00Z"),
+            _checkrun("build", "COMPLETED", "FAILURE", completed_at="2024-01-01T00:05:00Z"),
+        ],
+        total=2,
+    )
+    assert graphql.check_summary(_pr(rollup=rollup))["state"] == "failing"
+
+
+def test_check_summary_state_running_when_rerun_in_flight():
+    rollup = _rollup(
+        "FAILURE",
+        [
+            _checkrun("build", "COMPLETED", "FAILURE", completed_at="2024-01-01T00:00:00Z"),
+            _checkrun("build", "IN_PROGRESS", completed_at="2024-01-01T00:05:00Z"),
+        ],
+        total=2,
+    )
+    assert graphql.check_summary(_pr(rollup=rollup))["state"] == "running"
+
+
+def test_check_summary_state_keeps_rollup_when_contexts_truncated():
+    # More contexts exist than were fetched: a failing run may sit past the cap,
+    # so the raw rollup stays authoritative rather than risk a false green.
+    rollup = _rollup("FAILURE", [_checkrun("build", "COMPLETED", "SUCCESS")], total=60)
+    assert graphql.check_summary(_pr(rollup=rollup))["state"] == "failing"
+
+
+def test_check_summary_state_green_for_pr_with_more_than_fifty_checks():
+    # 56 contexts, a superseded failure, and every latest run green (#98 follow-up):
+    # the page must hold them all so the headline is not pinned to the sticky rollup.
+    runs = [_checkrun(f"job-{i}", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:05:00Z") for i in range(54)]
+    runs += [
+        _checkrun("flaky", "COMPLETED", "FAILURE", completed_at="2024-01-01T00:00:00Z"),
+        _checkrun("flaky", "COMPLETED", "SUCCESS", completed_at="2024-01-01T00:05:00Z"),
+    ]
+    summary = graphql.check_summary(_pr(rollup=_rollup("FAILURE", runs, total=56)))
+    assert summary["state"] == "succeeded"
+
+
+def test_queries_fetch_a_full_page_of_contexts():
+    # first:100 is GitHub's connection max and costs the same points as first:50.
+    assert "contexts(first: 100)" in graphql.build_query(1)
+
+
+def test_check_summary_state_falls_back_to_rollup_without_runs():
+    assert graphql.check_summary(_pr(rollup=_rollup("SUCCESS", [])))["state"] == "succeeded"
+    assert graphql.check_summary(_pr(rollup=_rollup("PENDING", [])))["state"] == "running"
 
 
 def test_required_check_mode_ignores_optional_failures_for_rollup():
@@ -443,6 +568,8 @@ def test_reviewers_merge_latest_reviews_with_outstanding_requests():
         {"name": "half-written", "state": "pending"},
         {"name": "platform-team", "state": "pending"},
     ]
+    stale = {"headRefOid": "new", "latestReviews": {"nodes": [_latest("CHANGES_REQUESTED", "old")]}}
+    assert graphql.reviewers(stale) == [{"name": "jules", "state": "changes-pushed"}]
     # Total: a malformed PR yields no reviewers rather than raising.
     assert graphql.reviewers({}) == []
 
@@ -456,6 +583,8 @@ def test_review_summary_reads_the_way_github_does():
         ([{"name": "a", "state": "pending"}, {"name": "b", "state": "pending"}], "2 pending"),
         # A blocking review wins regardless of how many approvals sit beside it.
         ([{"name": "a", "state": "approved"}, {"name": "b", "state": "changes-requested"}], "changes requested"),
+        ([{"name": "a", "state": "approved"}, {"name": "b", "state": "changes-pushed"}], "pushed since review"),
+        ([{"name": "a", "state": "changes-pushed"}, {"name": "b", "state": "changes-requested"}], "changes requested"),
     ]
     for people, expected in cases:
         assert graphql.review_summary(people) == expected, people

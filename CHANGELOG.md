@@ -4,6 +4,56 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [2.1.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.1.0) - 2026-10-16
+
+
+
+### Features
+
+- **ui:** Filter sessions by CI, review, PR and comment facets in [#110](https://github.com/agent-of-empires/plugin-github/pull/110) by [@Seluj78](https://github.com/Seluj78) ([`4dc1830`](https://github.com/agent-of-empires/plugin-github/commit/4dc1830369769d081abfe0ce6f7bb7445b25d582))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.0.4...v2.1.0
+## [2.0.4](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.0.4) - 2026-10-15
+
+
+
+### Bug Fixes
+
+- **graphql:** Read a re-requested reviewer's standing block from decidedReviews in [#107](https://github.com/agent-of-empires/plugin-github/pull/107) by [@Seluj78](https://github.com/Seluj78) ([`3b6d984`](https://github.com/agent-of-empires/plugin-github/commit/3b6d98461c071ff0120a814367ba02f7d690e05a))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.0.3...v2.0.4
+## [2.0.3](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.0.3) - 2026-10-15
+
+
+
+### Bug Fixes
+
+- **ui:** Show pushed since review instead of changes requested after a new push in [#105](https://github.com/agent-of-empires/plugin-github/pull/105) by [@Seluj78](https://github.com/Seluj78) ([`b429e6a`](https://github.com/agent-of-empires/plugin-github/commit/b429e6af9bf14922ca7ebceeefb834904fc908d5))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.0.2...v2.0.3
+## [2.0.2](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.0.2) - 2026-10-15
+
+
+
+### Bug Fixes
+
+- **graphql:** Fetch up to 100 check contexts so the CI fix covers large PRs in [#103](https://github.com/agent-of-empires/plugin-github/pull/103) by [@Seluj78](https://github.com/Seluj78) ([`361ee1a`](https://github.com/agent-of-empires/plugin-github/commit/361ee1ab317073d2ca0639cf66b1337c5bf5e02e))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.0.1...v2.0.2
+## [2.0.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.0.1) - 2026-10-14
+
+
+
+### Bug Fixes
+
+- **graphql:** Derive CI headline state from latest runs, not sticky rollup in [#99](https://github.com/agent-of-empires/plugin-github/pull/99) by [@Seluj78](https://github.com/Seluj78) ([`d3ec281`](https://github.com/agent-of-empires/plugin-github/commit/d3ec281fec46b842fdf75a688735df26ab883718))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.0.0...v2.0.1
 ## [2.0.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.0.0) - 2026-08-04
 
 

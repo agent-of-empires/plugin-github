@@ -29,4 +29,11 @@
   Interfaces: GitHubHost.dotcom()/enterprise(name), discover_trusted_hosts(env, previous), parse_owner_repo(url, trusted) -> (host, owner, repo), resolve_token(env, host), GitHubClient(host=host, token=token).
 - [x] 2. Add three-host refresh integration and per-host budget/backoff regression tests. Migrate RepoKey to (host, owner, repo, branch), group fetches by host, partition state, add snapshot version gate. Update existing assertions for the new contract. Run refresh tests and commit.
 - [x] 3. Add GHES handler/runtime/pane tests. Cache discovery in Runtime, rediscover on manual refresh, share map with direct handlers; show selected-host auth hints and construct compare links with web_base. Run affected tests and commit.
-- [ ] 4. Update dependency lock, README, and net capability comment; inspect host API enforcement. Run uv run pytest, uv run ruff check ., uv run ruff format --check ., uv run mypy src, and git diff --check. Review complete diff before updating PR #90.
+- [x] 4. Update dependency lock, README, and net capability comment; inspect host API enforcement. Run uv run pytest, uv run ruff check ., uv run ruff format --check ., uv run mypy src, and git diff --check. Review complete diff before updating PR #90.
+
+## Verification record
+
+- Merged current main at 3d13c6f (v2.1.0), preserving its CI/review fixes and session filter facets.
+- Full merged suite: 344 passed. Ruff lint and format checks, mypy (13 source files), and diff whitespace checks passed.
+- Fresh review found an uncached GHES backoff error with a dotcom hint. The regression test failed first; passing client.host fixed it and the full suite passed.
+- Separate integration review found no actionable issues. Live GHES compatibility remains unverified; HTTP coverage uses MockTransport.

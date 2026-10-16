@@ -35,9 +35,11 @@ from datetime import timezone
 # - reviewThreads first:100 with pageInfo, so a big review (e.g. a CodeRabbit
 #   pass) surfaces every unresolved comment; refresh paginates by the node ``id``
 #   for the rare PR that still has more (#28).
-# contexts stays at first:50 ON PURPOSE: the per-check rows are ranked
-# failure-first CLIENT-side (see check_summary), so truncating the connection
-# could drop a failing check past the cap and render a PR falsely green.
+# contexts is first:100 (GitHub's connection max, same point cost as first:50) ON
+# PURPOSE: the per-check rows are ranked failure-first CLIENT-side (see
+# check_summary), so truncating the connection could drop a failing check past the
+# cap and render a PR falsely green. A PR with 50+ checks is routine, and
+# check_summary keeps the raw rollup whenever the page is still truncated.
 _PR_CONNECTION_FRAGMENT = """
 fragment PRConnection on PullRequestConnection {
   nodes {
@@ -49,7 +51,7 @@ fragment PRConnection on PullRequestConnection {
       requiredStatusCheckContexts
       requiredStatusChecks { context app { databaseId slug name } }
     } }
-    commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 50) { nodes {
+    commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { totalCount nodes {
       __typename
       ... on CheckRun {
         name status conclusion detailsUrl startedAt completedAt
@@ -65,7 +67,10 @@ fragment PRConnection on PullRequestConnection {
       ... on StatusContext { context state targetUrl createdAt }
     } } } } } }
     reviews(last: 1, states: [COMMENTED]) { nodes { state } }
-    latestReviews(first: 20) { nodes { state author { login } } }
+    latestReviews(first: 20) { nodes { state author { login } commit { oid } } }
+    decidedReviews: reviews(last: 30, states: [CHANGES_REQUESTED, APPROVED, DISMISSED]) {
+      nodes { state author { login } commit { oid } }
+    }
     reviewRequests(first: 20) { nodes { requestedReviewer {
       __typename
       ... on User { login }
@@ -253,8 +258,36 @@ def excerpt(text: Any, limit: int = EXCERPT_LEN) -> str:
     return collapsed if len(collapsed) <= limit else collapsed[: limit - 1].rstrip() + "…"
 
 
+def _blocking_reviews(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    """Each reviewer's standing ``CHANGES_REQUESTED`` review.
+
+    ``latestReviews`` drops a reviewer's review once they are re-requested, yet
+    ``reviewDecision`` stays ``CHANGES_REQUESTED``; ``decidedReviews`` (oldest
+    first) still carries it, so the latest of those per author is authoritative.
+    ``latestReviews`` fills in for a response without ``decidedReviews``."""
+    latest: dict[str, dict[str, Any]] = {}
+    for node in [*_nodes(pr, "latestReviews"), *_nodes(pr, "decidedReviews")]:
+        name = _reviewer_name(node.get("author"))
+        if name is not None:
+            latest[name] = node
+    return [n for n in latest.values() if n.get("state") == "CHANGES_REQUESTED"]
+
+
+def _review_is_stale(pr: dict[str, Any], review: dict[str, Any]) -> bool:
+    """True when a review was made on a commit other than the PR's current head.
+    Unknown commits (a drifted or partial response) are never stale."""
+    commit = review.get("commit")
+    oid = commit.get("oid") if isinstance(commit, dict) else None
+    head = pr.get("headRefOid")
+    return isinstance(oid, str) and isinstance(head, str) and oid != head
+
+
 def review_state(pr: dict[str, Any]) -> str:
-    """``approved`` / ``changes-requested`` / ``commented`` / ``waiting``.
+    """``approved`` / ``changes-requested`` / ``changes-pushed`` / ``commented`` / ``waiting``.
+
+    ``changes-pushed`` is a ``CHANGES_REQUESTED`` decision whose blocking reviews
+    were all made on an older commit: the author has pushed since, so the review
+    still blocks the merge on GitHub but is likely addressed and awaits a re-review.
 
     ``commented`` is inferred (see module docstring): a COMMENTED review or any
     unresolved thread, when the decision is neither approved nor changes-needed.
@@ -263,6 +296,9 @@ def review_state(pr: dict[str, Any]) -> str:
     if decision == "APPROVED":
         return "approved"
     if decision == "CHANGES_REQUESTED":
+        blocking = _blocking_reviews(pr)
+        if blocking and all(_review_is_stale(pr, r) for r in blocking):
+            return "changes-pushed"
         return "changes-requested"
     reviews = _nodes(pr, "reviews")
     threads = _nodes(pr, "reviewThreads")
@@ -429,6 +465,17 @@ def _matches_requirement(run: dict[str, Any], requirement: Requirement) -> bool:
     return app is None or run.get("app") == app
 
 
+def _worst_state(states: list[str]) -> str:
+    for worst in ("failing", "running", "queued", "unknown"):
+        if worst in states:
+            return worst
+    return "succeeded"
+
+
+def _runs_state(runs: list[dict[str, Any]]) -> str:
+    return _worst_state([run.get("state", "unknown") for run in runs])
+
+
 def _required_rollup_state(runs: list[dict[str, Any]], required: list[Requirement]) -> str:
     if not required:
         return "unknown"
@@ -438,15 +485,7 @@ def _required_rollup_state(runs: list[dict[str, Any]], required: list[Requiremen
         states.extend(run.get("state", "unknown") for run in matches)
         if not matches:
             states.append("running")
-    if "failing" in states:
-        return "failing"
-    if "running" in states:
-        return "running"
-    if "queued" in states:
-        return "queued"
-    if "unknown" in states:
-        return "unknown"
-    return "succeeded"
+    return _worst_state(states)
 
 
 def _mark_required_runs(runs: list[dict[str, Any]], required: list[Requirement]) -> None:
@@ -523,6 +562,14 @@ def check_summary(pr: dict[str, Any], *, required_checks_only: bool = False) -> 
     # surfacing failures at the top.
     runs.sort(key=lambda r: _STATE_RANK.get(r["state"], 5))
     state = _STATUS_STATE.get(rollup.get("state") or "", "unknown")
+    # GitHub's rollup stays FAILURE after a failed run is re-run green (#98), so
+    # when every context was fetched, derive the headline from the deduped runs
+    # (what GitHub's own PR page shows). A truncated page may hide a failing run,
+    # so it keeps the raw rollup: a false "failing" beats a false green.
+    contexts = rollup.get("contexts")
+    total = contexts.get("totalCount") if isinstance(contexts, dict) else None
+    if runs and not (isinstance(total, int) and total > len(_nodes(rollup, "contexts"))):
+        state = _runs_state(runs)
     if required_checks_only:
         required = _required_checks(pr)
         if required is not None:
@@ -578,10 +625,11 @@ def _reviewer_name(reviewer: Any) -> str | None:
 def reviewers(pr: dict[str, Any]) -> list[dict[str, str]]:
     """One entry per person whose opinion this PR is waiting on or has:
     ``[{"name", "state"}]`` where state is ``approved`` / ``changes-requested`` /
-    ``commented`` / ``pending``.
+    ``changes-pushed`` / ``commented`` / ``pending``.
 
     ``latestReviews`` already collapses a reviewer's history to their current
-    position, so it needs no de-duplication of its own; outstanding
+    position, so it needs no de-duplication of its own; a standing block that
+    ``latestReviews`` dropped (re-requested reviewer) is restored; outstanding
     ``reviewRequests`` are appended as ``pending``. A reviewer who has both (a
     re-request after a review) keeps their submitted state, since that is the
     position still on record. Total: malformed nodes are skipped, never raised.
@@ -593,7 +641,18 @@ def reviewers(pr: dict[str, Any]) -> list[dict[str, str]]:
         if name is None or name in seen:
             continue
         seen.add(name)
-        out.append({"name": name, "state": _REVIEW_NODE_STATE.get(node.get("state") or "", "pending")})
+        state = _REVIEW_NODE_STATE.get(node.get("state") or "", "pending")
+        if state == "changes-requested" and _review_is_stale(pr, node):
+            state = "changes-pushed"
+        out.append({"name": name, "state": state})
+    # A re-requested reviewer is gone from `latestReviews` but their block stands.
+    for node in _blocking_reviews(pr):
+        name = _reviewer_name(node.get("author"))
+        if name is None or name in seen:
+            continue
+        seen.add(name)
+        stale = _review_is_stale(pr, node)
+        out.append({"name": name, "state": "changes-pushed" if stale else "changes-requested"})
     for node in _nodes(pr, "reviewRequests"):
         name = _reviewer_name(node.get("requestedReviewer"))
         if name is None or name in seen:
@@ -611,6 +670,8 @@ def review_summary(people: list[dict[str, str]]) -> str:
         return ""
     if any(p["state"] == "changes-requested" for p in people):
         return "changes requested"
+    if any(p["state"] == "changes-pushed" for p in people):
+        return "pushed since review"
     approved = sum(1 for p in people if p["state"] == "approved")
     if approved == len(people):
         return f"{approved} approved" if approved != 1 else "1 approved"
