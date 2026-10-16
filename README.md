@@ -320,7 +320,8 @@ fall back to the all-check rollup.
 The advanced `ignored_commenters` setting (default `coderabbitai, codecov`) is a
 comma-separated list of GitHub logins whose COMMENTED reviews and unresolved
 threads never make a PR read "commented", so that state means a person
-commented. Their unresolved threads still count toward unresolved comments.
+commented. The PR author's own comments (e.g. replies to review threads) never
+count either. Their unresolved threads still count toward unresolved comments.
 
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol

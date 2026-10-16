@@ -174,7 +174,7 @@ default = true
 [[settings]]
 key = "ignored_commenters"
 label = "Ignored commenters"
-description = "Comma-separated GitHub logins (e.g. bots) whose comments never mark a PR as \"commented\". Their unresolved threads still count as unresolved comments. Case-insensitive; a [bot] suffix is optional."
+description = "Comma-separated GitHub logins (e.g. bots) whose comments never mark a PR as \"commented\" (the PR author's own comments never do either). Their unresolved threads still count as unresolved comments. Case-insensitive; a [bot] suffix is optional."
 type = "string"
 default = "coderabbitai, codecov"
 advanced = true
