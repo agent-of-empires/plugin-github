@@ -390,6 +390,29 @@ def test_normalize_pull_with_no_commit_or_threads_does_not_raise():
     assert out["comments"] == {"unresolved": 0, "items": []}
 
 
+def test_normalize_pull_exposes_merge_queue_and_degrades_without_entry():
+    queued = _pr(decision="APPROVED")
+    queued["mergeQueueEntry"] = {"position": 2, "state": "AWAITING_CHECKS"}
+    queued["mergeQueue"] = {"url": "https://github.com/o/r/queue/main"}
+    without_queue = _pr()
+    without_queue["mergeQueueEntry"] = None
+    assert graphql.normalize_connection(_conn(queued))[0]["merge_queue"] == {
+        "position": 2,
+        "state": "awaiting-checks",
+        "url": "https://github.com/o/r/queue/main",
+    }
+    assert graphql.normalize_connection(_conn(without_queue))[0]["merge_queue"] is None
+
+
+def test_merge_queue_position_rejects_invalid_values():
+    queued = _pr()
+    queued["mergeQueueEntry"] = {"position": True, "state": None}
+    assert graphql.normalize_connection(_conn(queued))[0]["merge_queue"] == {
+        "position": None,
+        "state": "unknown",
+    }
+
+
 def test_build_query_aliases_each_branch_with_variables():
     q = graphql.build_query(3)
     # One typed variable + one aliased field per branch, sharing the fragment.
@@ -400,6 +423,8 @@ def test_build_query_aliases_each_branch_with_variables():
     assert "fragment PRConnection on PullRequestConnection" in q
     assert "reviewThreads(first: 100)" in q
     assert "pageInfo { hasNextPage endCursor }" in q
+    assert "mergeQueueEntry { position state }" in q
+    assert "mergeQueue { url }" in q
 
 
 def test_build_query_single_alias_is_just_one_branch():
@@ -426,6 +451,7 @@ def test_build_digest_query_aliases_and_omits_rich_connections():
     assert "contexts" not in q
     assert "comments" not in q
     assert "PRConnection" not in q
+    assert "mergeQueueEntry" in q
 
 
 def test_digest_signature_equal_for_digest_and_full_shapes():
@@ -473,6 +499,7 @@ def test_digest_signature_changes_on_each_watched_field():
         ("headRefOid", "def"),
         ("reviewThreads", {"totalCount": 3}),
         ("mergeable", "CONFLICTING"),
+        ("mergeQueueEntry", {"position": 2, "state": "QUEUED"}),
     ]:
         node = dict(base)
         node[field] = value
