@@ -45,7 +45,7 @@ anything is written.
 | Command | `refresh` -> worker method `github.refresh`                        |
 | Command | `open` (open-in-GitHub) -> worker method `github.open`             |
 | Command | `open_pr` (`GitHub: open PR`) -> client `open-ui-link` action, default chord `Ctrl+Shift+G` |
-| UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), and a `pane` tool-window (`github_pane`) |
+| UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), four `filter-facet`s (`github_ci`, `github_review`, `github_pr`, `github_comments`), and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
 `open_pr` is the command-palette / shortcut way to open the active session's PR
@@ -127,7 +127,7 @@ session-less `github.refresh` cover every session and prune vanished ones:
    a workspace of many worktrees of one repo costs a single query (split into a
    few once it exceeds the per-query alias cap). Without a token it is the basic
    REST open-PR lookup only.
-4. Push one global `sort-key` and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
+4. Push one global `sort-key`, four global `filter-facet`s (below), and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
    chip sequence per open PR: a clickable PR icon, a merge-conflict chip when the
    PR conflicts with its base, then review-state, CI-rollup,
    and unresolved-comment chips, each shown only when a token supplies that field,
@@ -137,17 +137,38 @@ session-less `github.refresh` cover every session and prune vanished ones:
    distinguishing a broken PR from a healthy one at a glance; a draft shows the PR
    chip alone and merged-only repos are omitted, since the badge is an actionable
    indicator), a `row-column`
-   (`{text, tone, tooltip, sort_value?}`, or `{}` to clear -- one deterministic
+   (`{text, tone, tooltip, sort_value?, filter_values?}`, or `{}` to clear -- one deterministic
    words summary of the session's most-urgent PR signal so the list is scannable
    without hovering the badge; a multi-repo workspace collapses to its single
    highest-attention candidate, with the pane keeping the per-repo breakdown;
-   `sort_value` lets the dashboard sort sessions by GitHub PR attention, even
-   when `show_status_text` hides the visible words), and
+   `sort_value` lets the dashboard sort sessions by GitHub PR attention and
+   `filter_values` lets it filter them by PR fact, both even when
+   `show_status_text` hides the visible words), and
    a `pane`
    (`{title, default_location, blocks: [...], footer}` -- the in-session GitHub
    tool-window, described in [The pane](#the-pane) below. Its `action` blocks POST
    back to the host, which forwards the named method (`github.refresh`,
    `github.select_pr`) to this worker).
+
+Filter facets: each session's `row-column` carries `filter_values`, the sorted
+union of facts across every open (non-merged) PR in the workspace, drafts
+included. They are data, not display, so the session-row chip toggles do not
+affect them. The four global `filter-facet` entries point at that column
+(`column: "github_pr_status"`) and list the values a user can pick; a facet
+matches a session when its `filter_values` holds any selected value, so the
+dashboard sidebar and other plugins (e.g. a kanban board) can filter sessions by
+"CI failing" without a host change:
+
+| Facet id          | Label           | Values                                                                                                   |
+| ----------------- | --------------- | -------------------------------------------------------------------------------------------------------- |
+| `github_ci`       | GitHub CI       | `ci:passing`, `ci:failing`, `ci:running`, `ci:queued`, `ci:unknown` (only when the PR has a check rollup) |
+| `github_review`   | GitHub review   | `review:approved`, `review:changes-requested`, `review:changes-pushed`, `review:commented`, `review:waiting` |
+| `github_pr`       | GitHub PR       | `pr:open`, `pr:draft`                                                                                     |
+| `github_comments` | GitHub comments | `comments:unresolved` (at least one unresolved review thread)                                            |
+
+Each option is `{ value, label, tone }`, with the label and tone matching the
+pane's CI and review vocabulary. Without a token only the `pr:*` values exist.
+A session with no open PR has no `row-column` entry, so it matches no facet.
 
 On restart: each successful full refresh is persisted to an on-disk cache
 (`${XDG_CACHE_HOME:-~/.cache}/agent-of-empires/github-plugin/snapshot.json`). On
