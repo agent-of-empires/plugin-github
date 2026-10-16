@@ -4,6 +4,16 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [2.2.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.1) - 2026-10-16
+
+
+
+### Bug Fixes
+
+- **ui:** Do not count the PR author's own comments as commented in [#113](https://github.com/agent-of-empires/plugin-github/pull/113) by [@Seluj78](https://github.com/Seluj78)
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.2.0...v2.2.1
 ## [2.2.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.0) - 2026-10-16
 
 
