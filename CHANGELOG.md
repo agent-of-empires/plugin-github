@@ -4,6 +4,12 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Features
+
+- **pane:** Show GitHub-native pull request stacks, layer navigation, and readiness through the selected PR.
+
 ## [2.0.4](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.0.4) - 2026-10-15
 
 

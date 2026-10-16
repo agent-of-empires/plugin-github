@@ -938,6 +938,96 @@ def test_merged_pr_verdict_replaces_the_conflict_signal():
     assert _callout([_repo(pulls=[pull])])["title"] == "Merged"
 
 
+def test_stack_shows_position_navigation_and_readiness_only_through_selection():
+    selected = _rich_pull(review="approved")
+    selected["number"] = 2
+    selected["stack"] = [
+        {
+            "number": 1,
+            "title": "Foundation",
+            "url": "https://github.com/o/r/pull/1",
+            "state": "open",
+            "mergeable_state": "clean",
+            "head": "foundation",
+        },
+        {
+            "number": 2,
+            "title": "Selected",
+            "url": "https://github.com/o/r/pull/2",
+            "state": "open",
+            "mergeable_state": "clean",
+            "head": "feature",
+        },
+        {
+            "number": 3,
+            "title": "Blocked above",
+            "url": "https://github.com/o/r/pull/3",
+            "state": "open",
+            "draft": True,
+            "mergeable_state": "draft",
+            "head": "top",
+        },
+    ]
+    blocks = _pane(
+        uistate.snapshot_ui_state_params(
+            _auth_snapshot(_session(repos=[_repo(pulls=[selected])])), selected={"s1": "o/r#2"}
+        )
+    )["payload"]["blocks"]
+    stack = next(block for block in blocks if block.get("title") == "Stack · PR 2 of 3")
+    rows = stack["children"]
+    assert rows[0]["value"] == "Mergeable through this PR"
+    assert [row["params"]["pr"] for row in rows[1:]] == ["o/r#1", "o/r#2", "o/r#3"]
+    assert rows[2]["selected"] is True
+    assert rows[3]["value"] == "draft"
+
+
+@pytest.mark.parametrize(
+    ("mergeable_state", "expected"),
+    [("blocked", "Blocked at #1"), (None, "Mergeability unknown")],
+)
+def test_stack_readiness_reports_blocked_and_unknown_dependencies(mergeable_state, expected):
+    pull = _rich_pull(review="approved")
+    pull["number"] = 2
+    pull["stack"] = [
+        {"number": 1, "state": "open", "mergeable_state": mergeable_state},
+        {"number": 2, "state": "open", "mergeable_state": "clean"},
+    ]
+    blocks = _pane(
+        uistate.snapshot_ui_state_params(
+            _auth_snapshot(_session(repos=[_repo(pulls=[pull])])), selected={"s1": "o/r#2"}
+        )
+    )["payload"]["blocks"]
+    stack = next(block for block in blocks if block.get("title") == "Stack · PR 2 of 2")
+    assert stack["children"][0]["value"] == expected
+
+
+def test_closed_unmerged_stack_member_is_not_presented_as_open():
+    closed = _rich_pull(state="CLOSED", merged=False)
+    closed["stack"] = [
+        {"number": 4, "state": "closed", "merged": False, "mergeable_state": "unknown"},
+        {"number": 5, "state": "open", "mergeable_state": "clean"},
+    ]
+    closed["number"] = 4
+    repo = _repo(pulls=[closed])
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[repo])))
+    row = _rows(_pane(params)["payload"]["blocks"])[0]
+    assert row["icon"] == "circle-x"
+    assert _badge(params)["payload"]["items"] == []
+    callout = next(block for block in _pane(params)["payload"]["blocks"] if block.get("kind") == "callout")
+    assert callout["title"] == "Closed"
+
+
+def test_fully_merged_stack_range_is_not_described_as_mergeable():
+    pull = _rich_pull(state="MERGED", merged=True)
+    pull["stack"] = [
+        {"number": 1, "state": "closed", "merged": True},
+        {"number": 2, "state": "closed", "merged": True},
+    ]
+    pull["number"] = 2
+    stack = uistate._stack_section(_repo(), pull)
+    assert stack["children"][0]["value"] == "Already merged"
+
+
 def test_column_is_empty_when_no_prs_to_clear_stale_state():
     assert _column_payload([_repo()]) == {}
 
