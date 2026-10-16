@@ -56,6 +56,14 @@ remote web dashboard without a popup-blocked async open. The badge href is the
 highest-attention PR and is present whenever an open PR exists, independent of the
 `show_status_text` setting.
 
+### Works with the Board plugin
+
+Compatible with the [Board](https://github.com/agent-of-empires/plugin-kanban)
+(kanban) plugin. Its Cards show the PR badges and status text as the sidebar
+does, and its Signal columns can match on the four filter facets below, e.g. a
+column holding every session where `GitHub CI is failing` or `GitHub review is
+changes requested`.
+
 At install/update the host runs the manifest's `[[runtime.build]]` steps in the
 plugin directory: create a venv under `.aoe-build/` and `pip install .` into it.
 The worker then launches from the plugin-relative
@@ -156,7 +164,7 @@ included. They are data, not display, so the session-row chip toggles do not
 affect them. The four global `filter-facet` entries point at that column
 (`column: "github_pr_status"`) and list the values a user can pick; a facet
 matches a session when its `filter_values` holds any selected value, so the
-dashboard sidebar and other plugins (e.g. a kanban board) can filter sessions by
+dashboard sidebar and other plugins (such as the Board) can filter sessions by
 "CI failing" without a host change:
 
 | Facet id          | Label           | Values                                                                                                   |
