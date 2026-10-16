@@ -2,11 +2,14 @@
 
 The host renders the slots; the worker only pushes typed display state. From one
 aggregate snapshot (see ``refresh.build_snapshot``) this produces one global
-sort option plus three pushes per session:
+sort option, four global filter facets, plus three pushes per session:
 
 - a global ``sort-key`` whose payload points at the ``github_pr_status``
   ``row-column`` and sorts by the same PR attention rank the row already uses.
   The host keeps the sorting client-side over the pushed scalar values.
+- global ``filter-facet`` entries (CI, review, PR, comments; see
+  ``FILTER_FACETS``) that also point at ``github_pr_status``, so the sidebar and
+  other plugins can filter sessions by one PR fact such as "CI failing".
 
 - a ``row-badge`` whose payload is ``{"items": [...]}`` -- a chip sequence per
   open PR (a PR affordance, then review-state, CI-rollup, and unresolved-comment
@@ -18,11 +21,13 @@ sort option plus three pushes per session:
   badge is an actionable indicator. Every chip's href opens that PR; the pane
   carries the full detail.
 - a ``row-column`` whose payload is ``{"text", "tone", "tooltip",
-  "sort_value"?}`` (or ``{}`` to clear) -- one deterministic words
-  summary of the session's most-urgent PR signal, so the list is scannable
+  "sort_value"?, "filter_values"?}`` (or ``{}`` to clear) -- one deterministic
+  words summary of the session's most-urgent PR signal, so the list is scannable
   without hovering the badge or opening the pane. Multi-repo workspaces collapse
   to their single highest-attention candidate; the pane keeps the per-repo
-  breakdown.
+  breakdown. ``filter_values`` is the union of every open PR's facet values
+  (``ci:failing``, ``review:approved``, ``pr:draft``, ``comments:unresolved``,
+  ...), independent of the chip toggles.
 - a ``pane`` (the in-session GitHub tool-window, opened in the right dock by
   default via ``default_location``) whose payload is a
   ``{"title", "blocks": [...], "footer"}`` block list. The pane is one-PR-focused:
@@ -101,6 +106,55 @@ _CHECK_VISUAL: dict[str, tuple[str, str, str]] = {
     "queued": ("clock", "neutral", "queued"),
     "unknown": ("circle-help", "neutral", "unknown"),
 }
+
+# Global `filter-facet` entries: (facet id, payload). Each facet matches a session
+# when the `github_pr_status` row-column's `filter_values` holds any selected
+# option value, so the values here and in `_pull_filter_values` share one
+# vocabulary. The CI and review options reuse the pane's labels and tones; the CI
+# value is the human label ("succeeded" reads as "ci:passing").
+FILTER_FACET_SLOT = "filter-facet"
+FILTER_FACETS: tuple[tuple[str, dict[str, Any]], ...] = (
+    (
+        "github_ci",
+        {
+            "label": "GitHub CI",
+            "column": ROW_COLUMN_SLOT[1],
+            "options": [
+                {"value": f"ci:{label}", "label": label, "tone": tone} for _icon, tone, label in _CHECK_VISUAL.values()
+            ],
+        },
+    ),
+    (
+        "github_review",
+        {
+            "label": "GitHub review",
+            "column": ROW_COLUMN_SLOT[1],
+            "options": [
+                {"value": f"review:{state}", "label": label, "tone": tone}
+                for state, (_icon, tone, label) in _REVIEW_VISUAL.items()
+            ],
+        },
+    ),
+    (
+        "github_pr",
+        {
+            "label": "GitHub PR",
+            "column": ROW_COLUMN_SLOT[1],
+            "options": [
+                {"value": "pr:open", "label": "open", "tone": "success"},
+                {"value": "pr:draft", "label": "draft", "tone": "warn"},
+            ],
+        },
+    ),
+    (
+        "github_comments",
+        {
+            "label": "GitHub comments",
+            "column": ROW_COLUMN_SLOT[1],
+            "options": [{"value": "comments:unresolved", "label": "unresolved", "tone": "warn"}],
+        },
+    ),
+)
 
 # PR attention kind -> (rank, lucide icon, host Tone, compact label). Lower rank
 # = more attention, so it wins the badge icon and the row-column summary. The
@@ -314,13 +368,15 @@ def _status_candidate(
 
 def _status_column(repos: list[dict[str, Any]], chips_on: frozenset[str], *, show_text: bool = True) -> dict[str, Any]:
     """A single per-session summary cell: the highest-attention PR (or repo error)
-    across the workspace, as ``{text, tone, tooltip, sort_value}``. Returns ``{}``
+    across the workspace, as ``{text, tone, tooltip, sort_value, filter_values?}``
+    (``filter_values`` is every open PR's facet values, see ``_filter_values``).
+    Returns ``{}``
     when there is nothing worth showing (no open PR, no error), which clears any
     stale row state on the next push. A disabled category (``chips_on``) is skipped
     here too, so a hidden chip never resurfaces as the column text. When
-    ``show_text`` is false, keep an empty text field plus the sort scalar so the
-    host validates the row-column payload and the sidebar sort still works without
-    rendering words.
+    ``show_text`` is false, keep an empty text field plus the sort scalar and the
+    facet values so the host validates the row-column payload and the sidebar sort
+    and filters still work without rendering words.
 
     ponytail: one winning candidate, not per-repo detail. A multi-repo workspace
     collapses to its single most-urgent signal here; the pane keeps the full
@@ -329,9 +385,40 @@ def _status_column(repos: list[dict[str, Any]], chips_on: frozenset[str], *, sho
     candidate = _status_candidate(repos, chips_on)
     if candidate is None:
         return {}
-    if show_text:
-        return candidate[1]
-    return {"text": "", "sort_value": candidate[0]}
+    cell = dict(candidate[1]) if show_text else {"text": "", "sort_value": candidate[0]}
+    filter_values = _filter_values(repos)
+    if filter_values:
+        cell["filter_values"] = filter_values
+    return cell
+
+
+def _pull_filter_values(pull: dict[str, Any]) -> set[str]:
+    """The facet values one non-merged PR contributes (see ``FILTER_FACETS``).
+    These are facts about the PR, not display, so they ignore the chip toggles
+    and the draft chip-suppression: a draft still reports whatever CI or review
+    state its data carries."""
+    values = {"pr:draft" if pull.get("draft") else "pr:open"}
+    checks = pull.get("checks")
+    cstate = checks.get("state") if isinstance(checks, dict) else None
+    if isinstance(cstate, str):
+        values.add(f"ci:{_CHECK_VISUAL.get(cstate, _CHECK_VISUAL['unknown'])[2]}")
+    review = pull.get("review_state")
+    if isinstance(review, str) and review in _REVIEW_VISUAL:
+        values.add(f"review:{review}")
+    if _unresolved_count(pull):
+        values.add("comments:unresolved")
+    return values
+
+
+def _filter_values(repos: list[dict[str, Any]]) -> list[str]:
+    """Sorted union of every open PR's facet values across the workspace, so a
+    facet matches a session when any of its PRs has that fact (unlike the column
+    text, which collapses to the single most-urgent PR)."""
+    values: set[str] = set()
+    for repo in repos:
+        for pull in _open_pulls(repo):
+            values |= _pull_filter_values(pull)
+    return sorted(values)
 
 
 def _status_href(repos: list[dict[str, Any]], chips_on: frozenset[str]) -> str | None:
@@ -1125,7 +1212,8 @@ def snapshot_ui_state_params(
 ) -> list[dict[str, Any]]:
     """``ui.state.set`` params for a refresh snapshot: per session, a ``row-badge``
     (a chip sequence per PR), a ``row-column`` (the status summary), and a ``pane``
-    (the GitHub tool-window), plus one global ``sort-key``. ``chips_on`` is the set
+    (the GitHub tool-window), plus one global ``sort-key`` and the global
+    ``filter-facet`` entries. ``chips_on`` is the set
     of enabled chip categories (``review``/``ci``/``comments``); a disabled one is
     hidden from both the badge and the column. ``show_column`` False hides the
     words while preserving the sort scalar. Pure and total: a missing/partial
@@ -1138,7 +1226,8 @@ def snapshot_ui_state_params(
     auth_present = bool((snapshot.get("auth") or {}).get("present", True))
     rate_limit = snapshot.get("rate_limit")
     params: list[dict[str, Any]] = [
-        {"slot": SORT_KEY_SLOT[0], "id": SORT_KEY_SLOT[1], "payload": dict(SORT_KEY_PAYLOAD)}
+        {"slot": SORT_KEY_SLOT[0], "id": SORT_KEY_SLOT[1], "payload": dict(SORT_KEY_PAYLOAD)},
+        *({"slot": FILTER_FACET_SLOT, "id": fid, "payload": dict(payload)} for fid, payload in FILTER_FACETS),
     ]
     for session in sessions:
         sid = session.get("session_id")
