@@ -28,7 +28,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.2.0
+        uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "latest"
 
@@ -116,7 +116,7 @@ jobs:
 
       - name: Install uv
         if: steps.gate.outputs.skip == 'false'
-        uses: astral-sh/setup-uv@v8.2.0
+        uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "latest"
 
