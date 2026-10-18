@@ -1460,3 +1460,67 @@ def test_unusable_workspace_metadata_preserves_checkout_discovery(tmp_path, meta
     )
     repo = snap["sessions"][0]["repos"][0]
     assert (repo["repo"], repo["branch"], repo["pulls"][0]["number"]) == ("o/r", "feature", 12)
+
+
+@pytest.mark.parametrize("stale_kind", ["missing", "plain_directory", "repo_subdirectory"])
+def test_stale_workspace_paths_fall_back_to_checkout_discovery(tmp_path, stale_kind):
+    workspace = tmp_path / "workspace"
+    _make_repo(workspace, branch="workspace-branch")
+    stale = tmp_path / "stale"
+    if stale_kind == "plain_directory":
+        stale.mkdir()
+    elif stale_kind == "repo_subdirectory":
+        stale = workspace / "nested"
+        stale.mkdir()
+    snapshot = refresh.build_snapshot(
+        [
+            {
+                "id": "s1",
+                "project_path": str(workspace),
+                "workspace_repos": [{"source_path": str(stale), "branch": "stale-branch"}],
+            }
+        ],
+        env=_NoToken(),
+        transport=_transport([_pull()]),
+    )
+    repos = snapshot["sessions"][0]["repos"]
+    assert [(r["path"], r["repo"], r["branch"]) for r in repos] == [
+        (str(workspace), "o/r", "workspace-branch"),
+    ]
+    assert repos[0]["pulls"][0]["number"] == 12
+
+
+def test_mixed_workspace_paths_keep_valid_worktrees_authoritative(tmp_path):
+    workspace = tmp_path / "workspace"
+    _make_repo(workspace, remote="https://github.com/o/unattached.git")
+    source = tmp_path / "source"
+    _make_repo(source, remote="https://github.com/o/attached.git", branch="source-branch")
+    worktree = tmp_path / "worktree"
+    _git(source, "worktree", "add", "-b", "worktree-branch", str(worktree))
+    alias = tmp_path / "alias"
+    alias.symlink_to(worktree, target_is_directory=True)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    requests = []
+    snapshot = refresh.build_snapshot(
+        [
+            {
+                "id": "s1",
+                "project_path": str(workspace),
+                "workspace_repos": [
+                    {"source_path": str(path), "branch": "session-branch"}
+                    for path in (tmp_path / "missing", plain, worktree, alias)
+                ],
+            }
+        ],
+        env=_NoToken(),
+        transport=_transport([_pull()], capture=requests),
+    )
+    repos = snapshot["sessions"][0]["repos"]
+    assert [(r["path"], r["repo"], r["branch"]) for r in repos] == [
+        (str(worktree), "o/attached", "session-branch"),
+    ]
+    assert repos[0]["pulls"][0]["number"] == 12
+    assert [(r.url.path, r.url.params["head"]) for r in requests] == [
+        ("/repos/o/attached/pulls", "o:session-branch"),
+    ]

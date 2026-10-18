@@ -306,6 +306,9 @@ def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> l
             if not isinstance(repo, dict) or not isinstance(repo.get("source_path"), str) or not repo["source_path"]:
                 continue
             checkout = repo["source_path"]
+            top = _git(checkout, "rev-parse", "--show-toplevel")
+            if not top or os.path.realpath(top) != os.path.realpath(checkout):
+                continue
             branch = repo.get("branch")
             key = (os.path.realpath(checkout), branch if isinstance(branch, str) else None)
             if key not in seen:

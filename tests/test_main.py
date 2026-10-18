@@ -535,15 +535,17 @@ def test_select_pr_survives_a_drifted_cached_snapshot(monkeypatch):
 
 def test_fast_poll_refreshes_changed_workspace_repos_without_new_session(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    source = tmp_path / "source"
+    subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
     rt = main.Runtime(send=lambda _m: None)
     rt.call_host = lambda *_a, **_kw: None
     session = {"id": "s1", "project_path": "/missing", "workspace_repos": []}
     rt.run_refresh(sessions=[session])
-    session["workspace_repos"] = [{"source_path": "/source", "branch": "feature"}]
+    session["workspace_repos"] = [{"source_path": str(source), "branch": "feature"}]
     rt.list_sessions = lambda *_a, **_kw: [session]
     rt._next_poll = 0
     rt._service_ticks()
-    assert rt._last_snapshot["sessions"][0]["repos"][0]["path"] == "/source"
+    assert rt._last_snapshot["sessions"][0]["repos"][0]["path"] == str(source)
 
     session["workspace_repos"][0]["branch"] = "next"
     refreshed = []
