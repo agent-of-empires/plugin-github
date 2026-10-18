@@ -255,7 +255,7 @@ def _is_submodule_checkout(path: str) -> bool:
 def discover_checkouts(workspace: str, *, ignore_submodules: bool = True) -> list[str]:
     """Git checkouts in a session workspace: root plus immediate child repos.
 
-    This remains the compatibility path when the host does not supply
+    This remains the compatibility path when the host does not supply usable
     ``workspace_repos`` metadata.
     """
     candidates = [workspace]
@@ -297,7 +297,7 @@ def _identify(path: str, branch_override: str | None = None) -> tuple[str | None
 
 
 def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> list[tuple[str, str | None]]:
-    """Return checkout/branch pairs, preferring non-empty host metadata."""
+    """Return checkout/branch pairs, preferring usable host metadata."""
     workspace_repos = session.get("workspace_repos")
     if isinstance(workspace_repos, list) and workspace_repos:
         checkouts: list[tuple[str, str | None]] = []
@@ -311,7 +311,8 @@ def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> l
             if key not in seen:
                 seen.add(key)
                 checkouts.append((checkout, key[1]))
-        return checkouts
+        if checkouts:
+            return checkouts
     path = session.get("project_path")
     if not (isinstance(path, str) and path):
         return []
@@ -1056,8 +1057,8 @@ def build_snapshot(
 ) -> dict[str, Any]:
     """Assemble a snapshot from active sessions and their repository metadata.
 
-    Host ``workspace_repos`` metadata is authoritative when non-empty; older
-    hosts fall back to shallow checkout discovery under ``project_path``.
+    Usable host ``workspace_repos`` metadata is authoritative; otherwise fall
+    back to shallow checkout discovery under ``project_path``.
     """
 
     def _discover(session: dict[str, Any]) -> list[tuple[str, str | None]]:

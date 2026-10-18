@@ -115,7 +115,7 @@ session-less `github.refresh` cover every session and prune vanished ones:
 2. Prefer the host's explicit `workspace_repos` list: each entry supplies a
    source checkout path and the branch attached to this session. This branch
    is authoritative even when the source checkout's current branch differs.
-   Older hosts without repository metadata use shallow discovery under
+   Hosts without usable repository metadata use shallow discovery under
    `project_path`: the workspace root and immediate child checkouts. Immediate
    child submodules are skipped by default; turn off `ignore_submodules` to
    include them.

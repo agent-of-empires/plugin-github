@@ -1450,8 +1450,8 @@ def test_workspace_metadata_is_authoritative_and_isolates_repo_errors(tmp_path):
     assert repos[2]["error"] is None
 
 
-@pytest.mark.parametrize("metadata", [None, []])
-def test_empty_workspace_metadata_preserves_checkout_discovery(tmp_path, metadata):
+@pytest.mark.parametrize("metadata", [None, [], [{}], [{"source_path": ""}], [None, {"source_path": 42}]])
+def test_unusable_workspace_metadata_preserves_checkout_discovery(tmp_path, metadata):
     _make_repo(tmp_path / "repo")
     snap = refresh.build_snapshot(
         [{"id": "s1", "project_path": str(tmp_path / "repo"), "workspace_repos": metadata}],
