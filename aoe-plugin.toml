@@ -12,17 +12,11 @@
 id = "agent-of-empires.github"
 name = "GitHub"
 version = "2.2.1"
-# Manifest schema / host API version. api_version 5 added the [[screenshots]]
-# list (declared below); 6 lets a command declare a client-executed `action`
-# (the `open_pr` command below uses `open-ui-link`); 7 adds the `icon` /
-# `icon_asset` identity fields (declared below); 12 adds the pane block kinds
-# this plugin's pane is now built from (`callout`, `bar`, `columns`), clickable
-# `row`s carrying `params` (the PR selector), header summaries and scrollable
-# bodies on `section`, `disabled` / `variant` / `href` actions, and the
-# pane-level `footer`. A host older than 12 rejects this manifest outright,
-# which is the intent: it would render the pane as a bare list of rows with no
-# verdict, no diff, and no way to switch PRs.
-api_version = 12
+# Manifest schema / host API version. api_version 5 added screenshots; 6 adds
+# client-executed command actions; 7 adds identity icons; 12 adds the rich pane
+# blocks and actions; 14 adds host-managed suggestions.
+api_version = 14
+suggestions = true
 # Host-app compatibility range (different axis from api_version, which is the
 # manifest-schema version). The host refuses install/update outside this range
 # and skips loading if a later aoe upgrade moves out of it. Requires api_version
@@ -137,6 +131,54 @@ min = 0
 max = 86400
 advanced = true
 
+[[settings]]
+key = "suggestion_criteria"
+label = "GitHub suggestion criteria"
+description = "Comma-separated review_requested and changes_requested criteria."
+type = "string"
+default = "review_requested,changes_requested"
+
+[[settings]]
+key = "suggestion_repositories"
+label = "GitHub suggestion repositories"
+description = "Optional comma-separated owner/repo allowlist; empty includes all repositories."
+type = "string"
+default = ""
+advanced = true
+
+[[settings]]
+key = "suggestion_organizations"
+label = "GitHub suggestion organizations"
+description = "Optional comma-separated organization allowlist."
+type = "string"
+default = ""
+advanced = true
+
+[[settings]]
+key = "suggestion_projects"
+label = "GitHub suggestion project mappings"
+description = "Explicit owner/repo=registered project name or canonical local path, one mapping per line."
+type = "string"
+default = ""
+advanced = true
+
+[[settings]]
+key = "suggestion_priority"
+label = "GitHub suggestion ranking"
+description = "Comma-separated criterion priority, using review_requested and changes_requested."
+type = "string"
+default = "changes_requested,review_requested"
+advanced = true
+
+[[settings]]
+key = "suggestion_limit"
+label = "Maximum GitHub suggestions"
+description = "Maximum suggestions retained in the provider snapshot."
+type = "integer"
+default = 100
+min = 1
+max = 500
+advanced = true
 # Session-row chip toggles (#36). Each defaults on; turning one off hides that
 # chip from every session row (and drops it from the row's status summary), while
 # the GitHub pane still shows the full detail.

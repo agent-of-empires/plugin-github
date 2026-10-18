@@ -3,6 +3,12 @@
 All notable changes to the Agent of Empires GitHub plugin will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
+## Unreleased
+
+### Features
+
+- **suggestions:** Publish session-independent GitHub review-request suggestions with scoped discovery, explicit project mapping, and stale-snapshot error handling.
+
 
 ## [2.2.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.1) - 2026-10-16
 

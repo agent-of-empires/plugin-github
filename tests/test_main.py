@@ -24,12 +24,34 @@ def _run(*lines):
         timeout=15,
         check=False,
         cwd="/",
-        env={**os.environ, "AOE_GITHUB_UI_REFRESH_SECS": "0"},
+        env={
+            **{key: value for key, value in os.environ.items() if key not in {"GITHUB_TOKEN", "GH_TOKEN"}},
+            "PATH": "/usr/bin:/bin",
+            "AOE_GITHUB_UI_REFRESH_SECS": "0",
+        },
     )
     msgs = [json.loads(out) for out in proc.stdout.splitlines() if out.strip()]
     responses = [m for m in msgs if "result" in m or "error" in m]
     pushes = [m for m in msgs if m.get("method") == "ui.state.set"]
     return responses, pushes
+
+
+def _run_all(*lines):
+    proc = subprocess.run(
+        [sys.executable, "-m", "aoe_github_plugin.main"],
+        input="".join(line + "\n" for line in lines),
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+        cwd="/",
+        env={
+            **{key: value for key, value in os.environ.items() if key not in {"GITHUB_TOKEN", "GH_TOKEN"}},
+            "PATH": "/usr/bin:/bin",
+            "AOE_GITHUB_UI_REFRESH_SECS": "0",
+        },
+    )
+    return [json.loads(out) for out in proc.stdout.splitlines() if out.strip()]
 
 
 def test_unknown_method_returns_method_not_found():
@@ -531,3 +553,10 @@ def test_select_pr_survives_a_drifted_cached_snapshot(monkeypatch):
     # and crucially no exception escaped to the caller.
     assert rt._selected_pr == {"s1": "o/r#1"}
     assert not [m for m in sent if m["method"] == "ui.state.set"]
+
+
+def test_suggestions_refresh_runs_over_worker_json_rpc_without_sessions():
+    messages = _run_all(json.dumps({"jsonrpc": "2.0", "id": 77, "method": "suggestions.refresh"}))
+    assert any(message.get("result") == {"accepted": True} for message in messages)
+    assert any(message.get("method") == "suggestions.error" for message in messages)
+    assert not any(message.get("method") == "suggestions.set" for message in messages)

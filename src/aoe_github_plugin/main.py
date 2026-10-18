@@ -45,8 +45,21 @@ from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
 from aoe_github_plugin import uistate
 from aoe_github_plugin import handlers
+from aoe_github_plugin import suggestions
 from aoe_github_plugin.utils.rpc import error_response
 from aoe_github_plugin.utils.rpc import result_response
+
+SUGGESTIONS_SET = "suggestions.set"
+SUGGESTIONS_ERROR = "suggestions.error"
+SUGGESTIONS_REFRESH = "suggestions.refresh"
+SUGGESTION_SETTING_KEYS = (
+    "suggestion_criteria",
+    "suggestion_repositories",
+    "suggestion_organizations",
+    "suggestion_projects",
+    "suggestion_priority",
+    "suggestion_limit",
+)
 
 Sink = Callable[[dict[str, Any]], None]
 
@@ -220,6 +233,8 @@ class Runtime:
         self._ignored_commenters = graphql.parse_ignored_commenters(DEFAULT_IGNORED_COMMENTERS)
         self._next_network: float | None = None
         self._next_poll: float | None = None
+        self._suggestions_refresh_due = False
+        self._suggestions_last_good: list[dict[str, Any]] = []
 
     def _read_stdin(self) -> None:
         """Reader thread: drain stdin into the queue, then post ``_EOF``."""
@@ -240,6 +255,8 @@ class Runtime:
         Returns the result, ``None`` on an error reply, on EOF (the stream
         closed -- the runtime is then stopping), or on ``timeout`` (a wedged
         host must never freeze the worker; the caller falls back)."""
+        if self.stopped:
+            return None
         req_id = next(_outbound_ids)
         self.send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
         deadline = time.monotonic() + timeout
@@ -268,22 +285,24 @@ class Runtime:
         method = msg.get("method", "")
         params = msg.get("params") or {}
         msg_id = msg.get("id")
-        try:
-            result = dispatch(method, params)
-        except Exception as exc:  # noqa: BLE001 - any failure becomes a JSON-RPC error
-            if isinstance(msg_id, int):
-                self.send(error_response(msg_id, exc))
-            return
+        if method == SUGGESTIONS_REFRESH:
+            result = {"accepted": True}
+        else:
+            try:
+                result = dispatch(method, params)
+            except Exception as exc:  # noqa: BLE001 - any failure becomes a JSON-RPC error
+                if isinstance(msg_id, int):
+                    self.send(error_response(msg_id, exc))
+                return
         if isinstance(msg_id, int):
             self.send(result_response(msg_id, result))
-        if method == "github.refresh":
-            # A clicked pane is one session; refresh just that one. A string id
-            # scopes it; anything else (absent/null/non-string) falls back to a
-            # full refresh, so an older host that forwards no session id behaves
-            # as before.
+        if method == SUGGESTIONS_REFRESH:
+            self._suggestions_refresh_due = True
+        elif method == "github.refresh":
             sid = params.get("session_id")
             self._refresh_target = sid if isinstance(sid, str) else None
             self.refresh_due = True
+            self._suggestions_refresh_due = True
         elif method == SELECT_PR_METHOD:
             self._select_pr(params)
 
@@ -537,9 +556,49 @@ class Runtime:
         if self._next_network is not None:
             self._next_network = time.monotonic() + self._interval + _network_jitter(self._interval)
 
+    def _refresh_suggestions(self) -> None:
+        """Fetch and publish a complete review snapshot; retain last-good on errors."""
+        try:
+            settings = {}
+            for key in SUGGESTION_SETTING_KEYS:
+                result = self.call_host(CONFIG_GET, {"key": key})
+                settings[key] = result.get("value") if isinstance(result, dict) else None
+            items = suggestions.fetch_suggestions(
+                criteria_raw=settings.get("suggestion_criteria") or "review_requested,changes_requested",
+                repos_raw=settings.get("suggestion_repositories"),
+                orgs_raw=settings.get("suggestion_organizations"),
+                mapping_raw=settings.get("suggestion_projects"),
+                priority_raw=settings.get("suggestion_priority"),
+                limit_raw=settings.get("suggestion_limit"),
+            )
+        except Exception as exc:  # noqa: BLE001 - report failure, keep last-good snapshot
+            self.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": next(_outbound_ids),
+                    "method": SUGGESTIONS_ERROR,
+                    "params": {"message": str(exc)},
+                }
+            )
+            return
+        self._suggestions_last_good = items
+        self.send(
+            {
+                "jsonrpc": "2.0",
+                "id": next(_outbound_ids),
+                "method": SUGGESTIONS_SET,
+                "params": {"items": items},
+            }
+        )
+
+    def _service_suggestions(self) -> None:
+        if self._suggestions_refresh_due:
+            self._suggestions_refresh_due = False
+            self._refresh_suggestions()
+
     def _service_ticks(self) -> None:
-        """Run whichever refresh is due: an inbound github.refresh, a fast local
-        tick that noticed a session change, or the slower network tick."""
+        """Run pending worker refreshes on the main RPC-owner thread."""
+        self._service_suggestions()
         now = time.monotonic()
         if self.refresh_due:
             self.refresh_due = False
@@ -555,6 +614,7 @@ class Runtime:
             self._next_poll = now + SESSION_POLL_SECS
         if self._next_network is not None and now >= self._next_network:
             self._refresh_and_reset()
+            self._refresh_suggestions()
 
     def run(self) -> None:
         threading.Thread(target=self._read_stdin, daemon=True).start()
@@ -574,6 +634,9 @@ class Runtime:
         else:
             self.run_refresh()
         self._seen_ids = set(self.pushed_session_ids)
+        # Suggestions are independent of the session list and run at startup,
+        # including on a host with no active AoE sessions.
+        self._refresh_suggestions()
         self._interval = self.resolve_interval()
         # interval 0 disables all background polling (startup + on github.refresh
         # still push); otherwise a fast local tick notices session changes and a

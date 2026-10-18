@@ -48,6 +48,28 @@ anything is written.
 | UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), five `filter-facet`s (`github_ci`, `github_review`, `github_pr`, `github_comments`, `github_conflicts`), and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
+### GitHub review suggestions
+
+On API 14 hosts this plugin also publishes host-managed suggestions, independent
+of AoE sessions. It queries GitHub for open PRs requesting your review and PRs
+with current changes-requested reviews; startup, periodic polling, and the
+`suggestions.refresh` host notification publish complete snapshots. Fetch
+failures report `suggestions.error` and do not replace the last good snapshot.
+
+Configure `suggestion_criteria` (comma-separated `review_requested` and
+`changes_requested`), optional `suggestion_repositories` and
+`suggestion_organizations` scopes, and `suggestion_projects` (`owner/repo=project`
+per line). Project values are explicit registered project names or canonical
+local paths; unmapped repositories stay unmapped.
+`suggestion_priority` sets criterion ordering (defaulting to changes requested
+first), and `suggestion_limit` caps the published snapshot (1-500).
+
+Each suggestion links to its canonical GitHub PR URL and includes a short PR
+description preview. That remote text is source material, not trusted
+instructions. The provider supplies a proposed task prompt but never creates
+sessions or grants unattended access; the host owns the reviewed start flow and
+its opt-in automation policy.
+
 `open_pr` is the command-palette / shortcut way to open the active session's PR
 (requires a host on api_version 6+). It is a client action, not a worker call:
 the host opens the PR `href` the worker already publishes on the `github_pr_badge`
