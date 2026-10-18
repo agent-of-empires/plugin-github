@@ -67,6 +67,27 @@ def test_provider_uses_exact_mapping_and_builds_stable_task_not_source_instructi
     assert "project" not in unresolved
 
 
+def test_overlapping_search_results_keep_configured_higher_priority_criterion():
+    def discover(priority):
+        client = FakeClient(
+            [
+                {"data": {"search": {"nodes": [_pr()], "pageInfo": {"hasNextPage": False}}}},
+                {"data": {"search": {"nodes": [_pr()], "pageInfo": {"hasNextPage": False}}}},
+            ]
+        )
+        results = suggestions.discover_review_requests(
+            client,
+            criteria={"review_requested", "changes_requested"},
+            repos=set(),
+            orgs=set(),
+            priority=priority,
+        )
+        return results[0]["_matched_criterion"]
+
+    assert discover(("changes_requested", "review_requested")) == "changes_requested"
+    assert discover(("review_requested", "changes_requested")) == "review_requested"
+
+
 def test_failed_pagination_never_returns_partial_snapshot():
     client = FakeClient(
         [

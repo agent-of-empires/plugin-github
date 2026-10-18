@@ -72,15 +72,27 @@ def _review_state(pr: dict[str, Any]) -> str:
     return "review_requested"
 
 
-def discover_review_requests(  # noqa: C901
-    client: GitHubClient, *, criteria: set[str], repos: set[str], orgs: set[str]
+def discover_review_requests(  # noqa: C901, PLR0912
+    client: GitHubClient,
+    *,
+    criteria: set[str],
+    repos: set[str],
+    orgs: set[str],
+    priority: tuple[str, ...] = ("changes_requested", "review_requested"),
 ) -> list[dict[str, Any]]:
     """Return only a fully paginated snapshot; raise on malformed/partial results."""
     if not criteria.intersection({"review_requested", "changes_requested"}):
         return []
     all_items: dict[str, dict[str, Any]] = {}
     scope = [f"repo:{repo}" for repo in sorted(repos)] + [f"org:{org}" for org in sorted(orgs)]
-    for criterion in sorted(criteria.intersection({"review_requested", "changes_requested"})):
+    priority = priority + tuple(
+        criterion for criterion in ("changes_requested", "review_requested") if criterion not in priority
+    )
+    criterion_order = sorted(
+        criteria.intersection({"review_requested", "changes_requested"}),
+        key=priority.index,
+    )
+    for criterion in criterion_order:
         clause = "review-requested:@me" if criterion == "review_requested" else "review:changes_requested"
         query = "is:open " + clause + (" " + " ".join(scope) if scope else "")
         cursor: str | None = None
@@ -94,8 +106,12 @@ def discover_review_requests(  # noqa: C901
             for node in search["nodes"]:
                 if isinstance(node, dict) and node.get("url"):
                     prior = all_items.get(node["url"])
-                    if prior is None or criterion == "review_requested":
+                    if prior is None:
                         all_items[node["url"]] = {**node, "_matched_criterion": criterion}
+                    else:
+                        previous = prior.get("_matched_criterion")
+                        if previous not in priority or priority.index(criterion) < priority.index(previous):
+                            all_items[node["url"]] = {**node, "_matched_criterion": criterion}
             info = search.get("pageInfo") or {}
             if not info.get("hasNextPage"):
                 break
@@ -193,7 +209,7 @@ def fetch_suggestions(  # noqa: PLR0913
     except GitHubAuthError as exc:
         raise RuntimeError(str(exc)) from exc
     with GitHubClient(token) as client:
-        pulls = discover_review_requests(client, criteria=criteria, repos=repos, orgs=orgs)
+        pulls = discover_review_requests(client, criteria=criteria, repos=repos, orgs=orgs, priority=priority)
     return build_suggestions(
         pulls,
         criteria=criteria,
