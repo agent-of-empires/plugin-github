@@ -209,6 +209,7 @@ class Runtime:
         # Loop state, initialized in run(): the session-id set seen by the fast
         # tick, the resolved poll interval, and the next-fire monotonic deadlines.
         self._seen_ids: set[str] = set()
+        self._seen_topology: dict[str, tuple[Any, ...]] = {}
         self._interval = 0
         # Enabled session-row chip categories; resolved from settings in run(),
         # all-on until then so the startup push is never accidentally empty.
@@ -442,6 +443,7 @@ class Runtime:
             )
             current_ids = self._push_snapshot(snapshot)
             if only_session is None:
+                self._seen_topology = self._session_topology(sessions)
                 # Full refresh: the snapshot is the whole truth, so a session
                 # that dropped out has vanished and its slots are pruned.
                 for sid in self.pushed_session_ids - current_ids:
@@ -455,13 +457,8 @@ class Runtime:
                             }
                         )
                 self.pushed_session_ids = current_ids
-                # Persist the full snapshot so the next worker start can repaint
-                # this data instantly instead of blocking on a cold refresh.
                 refresh.save_snapshot(snapshot)
             else:
-                # Scoped refresh: only the target was fetched, so an absence
-                # here means "not refreshed", not "vanished". Add what we pushed
-                # and leave every other session's tracking and slots intact.
                 self.pushed_session_ids |= current_ids
             # A forced refresh that hit a rate limit carries a one-shot notice
             # (build_snapshot only adds it on force=True). Tell the user why the
@@ -476,6 +473,23 @@ class Runtime:
                         "params": _rate_limit_notify_params(notice),
                     }
                 )
+
+    @staticmethod
+    def _session_topology(sessions: list[dict[str, Any]]) -> dict[str, tuple[Any, ...]]:
+        """Fingerprint attached repositories so same-ID topology changes refresh."""
+        topology = {}
+        for session in sessions:
+            sid = session.get("id")
+            if not isinstance(sid, str):
+                continue
+            repos = session.get("workspace_repos")
+            attached = (
+                tuple((repo.get("source_path"), repo.get("branch")) for repo in repos if isinstance(repo, dict))
+                if isinstance(repos, list)
+                else ()
+            )
+            topology[sid] = (session.get("project_path"), attached)
+        return topology
 
     def resolve_interval(self) -> int:
         """Poll period in seconds. Precedence: the host-persisted
@@ -549,8 +563,8 @@ class Runtime:
         if self._next_poll is not None and now >= self._next_poll:
             sessions = self.list_sessions(SESSION_LIST_TIMEOUT)
             if sessions is not None:
-                ids = {s["id"] for s in sessions if isinstance(s, dict) and isinstance(s.get("id"), str)}
-                if ids != self._seen_ids:
+                topology = self._session_topology(sessions)
+                if topology != self._seen_topology:
                     self._refresh_and_reset(sessions)
             self._next_poll = now + SESSION_POLL_SECS
         if self._next_network is not None and now >= self._next_network:

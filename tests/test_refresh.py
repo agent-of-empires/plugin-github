@@ -1389,3 +1389,74 @@ def test_parallel_discovery_output_matches_serial_shape(tmp_path):
         ("a", "o/a", "b1"),
         ("b", "o/b", "b2"),
     ]
+
+
+def test_workspace_metadata_uses_session_branches_not_source_head(tmp_path):
+    source = tmp_path / "source"
+    _make_repo(source, branch="unrelated")
+    sessions = [
+        {
+            "id": branch,
+            "project_path": str(tmp_path / "unavailable-workspace"),
+            "workspace_repos": [{"source_path": str(source), "branch": branch}],
+        }
+        for branch in ("session-a", "session-b")
+    ]
+    requests = []
+
+    def handler(request):
+        branch = request.url.params["head"].split(":", 1)[1]
+        requests.append(branch)
+        return httpx.Response(200, json=[_pull(number=1 if branch == "session-a" else 2)])
+
+    snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=httpx.MockTransport(handler))
+    assert sorted(requests) == ["session-a", "session-b"]
+    assert [
+        (s["repos"][0]["repo"], s["repos"][0]["branch"], s["repos"][0]["pulls"][0]["number"]) for s in snap["sessions"]
+    ] == [("o/r", "session-a", 1), ("o/r", "session-b", 2)]
+
+
+def test_workspace_metadata_is_authoritative_and_isolates_repo_errors(tmp_path):
+    ws = tmp_path / "workspace"
+    _make_repo(ws / "unattached", remote="https://github.com/o/unattached.git")
+    source = tmp_path / "source"
+    other = tmp_path / "other"
+    local = tmp_path / "local"
+    _make_repo(source, remote="https://github.com/o/first.git")
+    _make_repo(other, remote="https://github.com/o/second.git")
+    _make_repo(local, remote="https://example.org/o/local.git")
+    alias = tmp_path / "alias"
+    alias.symlink_to(source, target_is_directory=True)
+    session = {
+        "id": "s1",
+        "project_path": str(ws),
+        "workspace_repos": [{"source_path": str(path), "branch": "session"} for path in (source, alias, other, local)],
+    }
+
+    def handler(request):
+        if "/second/" in request.url.path:
+            return httpx.Response(404, json={"message": "Not Found"})
+        assert "/first/" in request.url.path
+        return httpx.Response(200, json=[_pull()])
+
+    snap = refresh.build_snapshot([session], env=_NoToken(), transport=httpx.MockTransport(handler))
+    repos = snap["sessions"][0]["repos"]
+    assert [r["repo"] for r in repos] == ["o/first", "o/second", None]
+    assert repos[0]["pulls"][0]["number"] == 12
+    assert repos[0]["error"] is None
+    assert repos[1]["pulls"] == []
+    assert repos[1]["error"] is not None
+    assert repos[2]["pulls"] == []
+    assert repos[2]["error"] is None
+
+
+@pytest.mark.parametrize("metadata", [None, []])
+def test_empty_workspace_metadata_preserves_checkout_discovery(tmp_path, metadata):
+    _make_repo(tmp_path / "repo")
+    snap = refresh.build_snapshot(
+        [{"id": "s1", "project_path": str(tmp_path / "repo"), "workspace_repos": metadata}],
+        env=_NoToken(),
+        transport=_transport([_pull()]),
+    )
+    repo = snap["sessions"][0]["repos"][0]
+    assert (repo["repo"], repo["branch"], repo["pulls"][0]["number"]) == ("o/r", "feature", 12)

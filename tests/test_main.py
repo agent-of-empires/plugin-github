@@ -531,3 +531,32 @@ def test_select_pr_survives_a_drifted_cached_snapshot(monkeypatch):
     # and crucially no exception escaped to the caller.
     assert rt._selected_pr == {"s1": "o/r#1"}
     assert not [m for m in sent if m["method"] == "ui.state.set"]
+
+
+def test_fast_poll_refreshes_changed_workspace_repos_without_new_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: None
+    session = {"id": "s1", "project_path": "/missing", "workspace_repos": []}
+    rt.run_refresh(sessions=[session])
+    session["workspace_repos"] = [{"source_path": "/source", "branch": "feature"}]
+    rt.list_sessions = lambda *_a, **_kw: [session]
+    rt._next_poll = 0
+    rt._service_ticks()
+    assert rt._last_snapshot["sessions"][0]["repos"][0]["path"] == "/source"
+
+    session["workspace_repos"][0]["branch"] = "next"
+    refreshed = []
+    original = rt.run_refresh
+
+    def record_refresh(*args, **kwargs):
+        refreshed.append(True)
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(rt, "run_refresh", record_refresh)
+    rt._next_poll = 0
+    rt._service_ticks()
+    assert refreshed == [True]
+    rt._next_poll = 0
+    rt._service_ticks()
+    assert refreshed == [True]

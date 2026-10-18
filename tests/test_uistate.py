@@ -1016,3 +1016,19 @@ def test_rate_limit_note_suppressed_without_github_repo():
         "blocks"
     ]
     assert not [b for b in blocks if b.get("kind") == "note"]
+
+
+def test_multi_repo_selector_disambiguates_equal_pr_numbers_and_targets_selection():
+    repos = [
+        _repo(name=name, repo=f"o/{name}", pulls=[{**_pull(), "url": f"https://github.com/o/{name}/pull/7"}])
+        for name in ("first", "second")
+    ]
+    params = uistate.snapshot_ui_state_params(_snapshot(_session(repos=repos)), selected={"s1": "o/second#7"})
+    rows = [r for r in _rows(_pane(params)["payload"]["blocks"]) if r.get("method") == "github.select_pr"]
+    assert [r["params"]["pr"] for r in rows] == ["o/first#7", "o/second#7"]
+    assert [r["selected"] for r in rows] == [False, True]
+    assert [r["href"] for r in rows] == [
+        "https://github.com/o/first/pull/7",
+        "https://github.com/o/second/pull/7",
+    ]
+    assert all(repo["repo"] in row["sublabel"] for repo, row in zip(repos, rows, strict=True))

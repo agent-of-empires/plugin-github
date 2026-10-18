@@ -253,14 +253,10 @@ def _is_submodule_checkout(path: str) -> bool:
 
 
 def discover_checkouts(workspace: str, *, ignore_submodules: bool = True) -> list[str]:
-    """Git checkouts in a session workspace: the workspace root and each
-    immediate child directory that is its own checkout. Worktree-safe (a
-    worktree's ``.git`` is a file, so we ask git, not the filesystem) and
-    shallow (no deep scan into ``node_modules`` etc).
+    """Git checkouts in a session workspace: root plus immediate child repos.
 
-    A candidate counts only if ``git rev-parse --show-toplevel`` equals the
-    candidate itself; that rejects subdirectories of a repo rooted higher up
-    (so a workspace that is itself one repo does not report every child).
+    This remains the compatibility path when the host does not supply
+    ``workspace_repos`` metadata.
     """
     candidates = [workspace]
     try:
@@ -287,19 +283,39 @@ def discover_checkouts(workspace: str, *, ignore_submodules: bool = True) -> lis
     return out
 
 
-def _identify(path: str) -> tuple[str | None, RepoKey | None]:
-    """``(repo, key)`` for a checkout: ``repo`` is ``"owner/name"`` (or ``None``
-    if the origin is not a github.com remote, a benign skip); ``key`` is the
-    dedup key, or ``None`` on a detached HEAD (known repo, no branch to query)."""
+def _identify(path: str, branch_override: str | None = None) -> tuple[str | None, RepoKey | None]:
+    """Resolve checkout origin and use the host session branch when supplied."""
     remote = _git(path, "remote", "get-url", "origin")
     owner_repo = parse_owner_repo(remote) if remote else None
     if owner_repo is None:
         return None, None
     owner, repo = owner_repo
-    branch = _git(path, "rev-parse", "--abbrev-ref", "HEAD")
+    branch = branch_override or _git(path, "rev-parse", "--abbrev-ref", "HEAD")
     if not branch or branch == "HEAD":
         return f"{owner}/{repo}", None
     return f"{owner}/{repo}", (owner, repo, branch)
+
+
+def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> list[tuple[str, str | None]]:
+    """Return checkout/branch pairs, preferring non-empty host metadata."""
+    workspace_repos = session.get("workspace_repos")
+    if isinstance(workspace_repos, list) and workspace_repos:
+        checkouts: list[tuple[str, str | None]] = []
+        seen: set[tuple[str, str | None]] = set()
+        for repo in workspace_repos:
+            if not isinstance(repo, dict) or not isinstance(repo.get("source_path"), str) or not repo["source_path"]:
+                continue
+            checkout = repo["source_path"]
+            branch = repo.get("branch")
+            key = (os.path.realpath(checkout), branch if isinstance(branch, str) else None)
+            if key not in seen:
+                seen.add(key)
+                checkouts.append((checkout, key[1]))
+        return checkouts
+    path = session.get("project_path")
+    if not (isinstance(path, str) and path):
+        return []
+    return [(checkout, None) for checkout in discover_checkouts(path, ignore_submodules=ignore_submodules)]
 
 
 def _trim(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1038,43 +1054,25 @@ def build_snapshot(
     force: bool = False,
     settings: SnapshotSettings = DEFAULT_SNAPSHOT_SETTINGS,
 ) -> dict[str, Any]:
-    """Assemble the aggregate snapshot from a host ``sessions.list`` result.
+    """Assemble a snapshot from active sessions and their repository metadata.
 
-    Returns ``{"sessions": [{session_id, title, project_path, repos: [...]}],
-    "auth": {"present": bool}}`` where each repo is
-    ``{path, name, repo, branch, pulls, error}``. With a token the pulls carry
-    rich fields (state/merged/review_state/checks/comments); without one they
-    are the basic REST shape and ``auth.present`` is ``False``. ``force`` bypasses
-    the GraphQL TTL so a user-initiated refresh fetches live CI/review data, and a
-    forced refresh that is rate-limited adds a one-shot ``rate_limit_notice``
-    (``{"seconds", "reset_known"}``) for the main loop to surface (issue #20). Pure
-    of IO side effects on the host channel; only filesystem + GitHub HTTP. ``env``
-    and ``transport`` are test seams.
+    Host ``workspace_repos`` metadata is authoritative when non-empty; older
+    hosts fall back to shallow checkout discovery under ``project_path``.
     """
 
-    # Discovery and identity are git subprocess calls, hundreds of them on a big
-    # workspace set, so both phases fan out on a bounded pool (#70): local-only
-    # work, no rate-limit interaction. Results map back over ordered inputs, so
-    # the output is identical to the serial version.
-    def _discover(session: dict[str, Any]) -> list[str]:
-        path = session.get("project_path")
-        if not (isinstance(path, str) and path):
-            return []
-        return discover_checkouts(path, ignore_submodules=settings.ignore_submodules)
+    def _discover(session: dict[str, Any]) -> list[tuple[str, str | None]]:
+        return _session_checkouts(session, ignore_submodules=settings.ignore_submodules)
 
     with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
         per_session = list(zip(sessions, pool.map(_discover, sessions), strict=True))
-        # Identity (two git calls) is keyed by real path so a checkout shared
-        # across sessions is resolved once, not once per occurrence.
-        reps: dict[str, str] = {}
+        reps: dict[tuple[str, str | None], str] = {}
         for _, checkouts in per_session:
-            for checkout in checkouts:
-                reps.setdefault(os.path.realpath(checkout), checkout)
-        ident: dict[str, tuple[str | None, RepoKey | None]] = dict(
-            zip(reps.keys(), pool.map(_identify, reps.values()), strict=True)
+            for checkout, branch in checkouts:
+                reps.setdefault((os.path.realpath(checkout), branch), checkout)
+        ident: dict[tuple[str, str | None], tuple[str | None, RepoKey | None]] = dict(
+            zip(reps.keys(), pool.map(lambda item: _identify(item[1], item[0][1]), reps.items()), strict=True)
         )
     keys: set[RepoKey] = {key for _, key in ident.values() if key is not None}
-
     fetched, auth_present = _fetch_all(
         keys,
         env,
@@ -1083,18 +1081,17 @@ def build_snapshot(
         required_checks_only=settings.required_checks_only,
     )
     refreshed_at = _utc_now_iso()
-
     out_sessions: list[dict[str, Any]] = []
     for session, checkouts in per_session:
         repos: list[dict[str, Any]] = []
         session_keys: list[RepoKey] = []
-        for checkout in checkouts:
-            repo_str, key = ident[os.path.realpath(checkout)]
+        for checkout, branch in checkouts:
+            repo_str, key = ident[(os.path.realpath(checkout), branch)]
             entry: dict[str, Any] = {
                 "path": checkout,
                 "name": Path(checkout).name or checkout,
                 "repo": repo_str,
-                "branch": key[2] if key else None,
+                "branch": key[2] if key else branch,
                 "pulls": [],
                 "error": None,
             }
@@ -1122,13 +1119,6 @@ def build_snapshot(
         if freshness is not None:
             out_session["freshness"] = freshness
         out_sessions.append(out_session)
-    # A forced refresh that is rate-limited carries a one-shot notice so the main
-    # loop can tell the user why nothing changed (issue #20); background ticks
-    # stay silent. See _forced_rate_limit_notice.
-    # ``rate_limit`` is the always-on counterpart (#62): the current backoff state
-    # regardless of force, so the pane can surface a persistent note on background
-    # refreshes too, not only when the user clicks Refresh. It does not consume the
-    # one-shot notice.
     rate_limit = _rate_limit_status()
     return {
         "sessions": out_sessions,
