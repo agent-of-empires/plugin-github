@@ -50,9 +50,10 @@ anything is written.
 
 ### GitHub review suggestions
 
-On API 14 hosts this plugin also publishes host-managed suggestions, independent
-of AoE sessions. It queries GitHub for open PRs requesting your review and PRs
-with current changes-requested reviews; startup, periodic polling, and the
+On Agent of Empires 1.20.0+ (SDK API 19), this plugin publishes host-managed
+suggestions, independent of AoE sessions. It queries GitHub for open PRs
+requesting your review and PRs with current changes-requested reviews; startup,
+periodic polling, and the
 `suggestions.refresh` host notification publish complete snapshots. Fetch
 failures report `suggestions.error` and do not replace the last good snapshot.
 
@@ -266,8 +267,8 @@ is one of a small, extensible set (`heading`, `row`, `note`, `divider`,
 per kind is in the host's
 [plugin API reference](https://github.com/agent-of-empires/agent-of-empires/blob/main/docs/plugin-api.md#pane-payload).
 The host renders the block kinds it knows and ignores the rest, so the pane can
-grow without a lockstep host change; the kinds used here need `api_version >= 12`,
-which is why the manifest declares it. `tone` is one of the host's `Tone` set
+grow without a lockstep host change; the kinds used here need `api_version >= 12`.
+`tone` is one of the host's `Tone` set
 (`neutral`, `info`, `success`, `warn`, `danger`): a non-draft open PR is
 `success`, a draft `warn`, a hard error (auth/rate-limit/network) `danger`. A
 merged PR has no semantic tone, so its selector row carries a validated hex

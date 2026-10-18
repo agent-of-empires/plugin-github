@@ -7,7 +7,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Features
 
-- **suggestions:** Publish session-independent GitHub review-request suggestions with scoped discovery, explicit project mapping, and stale-snapshot error handling.
+- **suggestions:** Publish session-independent GitHub review-request suggestions with scoped discovery, explicit project mapping, and stale-snapshot error handling. Requires AoE 1.20.0+ (SDK API 19).
 
 
 ## [2.2.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.1) - 2026-10-16
