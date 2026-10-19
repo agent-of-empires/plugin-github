@@ -562,7 +562,9 @@ class Runtime:
             settings = {}
             for key in SUGGESTION_SETTING_KEYS:
                 result = self.call_host(CONFIG_GET, {"key": key})
-                settings[key] = result.get("value") if isinstance(result, dict) else None
+                if not isinstance(result, dict):
+                    raise TypeError(f"Failed to read suggestion setting {key!r}")  # noqa: TRY301
+                settings[key] = result.get("value")
             items = suggestions.fetch_suggestions(
                 criteria_raw=settings.get("suggestion_criteria") or "review_requested,changes_requested",
                 repos_raw=settings.get("suggestion_repositories"),

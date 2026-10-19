@@ -72,7 +72,7 @@ def _review_state(pr: dict[str, Any]) -> str:
     return "review_requested"
 
 
-def discover_review_requests(  # noqa: C901, PLR0912
+def discover_review_requests(  # noqa: C901
     client: GitHubClient,
     *,
     criteria: set[str],
@@ -107,11 +107,9 @@ def discover_review_requests(  # noqa: C901, PLR0912
                 if isinstance(node, dict) and node.get("url"):
                     prior = all_items.get(node["url"])
                     if prior is None:
-                        all_items[node["url"]] = {**node, "_matched_criterion": criterion}
+                        all_items[node["url"]] = {**node, "_matched_criteria": {criterion}}
                     else:
-                        previous = prior.get("_matched_criterion")
-                        if previous not in priority or priority.index(criterion) < priority.index(previous):
-                            all_items[node["url"]] = {**node, "_matched_criterion": criterion}
+                        prior["_matched_criteria"].add(criterion)
             info = search.get("pageInfo") or {}
             if not info.get("hasNextPage"):
                 break
@@ -134,14 +132,27 @@ def build_suggestions(  # noqa: PLR0913
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
+    priority = priority + tuple(
+        criterion for criterion in ("changes_requested", "review_requested") if criterion not in priority
+    )
     for pr in pulls:
         repo = str((pr.get("repository") or {}).get("nameWithOwner") or "")
         if not repo or ((repos or orgs) and repo.lower() not in repos and repo.split("/", 1)[0].lower() not in orgs):
             continue
         requested = bool((pr.get("reviewRequests") or {}).get("nodes"))
         state = _review_state(pr)
-        criterion = str(pr.get("_matched_criterion") or ("review_requested" if requested else "changes_requested"))
-        if criterion not in criteria or (criterion == "changes_requested" and state != criterion):
+        matched = pr.get("_matched_criteria") or {"review_requested" if requested else "changes_requested"}
+        criterion = next(
+            (
+                candidate
+                for candidate in priority
+                if candidate in matched
+                and candidate in criteria
+                and (candidate != "changes_requested" or state == candidate)
+            ),
+            None,
+        )
+        if criterion is None:
             continue
         url = pr.get("url")
         parsed = urlparse(url) if isinstance(url, str) else None
