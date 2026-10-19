@@ -52,10 +52,12 @@ anything is written.
 
 On Agent of Empires 1.20.0+ (SDK API 19), this plugin publishes host-managed
 suggestions, independent of AoE sessions. It queries GitHub for open PRs
-requesting your review and PRs with current changes-requested reviews; startup,
-periodic polling, and the
-`suggestions.refresh` host notification publish complete snapshots. Fetch
-failures report `suggestions.error` and do not replace the last good snapshot.
+requesting your review and open PRs you authored with a current
+changes-requested review (`author:@me`); it does not include PRs you merely
+reviewed. Startup, periodic polling, and the `suggestions.refresh` host
+notification publish complete snapshots. Fetch failures or searches that exceed
+the 10-page, 50-results-per-page limit report `suggestions.error` and preserve
+the last good snapshot.
 
 Configure `suggestion_criteria` (comma-separated `review_requested` and
 `changes_requested`), optional `suggestion_repositories` and
@@ -63,7 +65,8 @@ Configure `suggestion_criteria` (comma-separated `review_requested` and
 per line). Project values are explicit registered project names or canonical
 local paths; unmapped repositories stay unmapped.
 `suggestion_priority` sets criterion ordering (defaulting to changes requested
-first), and `suggestion_limit` caps the published snapshot (1-500).
+first), and `suggestion_limit` caps the published snapshot (1-500) after a
+complete search.
 
 Each suggestion links to its canonical GitHub PR URL and includes a short PR
 description preview. That remote text is source material, not trusted

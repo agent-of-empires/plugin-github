@@ -53,9 +53,9 @@ def test_discovery_paginates_each_criterion_and_deduplicates_canonical_prs():
         client, criteria={"review_requested", "changes_requested"}, repos={"acme/widgets"}, orgs=set()
     )
     assert len(pulls) == 2
-    assert client.variables[0]["query"] == "is:open review:changes_requested repo:acme/widgets"
+    assert client.variables[0]["query"] == "is:open author:@me review:changes_requested repo:acme/widgets"
     assert client.variables[1]["after"] == "page-2"
-    assert "review-requested:@me" in client.variables[2]["query"]
+    assert client.variables[2]["query"] == "is:open review-requested:@me repo:acme/widgets"
 
 
 def test_provider_uses_exact_mapping_and_builds_stable_task_not_source_instructions():
@@ -124,6 +124,45 @@ def test_single_search_result_does_not_invent_an_unmatched_criterion(criterion, 
         pulls, criteria={"review_requested", "changes_requested"}, repos=set(), orgs=set(), mapping={}
     )
     assert [item["criterion"] for item in items] == expected
+
+
+@pytest.mark.parametrize(
+    ("states", "expected"),
+    [
+        (["CHANGES_REQUESTED", "COMMENTED"], "changes_requested"),
+        (["CHANGES_REQUESTED", "PENDING"], "changes_requested"),
+        (["CHANGES_REQUESTED", "DISMISSED"], "review_requested"),
+        (["CHANGES_REQUESTED", "DISMISSED", "CHANGES_REQUESTED"], "changes_requested"),
+    ],
+)
+def test_latest_review_verdict_ignores_non_verdicts_and_honors_dismissal(states, expected):
+    pr = _pr(
+        reviews={
+            "nodes": [{"author": {"login": "reviewer"}, "state": state, "commit": {"oid": "head"}} for state in states]
+        },
+        commits={"nodes": [{"commit": {"oid": "head"}}]},
+    )
+    assert suggestions._review_state(pr) == expected
+
+
+def test_search_pagination_cap_rejects_incomplete_snapshot():
+    pages = [
+        {
+            "data": {
+                "search": {
+                    "nodes": [],
+                    "pageInfo": {"hasNextPage": True, "endCursor": f"page-{page + 1}"},
+                }
+            }
+        }
+        for page in range(suggestions.MAX_PAGES)
+    ]
+    client = FakeClient(pages)
+
+    with pytest.raises(RuntimeError, match="complete pagination limit"):
+        suggestions.discover_review_requests(client, criteria={"changes_requested"}, repos=set(), orgs=set())
+
+    assert len(client.variables) == suggestions.MAX_PAGES
 
 
 def test_failed_pagination_never_returns_partial_snapshot():

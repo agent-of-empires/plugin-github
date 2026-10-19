@@ -61,8 +61,13 @@ def _review_state(pr: dict[str, Any]) -> str:
     latest: dict[str, dict[str, Any]] = {}
     for review in nodes:
         login = (review.get("author") or {}).get("login")
-        if login:
-            latest[login.lower()] = review
+        if not login:
+            continue
+        reviewer = login.lower()
+        if review.get("state") == "DISMISSED":
+            latest.pop(reviewer, None)
+        elif review.get("state") in {"APPROVED", "CHANGES_REQUESTED"}:
+            latest[reviewer] = review
     if any(
         review.get("state") == "CHANGES_REQUESTED"
         and (not head_oid or not review.get("commit") or review["commit"].get("oid") == head_oid)
@@ -93,7 +98,7 @@ def discover_review_requests(  # noqa: C901
         key=priority.index,
     )
     for criterion in criterion_order:
-        clause = "review-requested:@me" if criterion == "review_requested" else "review:changes_requested"
+        clause = "review-requested:@me" if criterion == "review_requested" else "author:@me review:changes_requested"
         query = "is:open " + clause + (" " + " ".join(scope) if scope else "")
         cursor: str | None = None
         for page in range(MAX_PAGES):

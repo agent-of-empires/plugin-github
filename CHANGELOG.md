@@ -12,6 +12,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 ### Bug Fixes
 
 - **suggestions:** Keep the last-good snapshot when configuration reads fail, and retain pending review requests when an overlapping changes-requested review is stale.
+- **suggestions:** Ignore non-verdict review states when tracking current changes requests, clear dismissed verdicts, and restrict changes-requested searches to the authenticated user's PRs.
 
 
 ## [2.2.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.1) - 2026-10-16
