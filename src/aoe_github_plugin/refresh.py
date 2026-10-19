@@ -134,6 +134,7 @@ RichCacheKey = tuple[str, str, str, str, bool]
 class SnapshotSettings:
     ignore_submodules: bool = True
     required_checks_only: bool = False
+    ignored_commenters: frozenset[str] = frozenset()
 
 
 DEFAULT_SNAPSHOT_SETTINGS = SnapshotSettings()
@@ -1124,7 +1125,9 @@ def build_snapshot(  # noqa: PLR0913 - explicit environment, transport, settings
             if key is not None:
                 session_keys.append(key)
                 result = fetched.get(key, {})
-                entry["pulls"] = result.get("pulls", [])
+                entry["pulls"] = [
+                    graphql.drop_ignored_commenters(p, settings.ignored_commenters) for p in result.get("pulls", [])
+                ]
                 entry["error"] = result.get("error")
             repos.append(entry)
         fingerprint = _session_fingerprint(session_keys)

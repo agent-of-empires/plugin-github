@@ -820,10 +820,22 @@ def test_column_without_pr_stays_empty_and_error_has_no_filter_values():
 def test_snapshot_emits_global_filter_facets_on_the_status_column():
     params = uistate.snapshot_ui_state_params(_snapshot(_session()))
     facets = [p for p in params if p["slot"] == "filter-facet"]
-    assert [f["id"] for f in facets] == ["github_ci", "github_review", "github_pr", "github_comments"]
+    assert [f["id"] for f in facets] == [
+        "github_ci",
+        "github_review",
+        "github_pr",
+        "github_comments",
+        "github_conflicts",
+    ]
     assert all("session_id" not in f for f in facets)
     assert all(f["payload"]["column"] == uistate.ROW_COLUMN_SLOT[1] for f in facets)
-    assert [f["payload"]["label"] for f in facets] == ["GitHub CI", "GitHub review", "GitHub PR", "GitHub comments"]
+    assert [f["payload"]["label"] for f in facets] == [
+        "GitHub CI",
+        "GitHub review",
+        "GitHub PR",
+        "GitHub comments",
+        "GitHub conflicts",
+    ]
     assert _facet(params, "github_ci")["payload"]["options"] == [
         {"value": "ci:passing", "label": "passing", "tone": "success"},
         {"value": "ci:failing", "label": "failing", "tone": "danger"},
@@ -845,6 +857,9 @@ def test_snapshot_emits_global_filter_facets_on_the_status_column():
     assert _facet(params, "github_comments")["payload"]["options"] == [
         {"value": "comments:unresolved", "label": "unresolved", "tone": "warn"},
     ]
+    assert _facet(params, "github_conflicts")["payload"]["options"] == [
+        {"value": "conflicts:yes", "label": "conflicts", "tone": "danger"},
+    ]
 
 
 def test_column_filter_values_cover_every_facet_option():
@@ -853,6 +868,7 @@ def test_column_filter_values_cover_every_facet_option():
     offered = {o["value"] for _fid, payload in uistate.FILTER_FACETS for o in payload["options"]}
     comments = {"unresolved": 1, "items": []}
     emitted: set[str] = set()
+    emitted |= uistate._pull_filter_values({**_rich_pull(), "merge_state": "conflicts"})
     for review in uistate._REVIEW_VISUAL:
         for cstate in [*uistate._CHECK_VISUAL, "weird"]:
             for draft in (False, True):

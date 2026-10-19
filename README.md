@@ -46,7 +46,7 @@ anything is written.
 | Command | `refresh` -> worker method `github.refresh`                        |
 | Command | `open` (open-in-GitHub) -> worker method `github.open`             |
 | Command | `open_pr` (`GitHub: open PR`) -> client `open-ui-link` action, default chord `Ctrl+Shift+G` |
-| UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), four `filter-facet`s (`github_ci`, `github_review`, `github_pr`, `github_comments`), and a `pane` tool-window (`github_pane`) |
+| UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), five `filter-facet`s (`github_ci`, `github_review`, `github_pr`, `github_comments`, `github_conflicts`), and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
 `open_pr` is the command-palette / shortcut way to open the active session's PR
@@ -61,7 +61,7 @@ highest-attention PR and is present whenever an open PR exists, independent of t
 
 Compatible with the [Board](https://github.com/agent-of-empires/plugin-kanban)
 (kanban) plugin. Its Cards show the PR badges and status text as the sidebar
-does, and its Signal columns can match on the four filter facets below, e.g. a
+does, and its Signal columns can match on the five filter facets below, e.g. a
 column holding every session where `GitHub CI is failing` or `GitHub review is
 changes requested`.
 
@@ -137,7 +137,7 @@ session-less `github.refresh` cover every session and prune vanished ones:
    a workspace of many worktrees of one repo costs a single query (split into a
    few once it exceeds the per-query alias cap). Without a token it is the basic
    REST open-PR lookup only.
-4. Push one global `sort-key`, four global `filter-facet`s (below), and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
+4. Push one global `sort-key`, five global `filter-facet`s (below), and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
    chip sequence per open PR: a clickable PR icon, a merge-conflict chip when the
    PR conflicts with its base, then review-state, CI-rollup,
    and unresolved-comment chips, each shown only when a token supplies that field,
@@ -163,7 +163,7 @@ session-less `github.refresh` cover every session and prune vanished ones:
 Filter facets: each session's `row-column` carries `filter_values`, the sorted
 union of facts across every open (non-merged) PR in the workspace, drafts
 included. They are data, not display, so the session-row chip toggles do not
-affect them. The four global `filter-facet` entries point at that column
+affect them. The five global `filter-facet` entries point at that column
 (`column: "github_pr_status"`) and list the values a user can pick; a facet
 matches a session when its `filter_values` holds any selected value, so the
 dashboard sidebar and other plugins (such as the Board) can filter sessions by
@@ -175,6 +175,7 @@ dashboard sidebar and other plugins (such as the Board) can filter sessions by
 | `github_review`   | GitHub review   | `review:approved`, `review:changes-requested`, `review:changes-pushed`, `review:commented`, `review:waiting` |
 | `github_pr`       | GitHub PR       | `pr:open`, `pr:draft`                                                                                     |
 | `github_comments` | GitHub comments | `comments:unresolved` (at least one unresolved review thread)                                            |
+| `github_conflicts` | GitHub conflicts | `conflicts:yes` (the PR conflicts with its base)                                                        |
 
 Each option is `{ value, label, tone }`, with the label and tone matching the
 pane's CI and review vocabulary. Without a token only the `pr:*` values exist.
@@ -318,6 +319,12 @@ The advanced `ci_required_checks_only` setting changes the row-level CI rollup
 to use only classic branch-protection required checks. Optional failures remain
 listed in the GitHub pane. Repos whose required-check metadata cannot be read
 fall back to the all-check rollup.
+
+The advanced `ignored_commenters` setting (default `coderabbitai, codecov`) is a
+comma-separated list of GitHub logins whose COMMENTED reviews and unresolved
+threads never make a PR read "commented", so that state means a person
+commented. The PR author's own comments (e.g. replies to review threads) never
+count either. Their unresolved threads still count toward unresolved comments.
 
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol

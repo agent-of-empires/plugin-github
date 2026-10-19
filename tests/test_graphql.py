@@ -140,6 +140,32 @@ def test_review_state_infers_commented_from_review_or_thread():
     assert graphql.review_state(_pr(threads=[_thread(resolved=True)])) == "waiting"
 
 
+def test_ignored_commenters_only_downgrade_bot_only_commented():
+    ignored = graphql.parse_ignored_commenters("CodeRabbitAI, codecov[bot]")
+    assert ignored == {"coderabbitai", "codecov"}
+    bot = _pr(
+        reviews=[{"state": "COMMENTED", "author": {"login": "coderabbitai"}}],
+        threads=[_thread(resolved=False, author="coderabbitai[bot]"), _thread(resolved=True, author="al")],
+    )
+    pull = graphql.normalize_connection(_conn(bot))[0]
+    assert pull["commenters"] == ["coderabbitai", "coderabbitai[bot]"]
+    assert graphql.drop_ignored_commenters(pull, ignored)["review_state"] == "waiting"
+    assert pull["review_state"] == "commented"  # copy, cached pull untouched
+    assert pull["comments"]["unresolved"] == 1  # bot threads still count
+    # One human commenter keeps the state; so does an empty ignore list.
+    human = graphql.normalize_connection(_conn(_pr(reviews=[{"state": "COMMENTED", "author": {"login": "seluj78"}}])))[
+        0
+    ]
+    assert graphql.drop_ignored_commenters(human, ignored)["review_state"] == "commented"
+    assert graphql.drop_ignored_commenters(pull, frozenset())["review_state"] == "commented"
+    # The PR author replying to threads on their own PR is not "commented".
+    own = {**human, "author": "Seluj78", "commenters": ["Seluj78", "coderabbitai"]}
+    assert graphql.drop_ignored_commenters(own, ignored)["review_state"] == "waiting"
+    assert graphql.drop_ignored_commenters({**own, "author": "lucas"}, ignored)["review_state"] == "commented"
+    # An older persisted pull with no commenters is left alone.
+    assert graphql.drop_ignored_commenters({"review_state": "commented"}, ignored)["review_state"] == "commented"
+
+
 def test_check_summary_maps_runs_and_rollup():
     rollup = _rollup(
         "FAILURE",

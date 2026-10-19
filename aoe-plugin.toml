@@ -11,7 +11,7 @@
 
 id = "agent-of-empires.github"
 name = "GitHub"
-version = "2.1.0"
+version = "2.2.1"
 # Manifest schema / host API version. api_version 5 added the [[screenshots]]
 # list (declared below); 6 lets a command declare a client-executed `action`
 # (the `open_pr` command below uses `open-ui-link`); 7 adds the `icon` /
@@ -169,6 +169,16 @@ description = "Show the unresolved-review-comment chip on each session row. The 
 type = "boolean"
 default = true
 
+# Bots whose reviews and threads should not make a PR read "commented" on the
+# session row. Their unresolved threads still count as unresolved comments.
+[[settings]]
+key = "ignored_commenters"
+label = "Ignored commenters"
+description = "Comma-separated GitHub logins (e.g. bots) whose comments never mark a PR as \"commented\" (the PR author's own comments never do either). Their unresolved threads still count as unresolved comments. Case-insensitive; a [bot] suffix is optional."
+type = "string"
+default = "coderabbitai, codecov"
+advanced = true
+
 [[settings]]
 key = "show_status_text"
 label = "Show PR status summary text in session row"
@@ -215,7 +225,7 @@ id = "github_pr_attention"
 
 # Global filter facets over the `github_pr_status` row-column: the worker tags
 # each session's cell with `filter_values` (e.g. `ci:failing`, `review:approved`,
-# `pr:draft`, `comments:unresolved`), so the dashboard sidebar and other plugins
+# `pr:draft`, `comments:unresolved`, `conflicts:yes`), so the dashboard sidebar and other plugins
 # can filter sessions by one PR fact.
 [[ui]]
 slot = "filter-facet"
@@ -232,6 +242,10 @@ id = "github_pr"
 [[ui]]
 slot = "filter-facet"
 id = "github_comments"
+
+[[ui]]
+slot = "filter-facet"
+id = "github_conflicts"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking
 # ndjson JSON-RPC over stdio. The host requires the entrypoint to be

@@ -2,12 +2,12 @@
 
 The host renders the slots; the worker only pushes typed display state. From one
 aggregate snapshot (see ``refresh.build_snapshot``) this produces one global
-sort option, four global filter facets, plus three pushes per session:
+sort option, five global filter facets, plus three pushes per session:
 
 - a global ``sort-key`` whose payload points at the ``github_pr_status``
   ``row-column`` and sorts by the same PR attention rank the row already uses.
   The host keeps the sorting client-side over the pushed scalar values.
-- global ``filter-facet`` entries (CI, review, PR, comments; see
+- global ``filter-facet`` entries (CI, review, PR, comments, conflicts; see
   ``FILTER_FACETS``) that also point at ``github_pr_status``, so the sidebar and
   other plugins can filter sessions by one PR fact such as "CI failing".
 
@@ -153,6 +153,14 @@ FILTER_FACETS: tuple[tuple[str, dict[str, Any]], ...] = (
             "label": "GitHub comments",
             "column": ROW_COLUMN_SLOT[1],
             "options": [{"value": "comments:unresolved", "label": "unresolved", "tone": "warn"}],
+        },
+    ),
+    (
+        "github_conflicts",
+        {
+            "label": "GitHub conflicts",
+            "column": ROW_COLUMN_SLOT[1],
+            "options": [{"value": "conflicts:yes", "label": "conflicts", "tone": "danger"}],
         },
     ),
 )
@@ -408,6 +416,8 @@ def _pull_filter_values(pull: dict[str, Any]) -> set[str]:
         values.add(f"review:{review}")
     if _unresolved_count(pull):
         values.add("comments:unresolved")
+    if pull.get("merge_state") == "conflicts":
+        values.add("conflicts:yes")
     return values
 
 
