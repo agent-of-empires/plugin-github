@@ -513,7 +513,11 @@ def _pr_signals(pull: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _pr_row(repo: dict[str, Any], pull: dict[str, Any], *, selected: bool, show_repo: bool = False) -> dict[str, Any]:
-    """One selector row, with repository identity when a workspace has several."""
+    """One row of the pane's PR selector: title, branch/author, and signals.
+
+    Repository identity is included when multiple repos contribute PRs. Clicking
+    the row selects its detail; the trailing link remains a separate affordance.
+    """
     icon, tone, color = _pull_visual(pull)
     row: dict[str, Any] = {
         "kind": "row",
@@ -1171,7 +1175,12 @@ def _pane_blocks(
             {
                 "kind": "section",
                 "children": [
-                    _pr_row(repo, pull, selected=_pull_key(repo, pull) == chosen_key, show_repo=len(repos) > 1)
+                    _pr_row(
+                        repo,
+                        pull,
+                        selected=_pull_key(repo, pull) == chosen_key,
+                        show_repo=len({item.get("repo") for item, _ in pulls}) > 1,
+                    )
                     for repo, pull in pulls
                 ],
             }

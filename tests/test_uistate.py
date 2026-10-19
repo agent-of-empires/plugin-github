@@ -178,6 +178,7 @@ def test_pane_leads_with_a_pr_selector_and_folds_repos_without_prs():
     assert [r["prefix"] for r in selector] == ["#9"]
     assert selector[0]["label"] == "Add x"
     assert selector[0]["href"] == "https://github.com/o/r/pull/9"
+    assert selector[0]["sublabel"] == "feature"
     # The only PR is selected by default, and clicking a row names it by key.
     assert selector[0]["selected"] is True
     assert selector[0]["method"] == uistate.SELECT_METHOD

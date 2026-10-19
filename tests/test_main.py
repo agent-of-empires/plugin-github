@@ -559,6 +559,8 @@ def test_fast_poll_refreshes_changed_workspace_repos_without_new_session(tmp_pat
     rt._next_poll = 0
     rt._service_ticks()
     assert refreshed == [True]
+
+    assert rt._last_snapshot["sessions"][0]["repos"][0]["branch"] == "next"
     rt._next_poll = 0
     rt._service_ticks()
     assert refreshed == [True]

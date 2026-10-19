@@ -1462,6 +1462,32 @@ def test_unusable_workspace_metadata_preserves_checkout_discovery(tmp_path, meta
     assert (repo["repo"], repo["branch"], repo["pulls"][0]["number"]) == ("o/r", "feature", 12)
 
 
+@pytest.mark.parametrize("branch", [None, "", 42, False, "missing"])
+def test_workspace_metadata_without_branch_falls_back_to_discovered_head(tmp_path, branch):
+    workspace = tmp_path / "workspace"
+    source = tmp_path / "source"
+    _make_repo(workspace, branch="session-branch")
+    _make_repo(source, remote="https://github.com/o/source.git", branch="source-branch")
+    metadata = {"source_path": str(source)}
+    if branch != "missing":
+        metadata["branch"] = branch
+    snapshot = refresh.build_snapshot(
+        [
+            {
+                "id": "s1",
+                "project_path": str(workspace),
+                "workspace_repos": [metadata],
+            }
+        ],
+        env=_NoToken(),
+        transport=_transport([_pull()]),
+    )
+    repos = snapshot["sessions"][0]["repos"]
+    assert [(repo["path"], repo["repo"], repo["branch"]) for repo in repos] == [
+        (str(workspace), "o/r", "session-branch"),
+    ]
+
+
 @pytest.mark.parametrize("stale_kind", ["missing", "plain_directory", "repo_subdirectory"])
 def test_stale_workspace_paths_fall_back_to_checkout_discovery(tmp_path, stale_kind):
     workspace = tmp_path / "workspace"

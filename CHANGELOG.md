@@ -4,18 +4,6 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
-
-## Unreleased
-
-### Features
-
-- Handle host-provided multi-repository session metadata and distinguish PRs by repository.
-
-### Bug Fixes
-
-- Preserve checkout discovery when session repository metadata has no usable checkout roots, including stale paths.
-- Retry vanished-session UI cleanup on the next fast poll after a transient host write failure.
-
 ## [2.2.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.1) - 2026-10-16
 
 

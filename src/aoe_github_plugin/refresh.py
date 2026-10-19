@@ -254,7 +254,14 @@ def _is_submodule_checkout(path: str) -> bool:
 
 
 def discover_checkouts(workspace: str, *, ignore_submodules: bool = True) -> list[str]:
-    """Git checkouts in a session workspace: root plus immediate child repos.
+    """Git checkouts in a session workspace: the workspace root and each
+    immediate child directory that is its own checkout. Worktree-safe (a
+    worktree's ``.git`` is a file, so we ask git, not the filesystem) and
+    shallow (no deep scan into ``node_modules`` etc).
+
+    A candidate counts only if ``git rev-parse --show-toplevel`` equals the
+    candidate itself; that rejects subdirectories of a repo rooted higher up
+    (so a workspace that is itself one repo does not report every child).
 
     This remains the compatibility path when the host does not supply usable
     ``workspace_repos`` metadata.
@@ -285,7 +292,11 @@ def discover_checkouts(workspace: str, *, ignore_submodules: bool = True) -> lis
 
 
 def _identify(path: str, branch_override: str | None = None) -> tuple[str | None, RepoKey | None]:
-    """Resolve checkout origin and use the host session branch when supplied."""
+    """Resolve the origin repo and branch, preferring the host's session branch.
+
+    A non-GitHub origin is a benign skip; a known repo on detached HEAD has no
+    branch key to query. Discovery-only checkouts read their branch from Git.
+    """
     remote = _git(path, "remote", "get-url", "origin")
     owner_repo = parse_owner_repo(remote) if remote else None
     if owner_repo is None:
@@ -311,10 +322,12 @@ def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> l
             if not top or os.path.realpath(top) != os.path.realpath(checkout):
                 continue
             branch = repo.get("branch")
-            key = (os.path.realpath(checkout), branch if isinstance(branch, str) else None)
+            if not isinstance(branch, str) or not branch:
+                continue
+            key = (os.path.realpath(checkout), branch)
             if key not in seen:
                 seen.add(key)
-                checkouts.append((checkout, key[1]))
+                checkouts.append((checkout, branch))
         if checkouts:
             return checkouts
     path = session.get("project_path")
@@ -1059,10 +1072,24 @@ def build_snapshot(
     force: bool = False,
     settings: SnapshotSettings = DEFAULT_SNAPSHOT_SETTINGS,
 ) -> dict[str, Any]:
-    """Assemble a snapshot from active sessions and their repository metadata.
+    """Assemble the host-session snapshot consumed by the UI mapper.
 
-    Usable host ``workspace_repos`` metadata is authoritative; otherwise fall
-    back to shallow checkout discovery under ``project_path``.
+    Returns ``{"sessions": [{session_id, title, project_path, repos: [...]}],
+    "auth": {"present": bool}}``; each repo is
+    ``{path, name, repo, branch, pulls, error}``. Token-backed pulls include
+    rich review/CI/comment state; without a token they use the basic REST shape
+    and ``auth.present`` is false. An optional ``freshness`` record summarizes
+    cached data, and ``rate_limit`` reports current backoff state.
+
+    Host ``workspace_repos`` paths and branches are authoritative when usable;
+    otherwise shallow checkout discovery under ``project_path`` supplies the
+    compatibility path. Discovery and Git identity use bounded local pools
+    (#70), while GraphQL remains serialized to avoid secondary limits.
+    ``force`` bypasses the GraphQL TTL; a forced rate-limited refresh adds a
+    one-shot ``rate_limit_notice`` (``{"seconds", "reset_known"}``) for the main
+    loop to surface (issue #20). The always-on rate-limit state (#62) does not
+    consume that notice. This function performs no host-channel I/O; ``env`` and
+    ``transport`` are test seams.
     """
 
     def _discover(session: dict[str, Any]) -> list[tuple[str, str | None]]:
@@ -1127,6 +1154,13 @@ def build_snapshot(
         if freshness is not None:
             out_session["freshness"] = freshness
         out_sessions.append(out_session)
+    # A forced refresh that is rate-limited carries a one-shot notice so the main
+    # loop can tell the user why nothing changed (issue #20); background ticks
+    # stay silent. See _forced_rate_limit_notice.
+    # ``rate_limit`` is the always-on counterpart (#62): the current backoff state
+    # regardless of force, so the pane can surface a persistent note on background
+    # refreshes too, not only when the user clicks Refresh. It does not consume the
+    # one-shot notice.
     rate_limit = _rate_limit_status()
     return {
         "sessions": out_sessions,
