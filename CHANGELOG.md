@@ -10,6 +10,40 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 - **pane:** Show GitHub-native pull request stacks, layer navigation, and readiness through the selected PR.
 
+### Bug Fixes
+
+- **refresh:** Cool down failed cold stack lookups and exclude stack-only PRs from session status.
+
+## [2.2.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.1) - 2026-10-16
+
+
+
+### Bug Fixes
+
+- **ui:** Do not count the PR author's own comments as commented in [#113](https://github.com/agent-of-empires/plugin-github/pull/113) by [@Seluj78](https://github.com/Seluj78)
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.2.0...v2.2.1
+## [2.2.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.0) - 2026-10-16
+
+
+
+### Features
+
+- **ui:** Ignore bot commenters when inferring the commented state in [#112](https://github.com/agent-of-empires/plugin-github/pull/112) by [@Seluj78](https://github.com/Seluj78)
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.1.0...v2.2.0
+## [2.1.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.1.0) - 2026-10-16
+
+
+
+### Features
+
+- **ui:** Filter sessions by CI, review, PR and comment facets in [#110](https://github.com/agent-of-empires/plugin-github/pull/110) by [@Seluj78](https://github.com/Seluj78) ([`4dc1830`](https://github.com/agent-of-empires/plugin-github/commit/4dc1830369769d081abfe0ce6f7bb7445b25d582))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.0.4...v2.1.0
 ## [2.0.4](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.0.4) - 2026-10-15
 
 

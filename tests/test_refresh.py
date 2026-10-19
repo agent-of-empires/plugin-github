@@ -714,6 +714,43 @@ def test_stack_rate_limit_arms_rest_backoff():
     assert refresh._backoff["rest"]["until"] > time.monotonic()
 
 
+@pytest.mark.parametrize(
+    ("status", "payload"),
+    [(200, {"malformed": True}), (500, {"message": "server error"})],
+)
+def test_cold_failed_stack_fetch_cools_down_and_retries_after_ttl(monkeypatch, status, payload):
+    now = [100.0]
+    monkeypatch.setattr(refresh.time, "monotonic", lambda: now[0])
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(status, json=payload)
+
+    with refresh.GitHubClient(transport=httpx.MockTransport(handler)) as client:
+        for _ in range(3):
+            assert refresh._fetch_stack(client, ("o", "r", "feature"), 12) is None
+        assert len(requests) == 1
+        assert refresh._stack_cache[("o", "r", 12)]["pulls"] is None
+
+        now[0] += refresh.STACK_CACHE_TTL
+        assert refresh._fetch_stack(client, ("o", "r", "feature"), 12) is None
+
+    assert len(requests) == 2
+
+
+def test_failed_stack_refresh_preserves_stale_positive_cache():
+    key = ("o", "r", 12)
+    stale = [{"number": 12, "state": "open"}]
+    refresh._stack_cache[key] = {"pulls": stale, "fetched_at": 0.0, "retry_at": 0.0, "ttl": 1.0}
+
+    def handler(_request):
+        return httpx.Response(500, json={"message": "server error"})
+
+    with refresh.GitHubClient(transport=httpx.MockTransport(handler)) as client:
+        assert refresh._fetch_stack(client, ("o", "r", "feature"), 12) == stale
+
+
 def test_graphql_rate_limit_serves_stale(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()

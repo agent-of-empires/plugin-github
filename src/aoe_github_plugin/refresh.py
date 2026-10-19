@@ -132,6 +132,8 @@ StackCacheKey = tuple[str, str, int]
 class SnapshotSettings:
     ignore_submodules: bool = True
     required_checks_only: bool = False
+    ignored_commenters: frozenset[str] = frozenset()
+    approved_overrides_stale_block: bool = False
 
 
 DEFAULT_SNAPSHOT_SETTINGS = SnapshotSettings()
@@ -402,13 +404,19 @@ def _cache_stack(key: StackCacheKey, pulls: list[dict[str, Any]], fetched_at: fl
 
 def _stale_stack(cache_key: StackCacheKey, cached: dict[str, Any] | None, now: float) -> list[dict[str, Any]] | None:
     if cached is None:
-        return None
+        with _cache_lock:
+            cached = _stack_cache.setdefault(
+                cache_key,
+                {"pulls": None, "fetched_at": now, "retry_at": now + STACK_CACHE_TTL, "ttl": STACK_CACHE_TTL},
+            )
+        return cached["pulls"]
     pulls = cached["pulls"]
     with _cache_lock:
-        for pull in pulls:
-            key = (cache_key[0], cache_key[1], pull["number"])
-            if key in _stack_cache:
-                _stack_cache[key]["retry_at"] = now + STACK_CACHE_TTL
+        if pulls is not None:
+            for pull in pulls:
+                key = (cache_key[0], cache_key[1], pull["number"])
+                if key in _stack_cache:
+                    _stack_cache[key]["retry_at"] = now + STACK_CACHE_TTL
         cached["retry_at"] = now + STACK_CACHE_TTL
     return pulls
 
@@ -1270,7 +1278,12 @@ def build_snapshot(
             if key is not None:
                 session_keys.append(key)
                 result = fetched.get(key, {})
-                entry["pulls"] = result.get("pulls", [])
+                pulls = [
+                    graphql.drop_ignored_commenters(p, settings.ignored_commenters) for p in result.get("pulls", [])
+                ]
+                if settings.approved_overrides_stale_block:
+                    pulls = [graphql.approve_over_stale_block(p) for p in pulls]
+                entry["pulls"] = pulls
                 entry["error"] = result.get("error")
             repos.append(entry)
         fingerprint = _session_fingerprint(session_keys)
