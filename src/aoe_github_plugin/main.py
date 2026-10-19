@@ -74,6 +74,9 @@ REQUIRED_CHECKS_SETTING_KEY = "ci_required_checks_only"
 # manifest default, used when the host does not answer config.get.
 IGNORED_COMMENTERS_SETTING_KEY = "ignored_commenters"
 DEFAULT_IGNORED_COMMENTERS = "coderabbitai, codecov"
+# Off by default: a stale CHANGES_REQUESTED still reads "pushed since review"
+# (with an approval hint) even when another reviewer approved the current head.
+APPROVED_OVERRIDES_STALE_BLOCK_SETTING_KEY = "approved_overrides_stale_block"
 # The pane's PR selector fires this with the clicked row's `params` (`{"pr": key}`);
 # `uistate.SELECT_METHOD` is the same name on the block-building side.
 SELECT_PR_METHOD = uistate.SELECT_METHOD
@@ -217,6 +220,7 @@ class Runtime:
         self._show_status_text = True
         self._ignore_submodules = True
         self._required_checks_only = False
+        self._approved_overrides_stale_block = False
         self._ignored_commenters = graphql.parse_ignored_commenters(DEFAULT_IGNORED_COMMENTERS)
         self._next_network: float | None = None
         self._next_poll: float | None = None
@@ -431,6 +435,7 @@ class Runtime:
             self._ignore_submodules = self.resolve_ignore_submodules()
             self._required_checks_only = self.resolve_required_checks_only()
             self._ignored_commenters = self.resolve_ignored_commenters()
+            self._approved_overrides_stale_block = self.resolve_approved_overrides_stale_block()
             snapshot = refresh.build_snapshot(
                 sessions,
                 force=force,
@@ -438,6 +443,7 @@ class Runtime:
                     ignore_submodules=self._ignore_submodules,
                     required_checks_only=self._required_checks_only,
                     ignored_commenters=self._ignored_commenters,
+                    approved_overrides_stale_block=self._approved_overrides_stale_block,
                 ),
             )
             current_ids = self._push_snapshot(snapshot)
@@ -505,6 +511,11 @@ class Runtime:
 
     def resolve_required_checks_only(self) -> bool:
         return self._setting_bool(REQUIRED_CHECKS_SETTING_KEY, default=self._required_checks_only)
+
+    def resolve_approved_overrides_stale_block(self) -> bool:
+        return self._setting_bool(
+            APPROVED_OVERRIDES_STALE_BLOCK_SETTING_KEY, default=self._approved_overrides_stale_block
+        )
 
     def resolve_ignored_commenters(self) -> frozenset[str]:
         if self.stopped:

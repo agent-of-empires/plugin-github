@@ -180,6 +180,14 @@ default = "coderabbitai, codecov"
 advanced = true
 
 [[settings]]
+key = "approved_overrides_stale_block"
+label = "Approval overrides a stale changes-requested review"
+description = "When a reviewer requested changes on an older commit and someone else approved the current head, show the PR as approved instead of \"pushed since review\". GitHub still blocks the merge until the stale review is re-done or dismissed. Off keeps \"pushed since review\" and notes the approval."
+type = "boolean"
+default = false
+advanced = true
+
+[[settings]]
 key = "show_status_text"
 label = "Show PR status summary text in session row"
 description = "Show the words summary at the end of each session row (e.g. \"CI failing\", \"approved\"). Turn off to keep only the PR status icons. The GitHub pane is unaffected."
