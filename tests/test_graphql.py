@@ -609,7 +609,10 @@ def test_review_summary_reads_the_way_github_does():
         ([{"name": "a", "state": "pending"}, {"name": "b", "state": "pending"}], "2 pending"),
         # A blocking review wins regardless of how many approvals sit beside it.
         ([{"name": "a", "state": "approved"}, {"name": "b", "state": "changes-requested"}], "changes requested"),
-        ([{"name": "a", "state": "approved"}, {"name": "b", "state": "changes-pushed"}], "pushed since review"),
+        (
+            [{"name": "a", "state": "approved"}, {"name": "b", "state": "changes-pushed"}],
+            "pushed since review, 1 approved",
+        ),
         ([{"name": "a", "state": "changes-pushed"}, {"name": "b", "state": "changes-requested"}], "changes requested"),
     ]
     for people, expected in cases:
@@ -725,3 +728,15 @@ def test_check_runs_carry_duration_workflow_group_and_a_skipped_flag():
     assert runs["close-stale"]["skipped"] is True
     assert "duration" not in runs["close-stale"]
     assert "skipped" not in runs["Clippy"]
+
+
+def test_approve_over_stale_block_upgrades_only_when_someone_approved():
+    people = [{"name": "a", "state": "approved"}, {"name": "b", "state": "changes-pushed"}]
+    pull = {"review_state": "changes-pushed", "reviewers": people}
+    assert graphql.approve_over_stale_block(pull)["review_state"] == "approved"
+    assert pull["review_state"] == "changes-pushed"
+    lone = {"review_state": "changes-pushed", "reviewers": people[1:]}
+    assert graphql.approve_over_stale_block(lone) is lone
+    live = {"review_state": "changes-requested", "reviewers": people}
+    assert graphql.approve_over_stale_block(live) is live
+    assert graphql.approve_over_stale_block({"review_state": "changes-pushed"})["review_state"] == "changes-pushed"

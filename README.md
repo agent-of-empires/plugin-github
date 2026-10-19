@@ -324,6 +324,12 @@ threads never make a PR read "commented", so that state means a person
 commented. The PR author's own comments (e.g. replies to review threads) never
 count either. Their unresolved threads still count toward unresolved comments.
 
+The advanced `approved_overrides_stale_block` setting (default off) makes a PR
+read "approved" when a reviewer requested changes on an older commit and another
+reviewer approved the current head. Off, it stays "pushed since review" and the
+reviewer summary notes the approval. GitHub still blocks the merge until the
+stale review is re-done or dismissed.
+
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol
 > (`agent-of-empires#2095`); this repo ships the data those slots consume. The
