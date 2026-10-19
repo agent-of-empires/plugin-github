@@ -41,6 +41,7 @@ from datetime import datetime
 from datetime import timedelta
 from collections.abc import Callable
 
+from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
 from aoe_github_plugin import uistate
 from aoe_github_plugin import handlers
@@ -69,6 +70,13 @@ IGNORE_SUBMODULES_SETTING_KEY = "ignore_submodules"
 # Toggle for the CI rollup semantics. Defaults off so existing row attention
 # keeps treating every failing check as actionable unless the user opts in.
 REQUIRED_CHECKS_SETTING_KEY = "ci_required_checks_only"
+# Logins whose comments never make a PR read "commented" (bots). Mirrors the
+# manifest default, used when the host does not answer config.get.
+IGNORED_COMMENTERS_SETTING_KEY = "ignored_commenters"
+DEFAULT_IGNORED_COMMENTERS = "coderabbitai, codecov"
+# Off by default: a stale CHANGES_REQUESTED still reads "pushed since review"
+# (with an approval hint) even when another reviewer approved the current head.
+APPROVED_OVERRIDES_STALE_BLOCK_SETTING_KEY = "approved_overrides_stale_block"
 # The pane's PR selector fires this with the clicked row's `params` (`{"pr": key}`);
 # `uistate.SELECT_METHOD` is the same name on the block-building side.
 SELECT_PR_METHOD = uistate.SELECT_METHOD
@@ -212,6 +220,8 @@ class Runtime:
         self._show_status_text = True
         self._ignore_submodules = True
         self._required_checks_only = False
+        self._approved_overrides_stale_block = False
+        self._ignored_commenters = graphql.parse_ignored_commenters(DEFAULT_IGNORED_COMMENTERS)
         self._next_network: float | None = None
         self._next_poll: float | None = None
 
@@ -424,12 +434,16 @@ class Runtime:
         with contextlib.suppress(Exception):
             self._ignore_submodules = self.resolve_ignore_submodules()
             self._required_checks_only = self.resolve_required_checks_only()
+            self._ignored_commenters = self.resolve_ignored_commenters()
+            self._approved_overrides_stale_block = self.resolve_approved_overrides_stale_block()
             snapshot = refresh.build_snapshot(
                 sessions,
                 force=force,
                 settings=refresh.SnapshotSettings(
                     ignore_submodules=self._ignore_submodules,
                     required_checks_only=self._required_checks_only,
+                    ignored_commenters=self._ignored_commenters,
+                    approved_overrides_stale_block=self._approved_overrides_stale_block,
                 ),
             )
             current_ids = self._push_snapshot(snapshot)
@@ -497,6 +511,19 @@ class Runtime:
 
     def resolve_required_checks_only(self) -> bool:
         return self._setting_bool(REQUIRED_CHECKS_SETTING_KEY, default=self._required_checks_only)
+
+    def resolve_approved_overrides_stale_block(self) -> bool:
+        return self._setting_bool(
+            APPROVED_OVERRIDES_STALE_BLOCK_SETTING_KEY, default=self._approved_overrides_stale_block
+        )
+
+    def resolve_ignored_commenters(self) -> frozenset[str]:
+        if self.stopped:
+            return self._ignored_commenters
+        result = self.call_host(CONFIG_GET, {"key": IGNORED_COMMENTERS_SETTING_KEY})
+        if isinstance(result, dict) and isinstance(result.get("value"), str):
+            return graphql.parse_ignored_commenters(result["value"])
+        return self._ignored_commenters
 
     def _setting_bool(self, key: str, *, default: bool) -> bool:
         if self.stopped:

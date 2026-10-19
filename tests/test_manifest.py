@@ -1,7 +1,8 @@
 """Lint the shipped ``aoe-plugin.toml`` so a command/keybind contribution stays
 consistent with what the host accepts: every keybind targets a declared command,
 every chord parses to the host's accepted form, and a client `action` points at a
-declared per-session UI slot and carries the capability the host gates it on.
+declared per-session UI slot and carries the capability the host gates it on,
+and every slot the worker pushes is declared.
 """
 
 from __future__ import annotations
@@ -9,6 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import tomlkit
+
+from aoe_github_plugin import uistate
 
 MANIFEST = Path(__file__).resolve().parent.parent / "aoe-plugin.toml"
 
@@ -70,6 +73,16 @@ def test_open_pr_command_is_wired():
     assert open_pr is not None, "open_pr command missing"
     assert open_pr["action"] == {"kind": "open-ui-link", "slot": "row-badge", "id": "github_pr_badge"}
     assert any(kb["command"] == "open_pr" for kb in m.get("keybinds", [])), "open_pr has no keybind"
+
+
+def test_every_pushed_ui_slot_is_declared():
+    # The host only accepts ui.state.set for a declared (slot, id), so a push the
+    # manifest misses (e.g. a new global filter-facet) would be rejected.
+    m = _manifest()
+    declared = {(u["slot"], u.get("id", "")) for u in m.get("ui", [])}
+    snapshot = {"sessions": [{"session_id": "s1", "repos": []}]}
+    pushed = {(p["slot"], p["id"]) for p in uistate.snapshot_ui_state_params(snapshot)}
+    assert pushed <= declared, f"undeclared ui slots: {sorted(pushed - declared)}"
 
 
 def test_icon_asset_exists_on_disk():

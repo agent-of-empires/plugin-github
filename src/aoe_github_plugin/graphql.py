@@ -30,8 +30,9 @@ from datetime import timezone
 # Counts are sized to what the pane renders, to keep the GraphQL point cost low
 # now that this query fires only on a detected change (#21):
 # - pullRequests first:3 (a branch rarely has more than one open + one merged PR);
-# - reviews last:1, states:[COMMENTED] (review_state only needs to know whether a
-#   COMMENTED review exists; APPROVED/CHANGES_REQUESTED come from reviewDecision);
+# - reviews last:20, states:[COMMENTED] (review_state only needs to know who left
+#   a COMMENTED review, so bot-only comments can be ignored; APPROVED /
+#   CHANGES_REQUESTED come from reviewDecision);
 # - reviewThreads first:100 with pageInfo, so a big review (e.g. a CodeRabbit
 #   pass) surfaces every unresolved comment; refresh paginates by the node ``id``
 #   for the rare PR that still has more (#28).
@@ -68,7 +69,7 @@ fragment PRConnection on PullRequestConnection {
       }
       ... on StatusContext { context state targetUrl createdAt }
     } } } } } }
-    reviews(last: 1, states: [COMMENTED]) { nodes { state } }
+    reviews(last: 20, states: [COMMENTED]) { nodes { state author { login } } }
     latestReviews(first: 20) { nodes { state author { login } commit { oid } } }
     decidedReviews: reviews(last: 30, states: [CHANGES_REQUESTED, APPROVED, DISMISSED]) {
       nodes { state author { login } commit { oid } }
@@ -189,6 +190,10 @@ def digest_signature(conn: Any) -> str | None:
         commits = _nodes(pr, "commits")
         rollup = commits[0].get("commit", {}).get("statusCheckRollup") if commits else None
         threads = pr.get("reviewThreads")
+        merge_queue = _merge_queue(pr)
+        if merge_queue is not None:
+            # The queue URL is display-only and absent from the digest query.
+            merge_queue.pop("url", None)
         sig.append(
             {
                 "number": pr.get("number"),
@@ -207,7 +212,7 @@ def digest_signature(conn: Any) -> str | None:
                 # GitHub reports it (the digest reads the same scalar), so this
                 # loses no detection latency (#80).
                 "conflicts": merge_state(pr) == "conflicts",
-                "merge_queue": _merge_queue(pr),
+                "merge_queue": merge_queue,
                 "rollup": rollup.get("state") if isinstance(rollup, dict) else None,
                 "threads": threads.get("totalCount") if isinstance(threads, dict) else None,
             }
@@ -309,6 +314,63 @@ def review_state(pr: dict[str, Any]) -> str:
     if any(r.get("state") == "COMMENTED" for r in reviews) or any(not t.get("isResolved") for t in threads):
         return "commented"
     return "waiting"
+
+
+def commenters(pr: dict[str, Any]) -> list[str]:
+    """Logins behind an inferred ``commented`` state: COMMENTED-review authors plus
+    each unresolved thread's opener. An unknown author is ``""`` (counts as a
+    person, so a deleted account never hides a comment)."""
+    logins = {_actor_login(r, "author") for r in _nodes(pr, "reviews") if r.get("state") == "COMMENTED"}
+    for thread in _nodes(pr, "reviewThreads"):
+        if not thread.get("isResolved"):
+            first = _nodes(thread, "comments")
+            logins.add(_actor_login(first[0], "author") if first else "")
+    return sorted(logins)
+
+
+def _login_key(login: str) -> str:
+    """Case-insensitive login, ``[bot]`` suffix dropped: GraphQL says
+    ``coderabbitai``, REST and the web UI say ``coderabbitai[bot]``."""
+    return login.strip().lower().removesuffix("[bot]")
+
+
+def parse_ignored_commenters(raw: Any) -> frozenset[str]:
+    """The ``ignored_commenters`` setting (comma/whitespace separated logins) as
+    a set of ``_login_key`` values. A non-string degrades to the empty set."""
+    if not isinstance(raw, str):
+        return frozenset()
+    return frozenset(k for k in (_login_key(x) for x in raw.replace(",", " ").split()) if k)
+
+
+def drop_ignored_commenters(pull: dict[str, Any], ignored: frozenset[str]) -> dict[str, Any]:
+    """``pull`` with ``commented`` downgraded to ``waiting`` when every commenter
+    is ignored (bots like CodeRabbit) or is the PR author (replying to a review
+    thread posts a COMMENTED review), so the row reads "commented" only when
+    someone else did. Returns a copy, never mutating the cached pull. A pull
+    without ``commenters`` (basic REST shape, an older persisted snapshot) is
+    untouched. Unresolved-comment counts are unaffected: bot threads still
+    surface there."""
+    names = pull.get("commenters")
+    if pull.get("review_state") != "commented" or not isinstance(names, list):
+        return pull
+    author = pull.get("author")
+    skip = ignored | {_login_key(author)} if isinstance(author, str) and author else ignored
+    if any(not isinstance(n, str) or _login_key(n) not in skip for n in names):
+        return pull
+    return {**pull, "review_state": "waiting"}
+
+
+def approve_over_stale_block(pull: dict[str, Any]) -> dict[str, Any]:
+    """``pull`` with ``changes-pushed`` upgraded to ``approved`` when another
+    reviewer approved the current head, for the ``approved_overrides_stale_block``
+    setting. GitHub still blocks the merge until the stale review is re-done or
+    dismissed. Returns a copy; a pull without ``reviewers`` is untouched."""
+    people = pull.get("reviewers")
+    if pull.get("review_state") != "changes-pushed" or not isinstance(people, list):
+        return pull
+    if any(isinstance(p, dict) and p.get("state") == "approved" for p in people):
+        return {**pull, "review_state": "approved"}
+    return pull
 
 
 def merge_state(pr: dict[str, Any]) -> str | None:
@@ -694,9 +756,9 @@ def review_summary(people: list[dict[str, str]]) -> str:
         return ""
     if any(p["state"] == "changes-requested" for p in people):
         return "changes requested"
-    if any(p["state"] == "changes-pushed" for p in people):
-        return "pushed since review"
     approved = sum(1 for p in people if p["state"] == "approved")
+    if any(p["state"] == "changes-pushed" for p in people):
+        return f"pushed since review, {approved} approved" if approved else "pushed since review"
     if approved == len(people):
         return f"{approved} approved" if approved != 1 else "1 approved"
     if approved:
@@ -821,6 +883,7 @@ def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -
         "merge_state": merge_state(pr),
         "merge_queue": _merge_queue(pr),
         "review_state": review_state(pr),
+        "commenters": commenters(pr),
         "checks": check_summary(pr, required_checks_only=required_checks_only),
         "comments": comment_summary(pr),
         "author": (pr.get("author") or {}).get("login") or "",
