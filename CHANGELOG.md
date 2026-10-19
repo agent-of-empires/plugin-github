@@ -14,6 +14,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 ### Bug Fixes
 
 - Preserve checkout discovery when session repository metadata has no usable checkout roots, including stale paths.
+- Retry vanished-session UI cleanup on the next fast poll after a transient host write failure.
 
 ## [2.2.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.1) - 2026-10-16
 

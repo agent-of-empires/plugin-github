@@ -443,7 +443,6 @@ class Runtime:
             )
             current_ids = self._push_snapshot(snapshot)
             if only_session is None:
-                self._seen_topology = self._session_topology(sessions)
                 # Full refresh: the snapshot is the whole truth, so a session
                 # that dropped out has vanished and its slots are pruned.
                 for sid in self.pushed_session_ids - current_ids:
@@ -456,6 +455,7 @@ class Runtime:
                                 "params": {"slot": slot, "id": slot_id, "session_id": sid},
                             }
                         )
+                self._seen_topology = self._session_topology(sessions)
                 self.pushed_session_ids = current_ids
                 refresh.save_snapshot(snapshot)
             else:
