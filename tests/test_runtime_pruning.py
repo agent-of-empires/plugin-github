@@ -79,3 +79,37 @@ def test_list_sessions_rejects_bad_shapes(monkeypatch):
         assert rt.list_sessions() is None
     monkeypatch.setattr(rt, "call_host", _const({"sessions": [{"id": "s1"}]}))
     assert rt.list_sessions() == [{"id": "s1"}]
+
+
+def test_fast_poll_retries_removal_after_transient_send_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    visible_slots = set()
+    fail_next_removal = False
+
+    def send(message):
+        nonlocal fail_next_removal
+        params = message.get("params", {})
+        if params.get("session_id") != "gone":
+            return
+        key = (params["slot"], params["id"])
+        if message["method"] == m.UI_STATE_SET:
+            visible_slots.add(key)
+        elif message["method"] == m.UI_STATE_REMOVE:
+            if fail_next_removal:
+                fail_next_removal = False
+                raise OSError("transient host write failure")
+            visible_slots.discard(key)
+
+    rt = m.Runtime(send=send)
+    rt.call_host = _const(None)
+    rt.run_refresh(sessions=[{"id": "gone", "project_path": str(tmp_path)}])
+    assert (uistate.PANE_SLOT[0], uistate.PANE_SLOT[1]) in visible_slots
+    rt.list_sessions = _const([])
+    fail_next_removal = True
+    rt._next_poll = 0
+    rt._service_ticks()
+    assert visible_slots
+    rt._next_poll = 0
+    rt._service_ticks()
+    assert visible_slots == set()
+    assert rt.pushed_session_ids == set()

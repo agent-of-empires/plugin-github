@@ -209,9 +209,9 @@ class Runtime:
         # The most recent snapshot pushed, so a selection click can repaint without
         # a network round trip. None until the first push (cached replay or refresh).
         self._last_snapshot: dict[str, Any] | None = None
-        # Loop state, initialized in run(): the session-id set seen by the fast
-        # tick, the resolved poll interval, and the next-fire monotonic deadlines.
-        self._seen_ids: set[str] = set()
+        # Loop state, initialized in run(): the workspace topology seen by the
+        # fast tick, the resolved poll interval, and the next-fire deadlines.
+        self._seen_topology: dict[str, tuple[Any, ...]] = {}
         self._interval = 0
         # Enabled session-row chip categories; resolved from settings in run(),
         # all-on until then so the startup push is never accidentally empty.
@@ -460,13 +460,14 @@ class Runtime:
                                 "params": {"slot": slot, "id": slot_id, "session_id": sid},
                             }
                         )
+                self._seen_topology = self._session_topology(sessions)
                 self.pushed_session_ids = current_ids
                 # Persist the full snapshot so the next worker start can repaint
                 # this data instantly instead of blocking on a cold refresh.
                 refresh.save_snapshot(snapshot)
             else:
                 # Scoped refresh: only the target was fetched, so an absence
-                # here means "not refreshed", not "vanished". Add what we pushed
+                # means "not refreshed", not "vanished". Add what was pushed
                 # and leave every other session's tracking and slots intact.
                 self.pushed_session_ids |= current_ids
             # A forced refresh that hit a rate limit carries a one-shot notice
@@ -482,6 +483,23 @@ class Runtime:
                         "params": _rate_limit_notify_params(notice),
                     }
                 )
+
+    @staticmethod
+    def _session_topology(sessions: list[dict[str, Any]]) -> dict[str, tuple[Any, ...]]:
+        """Fingerprint attached repositories so same-ID topology changes refresh."""
+        topology = {}
+        for session in sessions:
+            sid = session.get("id")
+            if not isinstance(sid, str):
+                continue
+            repos = session.get("workspace_repos")
+            attached = (
+                tuple((repo.get("source_path"), repo.get("branch")) for repo in repos if isinstance(repo, dict))
+                if isinstance(repos, list)
+                else ()
+            )
+            topology[sid] = (session.get("project_path"), attached)
+        return topology
 
     def resolve_interval(self) -> int:
         """Poll period in seconds. Precedence: the host-persisted
@@ -540,11 +558,10 @@ class Runtime:
         force: bool = False,
         only_session: str | None = None,
     ) -> None:
-        """Refresh, re-baseline the seen-id set, and push the network tick out.
-        A scoped refresh leaves other sessions in ``pushed_session_ids``, so the
-        re-baseline below still covers the whole tracked set."""
+        """Refresh and push the network tick out.
+        A scoped refresh leaves other sessions in ``pushed_session_ids``, so
+        tracking for other sessions and their UI slots remains intact."""
         self.run_refresh(sessions, force=force, only_session=only_session)
-        self._seen_ids = set(self.pushed_session_ids)
         if self._next_network is not None:
             self._next_network = time.monotonic() + self._interval + _network_jitter(self._interval)
 
@@ -560,8 +577,8 @@ class Runtime:
         if self._next_poll is not None and now >= self._next_poll:
             sessions = self.list_sessions(SESSION_LIST_TIMEOUT)
             if sessions is not None:
-                ids = {s["id"] for s in sessions if isinstance(s, dict) and isinstance(s.get("id"), str)}
-                if ids != self._seen_ids:
+                topology = self._session_topology(sessions)
+                if topology != self._seen_topology:
                     self._refresh_and_reset(sessions)
             self._next_poll = now + SESSION_POLL_SECS
         if self._next_network is not None and now >= self._next_network:
@@ -584,7 +601,6 @@ class Runtime:
             self.run_refresh(sessions)
         else:
             self.run_refresh()
-        self._seen_ids = set(self.pushed_session_ids)
         self._interval = self.resolve_interval()
         # interval 0 disables all background polling (startup + on github.refresh
         # still push); otherwise a fast local tick notices session changes and a
