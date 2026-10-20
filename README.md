@@ -114,12 +114,15 @@ session-less `github.refresh` cover every session and prune vanished ones:
 1. `sessions.list` (host RPC) -> every active session and its workspace
    `project_path`. Archived and snoozed sessions are skipped: they are inactive,
    so polling them would only spend GitHub quota for no UI change.
-2. For each workspace, discover the git checkouts: the workspace root plus each
-   immediate child directory that is its own checkout (worktree-safe, a
-   worktree's `.git` is a file, so discovery asks `git rev-parse --show-toplevel`
-   rather than looking for a `.git` directory). Immediate child submodules are
-   skipped by default; turn off `ignore_submodules` to include them again. The
-   workspace root is still scanned when it is itself a submodule.
+2. Prefer the host's explicit `workspace_repos` list: each entry supplies a
+   source checkout path and the branch attached to this session. This branch
+   is authoritative even when the source checkout's current branch differs.
+   Metadata paths must name checkout roots (including worktrees and symlink
+   aliases); stale paths and repository subdirectories are skipped. If no
+   metadata entry names a checkout, use shallow discovery under
+   `project_path`: the workspace root and immediate child checkouts. Immediate
+   child submodules are skipped by default; turn off `ignore_submodules` to
+   include them.
 3. Resolve each checkout to `(host, owner, repo, branch)`, deduplicate (a branch shared
    across workspaces is fetched once), and look up its PRs. Local git identity
    and the REST lookups fan out on small bounded thread pools so a big workspace
@@ -326,6 +329,12 @@ threads never make a PR read "commented", so that state means a person
 commented. The PR author's own comments (e.g. replies to review threads) never
 count either. Their unresolved threads still count toward unresolved comments.
 
+The advanced `approved_overrides_stale_block` setting (default off) makes a PR
+read "approved" when a reviewer requested changes on an older commit and another
+reviewer approved the current head. Off, it stays "pushed since review" and the
+reviewer summary notes the approval. GitHub still blocks the merge until the
+stale review is re-done or dismissed.
+
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol
 > (`agent-of-empires#2095`); this repo ships the data those slots consume. The
@@ -380,6 +389,11 @@ Sign in separately for each server:
 ```sh
 gh auth login --hostname github.mycorp.com
 ```
+
+The server must appear in `hosts.yml`, even when using an environment token.
+`GH_HOST` selects which configured server receives that token; it does not add a
+trusted server. Run the login command above to register the server, then click
+**Refresh** if the worker is already running.
 
 For an enterprise environment token, explicitly name the one server it belongs to:
 

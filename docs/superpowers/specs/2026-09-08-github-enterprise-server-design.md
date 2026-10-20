@@ -1,396 +1,111 @@
-# GitHub Enterprise Server support
+# GitHub Enterprise Server design
 
 Date: 2026-09-08
-Status: proposed, revised for implementation review
+Status: proposed for PR #90
 
-## Problem
+## Scope and host identity
 
-The plugin only works against github.com. Four separate blocks stop a GitHub
-Enterprise Server (GHES) checkout:
+Support github.com and multiple GitHub Enterprise Server (GHES) hosts in one
+worker. A frozen `GitHubHost` owns the host kind, API endpoints, web origin and
+authentication hints. Only `dotcom` and `ghes` kinds are supported.
 
-1. `utils/gitctx.py` matches three literal remote prefixes, all `github.com`. A
-   GHES remote returns `None`, so `_identify` skips the checkout and the row
-   shows "not a github.com remote".
-2. `client.py` defines `DEFAULT_GITHUB_API_BASE = "https://api.github.com"`. The
-   `api_base` parameter exists, but no caller passes it, and no setting supplies
-   one.
-3. `post_graphql` posts to the relative path `/graphql`, which is correct only
-   for github.com. GHES serves REST at `/api/v3` and GraphQL at `/api/graphql`.
-4. `auth.py` runs `gh auth token` with no `--hostname`, so a user logged in to
-   both hosts gets the github.com token, which GHES rejects with a 401.
-   `handlers.py` also builds a compare URL from the literal `https://github.com`.
-
-## Decisions
-
-Four product decisions were settled before design:
-
-| Decision | Choice |
-| --- | --- |
-| Host scope | Multi-host. github.com and one or more GHES hosts work in the same AoE instance, in the same refresh tick. |
-| Host trust | Discovered offline from the host names in gh's local `hosts.yml`. No new setting. |
-| Token order | gh token-family precedence, with enterprise environment tokens explicitly bound by `GH_HOST`. |
-| Auth banner | Per host, naming the host and the matching hint. |
-
-Approach chosen: a `GitHubHost` value object, with the refresh partitioned by
-host. Two alternatives were rejected:
-
-- **One client, absolute URLs per request.** The token lives in the client's
-  default headers, so a single client leaks host A's token to host B.
-- **Keep `RepoKey` at three elements, carry the host beside it.** Smaller diff,
-  but the same `owner/repo/branch` on two hosts collides in `_etag_cache` and
-  `_graphql_cache`. That is a silent wrong-data bug, not a visible failure.
-
-## Architecture
-
-One new module owns host classification, canonicalization, URLs, and authentication hints.
-
-```
-hosts.py         GitHubHost + discovery + remote->host resolution   (new)
-auth.py          resolve_token(env, host)                           (signature)
-client.py        GitHubClient(host=..., token=...)                   (signature)
-utils/gitctx.py  parse_owner_repo(url, trusted) -> (host, owner, repo)
-refresh.py       RepoKey gains host; _fetch_all groups by host
-uistate.py       per-host auth note
-handlers.py      compare URL from host.web_base
-```
-
-### GitHubHost
-
-A frozen dataclass with two constructors, so the URL rules live in one place.
-
-```python
-@dataclass(frozen=True)
-class GitHubHost:
-    name: str          # "github.com" | "github.mycorp.com"
-    rest_base: str
-    graphql_url: str
-    web_base: str
-    kind: Literal["dotcom", "ghes"]
-```
-
-| Constructor | rest_base | graphql_url | web_base |
+| Host | REST base | GraphQL endpoint | Web base |
 | --- | --- | --- | --- |
-| `GitHubHost.dotcom()` | `https://api.github.com` | `https://api.github.com/graphql` | `https://github.com` |
-| `GitHubHost.enterprise(name)` | `https://<name>/api/v3` | `https://<name>/api/graphql` | `https://<name>` |
+| github.com | `https://api.github.com` | `https://api.github.com/graphql` | `https://github.com` |
+| GHES | `https://<host>/api/v3` | `https://<host>/api/graphql` | `https://<host>` |
 
-`GitHubClient.__init__` takes a `GitHubHost` in place of the `api_base` string.
-`DEFAULT_GITHUB_API_BASE` and the unused `api_base` parameter are both removed.
+Canonicalize DNS names to lowercase and remove one trailing dot, identically
+for configuration keys, `GH_HOST` and remotes. Reject URLs, userinfo, whitespace,
+IP literals, empty labels and port-bearing configuration keys. Skip localhost
+(including subdomains) and GitHub Cloud tenancy (`ghe.com` and its subdomains).
 
-`post_graphql` must post to `host.graphql_url` as an **absolute** URL. Verified
-httpx join behaviour:
+Accept scp-style SSH, HTTPS (optionally with a username), and `ssh://` remotes.
+HTTPS uses port 443 only; an explicit SSH port does not change the API origin.
+Reject unsupported schemes, queries, fragments and malformed repository paths.
+`parse_owner_repo(url, trusted)` returns `(host, owner, repo)` only for a trusted
+host; otherwise it returns `None` and the checkout is skipped.
 
-```
-base_url="https://gh.corp/api/v3" + "/graphql"          -> https://gh.corp/api/v3/graphql   WRONG
-base_url="https://gh.corp/api/v3" + "/repos/o/r/pulls"  -> https://gh.corp/api/v3/repos/... correct
-absolute "https://gh.corp/api/graphql"                  -> https://gh.corp/api/graphql      correct
-```
+## Offline trust
 
-So REST keeps its relative paths, and only GraphQL changes to an absolute URL.
-HTTP redirects stay explicitly disabled. Authenticated requests must remain on
-the host's API origin; absolute off-origin REST URLs are rejected.
+Discover trusted hosts from top-level keys in GitHub CLI's local `hosts.yml`.
+Resolve its directory using nonempty `GH_CONFIG_DIR`, then `XDG_CONFIG_HOME/gh`,
+then `AppData/GitHub CLI` on Windows, otherwise `~/.config/gh`. Parse with
+`yaml.safe_load`; do not retain or log account/token fields. `github.com` is
+always trusted. `GH_HOST` selects credentials; it never establishes trust.
 
-## Host discovery and trust
+Discovery does not contact servers, resolve credentials, invoke `gh auth status`
+or unlock keyrings. Configured hosts remain visible while offline or holding
+invalid credentials; API errors surface in their repo records instead.
 
-Discovery runs once per worker lifetime, not once per refresh. The runtime
-object resolves the trusted map at startup, holds it, and passes it down to
-both the refresh path and the direct handlers (`github.status`,
-`github.open`), which call `parse_owner_repo` outside any refresh. A manual
-`github.refresh` re-discovers, so a user who runs `gh auth login` mid-session
-has a way to pick the new host up without a worker restart.
+The runtime discovers once at startup and shares its map with refresh and the
+direct status/open handlers. Manual Refresh rereads it and atomically publishes
+a replacement. A successful empty or missing file leaves only github.com.
+Unreadable files, malformed YAML and invalid mappings preserve the previous map;
+at startup they fall back to github.com. Discovery works without a `gh` binary
+when its configuration file is available.
 
-The lifetime cache avoids reading a configuration that rarely changes on every
-120-second background tick. Discovery reads local configuration only; it does
-not check credentials, contact a host, or unlock a keyring.
+## Credential and request boundaries
 
-```python
-def discover_trusted_hosts(
-    env: TokenEnvironment,
-    previous: dict[str, GitHubHost] | None = None,
-) -> dict[str, GitHubHost]
-```
-
-Read the top-level host keys from gh's `hosts.yml`. Resolve its directory using
-[gh's configuration path precedence](https://github.com/cli/go-gh/blob/trunk/pkg/config/config.go):
-non-empty `GH_CONFIG_DIR`, then `XDG_CONFIG_HOME/gh`, then
-`AppData/GitHub CLI` on Windows, otherwise `~/.config/gh`.
-
-Use `yaml.safe_load` (add PyYAML to the runtime dependencies and lockfile),
-validate a mapping with hostname keys, and return only those names from the
-environment seam. Do not log the file contents, retain account/token fields,
-or use them for token resolution; that remains the responsibility of `auth.py`.
-
-`gh auth status --json hosts` is unsuitable for discovery: it checks accounts
-over the network and emits JSON only after the checks finish. A five-second
-subprocess timeout can therefore discard every host when just one VPN-only
-server is unreachable. Discovery must not invoke that command, even at startup.
-
-Rules:
-
-- `github.com` is always present in the result, whether or not the file lists it.
-  Today's behaviour must never regress when `gh` is absent.
-- Canonicalize DNS names to lowercase and remove one trailing dot, identically
-  for configuration keys, `GH_HOST`, and remotes. Reject URLs, paths, userinfo,
-  whitespace, IP literals, empty labels, and port-bearing configuration keys.
-- Explicit kinds are `dotcom` and `ghes`. GitHub Cloud tenancy (`ghe.com` and
-  `*.ghe.com`) and localhost are unsupported and skipped, never treated as GHES.
-  Every other valid DNS hostname becomes `GitHubHost.enterprise(name)`.
-- HTTPS remotes allow no port or port 443. SSH remotes allow an explicit valid
-  SSH port, which does not change the HTTPS API origin. Query strings, fragments,
-  malformed paths, and unsupported schemes are rejected.
-- A configured host remains trusted when offline or when its token is invalid.
-  Subsequent API requests surface network or authorization errors in the pane;
-  discovery never hides a repo because an authentication check failed.
-- A successful read replaces the map, so manual refresh picks up logins and
-  removals. An empty file, empty mapping, or missing file is a successful empty
-  configuration and produces only github.com.
-- An unreadable file, malformed YAML, or invalid mapping preserves a copy of
-  `previous`; at startup with no previous map, fall back to github.com. These
-  failures never raise or erase a previously discovered enterprise host. The
-  runtime passes its current map on manual refresh and atomically publishes the
-  result for both refresh and direct handlers.
-- Discovery works without an installed `gh` binary if its configuration remains
-  available. `GH_AUTH_TIMEOUT` still bounds token-resolution shell-outs only.
-
-`TokenEnvironment` gains `gh_config_hosts() -> list[str] | None`, beside the
-existing `gh_auth_token()`. An empty list means a successful empty configuration;
-`None` means a read or parse failure. This keeps discovery testable with fixture
-configuration and no real `gh`, network, or user credentials.
-
-### Remote matching
-
-`hosts.host_for_remote(url, trusted) -> GitHubHost | None` replaces the literal
-prefix list. It accepts these forms, because GHES installs commonly use them:
-
-```
-git@<host>:owner/repo.git
-https://<host>/owner/repo.git
-https://user@<host>/owner/repo
-ssh://git@<host>/owner/repo.git
-ssh://git@<host>:2222/owner/repo.git
-```
-
-`parse_owner_repo(url, trusted)` returns `(host, owner, repo)`. A remote on an
-untrusted host still returns `None`, so the existing benign-skip path is
-unchanged.
-
-## Per-host tokens
-
-`resolve_token(env, host)` follows gh's token-family precedence with an explicit
-host binding for enterprise environment tokens. A per-host HTTP client alone
-does not isolate a host-agnostic environment token.
-
-| Host kind | Order |
+| Target | Token resolution order |
 | --- | --- |
-| github.com | `GH_TOKEN` -> `GITHUB_TOKEN` -> `gh auth token -h github.com` |
-| GHES matching canonical `GH_HOST` | `GH_ENTERPRISE_TOKEN` -> `GITHUB_ENTERPRISE_TOKEN` -> stored gh token |
-| Other GHES | stored gh token only, via `gh auth token --hostname <host>` |
+| github.com | `GH_TOKEN`, `GITHUB_TOKEN`, stored gh token |
+| GHES matching canonical `GH_HOST` | `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, stored gh token |
+| Other GHES | stored gh token only |
 
-`GH_HOST` is an existing gh environment variable, not a new plugin setting.
-Without it, enterprise environment tokens are ignored, even with just one
-configured server. This prevents changes to discovery from moving a credential
-to a different server. To use an environment token, set `GH_HOST` to its server.
+Enterprise environment variables hold a single token, so requiring an explicit
+`GH_HOST` binding prevents broadcasting that credential to multiple servers.
+The server must also be registered in `hosts.yml`. Tokens resolve per host on
+each refresh, so rotations take effect without restarting the worker.
 
-`gh auth token` gains `--hostname <host>`. The subprocess receives a copy of
-the environment with all four token variables removed: otherwise gh itself
-would re-read the unbound environment token and defeat this rule. Configuration
-and keyring credentials stay per host. stderr is not included in auth errors
-because a failed helper could echo a credential. Tokens resolve once per refresh per
-host and are held in a local dict for that refresh only. They are never written
-to disk and never put in the snapshot. Unlike the trusted-host map, tokens are
-NOT cached for the worker's lifetime: a token can expire or rotate, and the
-per-refresh resolve is what today's code already does.
+Stored credentials are read with `gh auth token --hostname <host>`. Strip all
+four token environment variables from the subprocess environment so gh cannot
+reintroduce an unbound token. Retain the existing token-resolution timeout.
+Never log helper stderr, persist tokens or include them in snapshots.
 
-`errors.py` needs the host in its hints. `NoTokenNoGhError` and
-`GhNotAuthenticatedError` currently suggest `gh auth login`, which is wrong
-advice for a GHES host. Both gain a host field, so the hint reads
-`gh auth login --hostname github.mycorp.com` and names `GH_ENTERPRISE_TOKEN`
-instead of `GITHUB_TOKEN`, with the matching `GH_HOST` binding.
+Each host gets its own HTTP client and Authorization header. Disable redirects
+and reject off-origin or userinfo-bearing absolute REST URLs. Post GraphQL to
+the absolute per-host endpoint: joining `/graphql` onto GHES's REST base would
+incorrectly target `/api/v3/graphql`. Login/error hints identify the target host
+and applicable token family; dotcom guidance explains `GH_TOKEN` precedence.
 
-### Accepted behaviour change
+## Refresh, state and UI
 
-Today a user with only `GITHUB_TOKEN` set gets that token for every repo. After
-this change that token no longer applies to a GHES host. Such a user sees the
-GHES repo degrade to the unauthenticated open-PR view, with a host-specific
-login hint. Enterprise environment tokens additionally require `GH_HOST`; use
-`gh auth login --hostname <host>` for credentials for multiple servers.
+Network identity is `(host, owner, repo, branch)`. ETags, rich GraphQL caches,
+retry cooldowns, REST/GraphQL backoff and budget observations are partitioned by
+host. One host's low budget stretches only its own freshness intervals. Shared
+state is protected by the existing cache lock.
 
-## Partitioning the refresh
+Honor usable host `workspace_repos` metadata, including its session branch;
+otherwise retain shallow checkout discovery. Local identity deduplication uses
+the checkout's real path and branch override, preserving separate sessions that
+share a source checkout but query different branches.
 
-`RepoKey` becomes `(host_name, owner, repo, branch)`. `RichCacheKey` gains the
-same leading element. That one change carries `_etag_cache`, `_graphql_cache`,
-and `_retry_cooldown` across, because the host is now part of every lookup.
+Fetch host groups on up to four workers, each with its own token and client.
+REST retains bounded concurrency; GraphQL stays serial within each host to
+respect secondary limits. Collect results deterministically in sorted host
+order. Healthy hosts can start requests while another host is offline, though
+the combined snapshot waits for all groups to finish.
 
-- `_identify` returns the host with the repo string.
-- `entry["branch"]` reads `key[3]`, not `key[2]`.
-- The pane selection key includes the host as well as owner/repo/PR number, so
-  identical PR numbers on different servers remain independently selectable.
+Snapshots use version 2, repo records include `host`, and authentication is
+`auth: {host: {present: bool}}`. Ignore older disk snapshots and rebuild on the
+first refresh; in-memory caches rebuild at worker startup. Tokens never enter
+either cache format.
 
-`_fetch_all` groups keys by `key[0]` and fetches host groups on a bounded
-pool of up to four workers. Each worker resolves that host's token, creates its own
-`GitHubClient`, and runs the existing rich or basic pipeline. Host workers
-return results and token-presence flags; only the collecting thread merges
-them, in sorted host order for determinism.
+PR selection keys include the host as well as owner/repo/PR number. Auth notices
+follow the selected repo's host, including repos without PRs. Single-host
+rate-limit notices name that host and budget; multi-host notices use aggregate
+wording. The one-shot rate-limit notification remains global. Compare links use
+`host.web_base`; PR links retain the server's absolute URLs.
 
-Within a host, `_fetch_rich`, `_probe_all`, `_fetch_chunk`, and the digest tier
-retain their pipeline and existing REST concurrency; GraphQL stays serialized.
-They pass the host through cache-key unpacking, backoff checks, budget
-observations, and freshness calculations. Healthy hosts can begin requests while
-another host is offline. The combined snapshot still waits for all groups.
+## Validation and limits
 
-`token_present` becomes a per-host map rather than one boolean.
+Offline tests cover discovery failures and rereads, canonicalization and remote
+forms, two-GHES credential isolation, subprocess token stripping, request origin
+checks, cache/backoff/budget isolation, session branch overrides, and UI host
+selection and hints. HTTP tests use `httpx.MockTransport`, never real credentials
+or a live GHES server. Existing partial GraphQL error handling remains in place.
 
-### Backoff and budget pacing must become per host
-
-`_backoff` is a module dict with the fixed keys `rest`, `graphql`, and
-`notified`. Today a github.com rate limit would also gate GHES polling, which is
-wrong: the two budgets are unrelated, and a GHES install often has a far larger
-one. So `_backoff` nests one level, `_backoff[host_name][api]`, created on
-demand. `_set_backoff` and `_active_backoff_locked` take a host.
-
-Partition `_graphql_budget` as well: `_graphql_budget[host_name]` holds that
-host's `remaining` and `valid_until`, created on demand under `_cache_lock`.
-`_observe_rate_limit` and `_budget_multiplier` take the host, as do
-`_digest_stale` and `_full_stale`. Thread the host through every rich and digest
-query observation and every freshness check. An expired observation clears only
-that host's budget; a host with no observation uses multiplier 1.
-
-The existing multiplier of 4 below 1,000 remaining points applies only to the
-host that reported that budget. A low-budget host must not stretch another
-host's refresh intervals, and a healthy response from another host must not
-remove the depleted host's pacing. Adding the host to `RepoKey` alone does not
-partition this module-level state.
-
-A separate `notified` one-shot holder stays global, so the user still gets one message per
-window rather than one per host. When exactly one host is limited, the message
-names it.
-
-### Snapshot shape
-
-```python
-"auth": {"github.com":        {"present": True},
-         "github.mycorp.com": {"present": False}}
-
-"repos": [{"path": ..., "host": "github.mycorp.com", "repo": "api/core", ...}]
-```
-
-## Links and the pane
-
-PR links need no change. REST `html_url` and GraphQL `url` are absolute URLs the
-server returns, so a GHES PR already arrives with a GHES link. The
-`github_pr_badge` href and the `open_pr` client command therefore work on GHES
-with no edit.
-
-The direct handlers (`github.status`, `github.open`) receive the trusted map
-from the runtime object, the same one the refresh path uses, so a GHES checkout
-resolves identically on both paths.
-
-One link in the codebase is built by hand, `handlers.py:131`. It takes
-`host.web_base`:
-
-```python
-f"{host.web_base}/{owner}/{repo}/compare/{quoted}?expand=1"
-```
-
-`uistate` reads the selected PR's repo record, looks up that host in the `auth`
-map, and warns only when that host lacks a token:
-
-```
-No token for github.mycorp.com: showing open PRs only.
-Run: gh auth login --hostname github.mycorp.com
-```
-
-For github.com the wording keeps today's `GITHUB_TOKEN` and `gh auth login`
-hint, so nothing regresses for existing users.
-
-The summary strings in `handlers.py` change from "not a github.com remote" to
-"not a GitHub remote", because the host is no longer fixed.
-
-## Testing
-
-Test-driven, module by module, against the current green baseline of 260 tests.
-`uv run pytest` is the command. No test touches the network or a real `gh`.
-
-The security test goes in first, because it justifies the whole design:
-
-- **Token isolation.** github.com and TWO GHES hosts in one refresh through
-  `httpx.MockTransport`, with the same owner/repo/branch on each. Assert each
-  request carries only its own token. Include a shared enterprise environment
-  token bound to one server by `GH_HOST`, the unbound case, and the real
-  subprocess environment to prove gh cannot reintroduce a shared token.
-
-Then, per module:
-
-- `test_hosts.py`: URL derivation for both constructors; remote parsing for
-  `git@`, `https://`, `https://user@`, `ssh://`, and a `:port` form; an
-  untrusted host returns `None`. Include canonicalization, localhost, and
-  `*.ghe.com` fixtures, which must never be classified as GHES.
-- `test_auth.py`: both token tables; `--hostname` is passed; each hint names the
-  right variable and the right `gh auth login` form for its host kind.
-- `test_client.py`: GraphQL posts to the absolute `graphql_url`; REST joins onto
-  `/api/v3`.
-- Discovery: fixture `hosts.yml` files cover configuration-directory precedence,
-  multiple hosts, invalid hostname keys, empty/missing files, malformed YAML,
-  and read failures. Verify failed rereads retain the previous map, successful
-  reads apply additions/removals, and startup failures fall back to github.com.
-  Assert discovery never invokes a subprocess or network request: with one
-  offline/VPN-only host configured, every configured host is still discovered
-  on a cold start. Include invalid credentials and an absent `gh` binary.
-- `test_refresh.py`: cache keys separate two hosts that share an
-  `owner/repo/branch`; a rate-limit trip on one host does not gate the other.
-  In one refresh, give host A 100 remaining GraphQL points and host B 5,000;
-  verify only A's digest and full-refresh intervals stretch by 4, regardless of
-  observation order. Reset A's observation and verify B's budget is untouched;
-  a host with no observation keeps multiplier 1.
-- `test_gitctx.py` and `test_handlers.py`: both change, because
-  `parse_owner_repo` changes shape and the handlers take the trusted map. The
-  handlers' tests cover a GHES checkout end to end: `github.status` summary and
-  the `github.open` compare URL built from `host.web_base`.
-- `test_uistate.py`: the note fires only for the selected PR's host, and its
-  hint matches that host's kind. Before the pane work starts, grep for every
-  reader of the snapshot's `auth` key and update each in the same change: the
-  version gate in `load_snapshot` protects the disk cache, not in-memory
-  consumers inside the release.
-- A GHES-style partial GraphQL error on `mergeable`, proving the existing
-  `_error_aliases` and `_fallback_pulls` path already covers an older GHES
-  schema. No schema probing is added.
-
-## Compatibility
-
-`load_snapshot` accepts any dict with a `sessions` list, and its docstring states
-that no version envelope is needed. That is no longer true: an old cached
-snapshot has `auth: {"present": bool}` and repo records with no `host`. The
-snapshot therefore gains `"version": 2`, and `load_snapshot` ignores any other
-value. The cost is one cold refresh after upgrade, which is what a fresh install
-already does.
-
-The in-memory caches need no migration, because the worker rebuilds them on
-start.
-
-## Host capability verification
-
-Checked the host's `aoe-plugin-api/src/capability.rs` and `src/plugin/sandbox.rs`:
-`net` is a named capability, without a hostname allowlist, and `NoSandbox`
-preserves the worker launch environment. The plugin uses direct httpx requests;
-there is no api.github.com-only proxy in this path. Existing `net` authorization
-covers trusted GHES endpoints; the manifest capability list does not change.
-
-## Out of scope
-
-- No GitHub Cloud tenancy (`*.ghe.com`), localhost, IP-literal servers, or custom
-  HTTPS ports in this GHES release. These need separate endpoint/token design.
-- No new plugin setting. Discovery is automatic, so the manifest's settings list
-  is untouched.
-- No new host RPC. Discovery reads gh's local configuration in the worker,
-  alongside its existing local git and snapshot reads.
-- No GraphQL schema probing for older GHES versions. The existing partial-error
-  tolerance handles it.
-- No GitHub App or OAuth device-flow work. Token sources stay as they are.
-
-## Docs to update
-
-- `pyproject.toml` and `uv.lock`: add PyYAML for safe configuration parsing.
-- `aoe-plugin.toml`: the `net` capability comment names `api.github.com`.
-- `README.md` lines 80 and 81: "null outside a github.com checkout" becomes
-  "outside a trusted GitHub host".
-- `README.md`: a short GHES section covering discovery and the two enterprise
-  token variables and the required `GH_HOST` binding.
+No new plugin setting, host RPC, login flow, GitHub App integration or schema
+probing is introduced. The host's existing `net` capability covers direct GHES
+requests without a hostname allowlist. Custom HTTPS ports, IP-literal servers,
+localhost and GitHub Cloud tenancy require a separate endpoint/token design.

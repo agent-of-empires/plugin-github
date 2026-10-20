@@ -78,6 +78,9 @@ REQUIRED_CHECKS_SETTING_KEY = "ci_required_checks_only"
 # manifest default, used when the host does not answer config.get.
 IGNORED_COMMENTERS_SETTING_KEY = "ignored_commenters"
 DEFAULT_IGNORED_COMMENTERS = "coderabbitai, codecov"
+# Off by default: a stale CHANGES_REQUESTED still reads "pushed since review"
+# (with an approval hint) even when another reviewer approved the current head.
+APPROVED_OVERRIDES_STALE_BLOCK_SETTING_KEY = "approved_overrides_stale_block"
 # The pane's PR selector fires this with the clicked row's `params` (`{"pr": key}`);
 # `uistate.SELECT_METHOD` is the same name on the block-building side.
 SELECT_PR_METHOD = uistate.SELECT_METHOD
@@ -220,9 +223,9 @@ class Runtime:
         # The most recent snapshot pushed, so a selection click can repaint without
         # a network round trip. None until the first push (cached replay or refresh).
         self._last_snapshot: dict[str, Any] | None = None
-        # Loop state, initialized in run(): the session-id set seen by the fast
-        # tick, the resolved poll interval, and the next-fire monotonic deadlines.
-        self._seen_ids: set[str] = set()
+        # Loop state, initialized in run(): the workspace topology seen by the
+        # fast tick, the resolved poll interval, and the next-fire deadlines.
+        self._seen_topology: dict[str, tuple[Any, ...]] = {}
         self._interval = 0
         # Enabled session-row chip categories; resolved from settings in run(),
         # all-on until then so the startup push is never accidentally empty.
@@ -231,6 +234,7 @@ class Runtime:
         self._show_status_text = True
         self._ignore_submodules = True
         self._required_checks_only = False
+        self._approved_overrides_stale_block = False
         self._ignored_commenters = graphql.parse_ignored_commenters(DEFAULT_IGNORED_COMMENTERS)
         self._next_network: float | None = None
         self._next_poll: float | None = None
@@ -447,6 +451,7 @@ class Runtime:
             self._ignore_submodules = self.resolve_ignore_submodules()
             self._required_checks_only = self.resolve_required_checks_only()
             self._ignored_commenters = self.resolve_ignored_commenters()
+            self._approved_overrides_stale_block = self.resolve_approved_overrides_stale_block()
             snapshot = refresh.build_snapshot(
                 sessions,
                 env=self.env,
@@ -456,6 +461,7 @@ class Runtime:
                     ignore_submodules=self._ignore_submodules,
                     required_checks_only=self._required_checks_only,
                     ignored_commenters=self._ignored_commenters,
+                    approved_overrides_stale_block=self._approved_overrides_stale_block,
                 ),
             )
             current_ids = self._push_snapshot(snapshot)
@@ -472,13 +478,14 @@ class Runtime:
                                 "params": {"slot": slot, "id": slot_id, "session_id": sid},
                             }
                         )
+                self._seen_topology = self._session_topology(sessions)
                 self.pushed_session_ids = current_ids
                 # Persist the full snapshot so the next worker start can repaint
                 # this data instantly instead of blocking on a cold refresh.
                 refresh.save_snapshot(snapshot)
             else:
                 # Scoped refresh: only the target was fetched, so an absence
-                # here means "not refreshed", not "vanished". Add what we pushed
+                # means "not refreshed", not "vanished". Add what was pushed
                 # and leave every other session's tracking and slots intact.
                 self.pushed_session_ids |= current_ids
             # A forced refresh that hit a rate limit carries a one-shot notice
@@ -494,6 +501,23 @@ class Runtime:
                         "params": _rate_limit_notify_params(notice),
                     }
                 )
+
+    @staticmethod
+    def _session_topology(sessions: list[dict[str, Any]]) -> dict[str, tuple[Any, ...]]:
+        """Fingerprint attached repositories so same-ID topology changes refresh."""
+        topology = {}
+        for session in sessions:
+            sid = session.get("id")
+            if not isinstance(sid, str):
+                continue
+            repos = session.get("workspace_repos")
+            attached = (
+                tuple((repo.get("source_path"), repo.get("branch")) for repo in repos if isinstance(repo, dict))
+                if isinstance(repos, list)
+                else ()
+            )
+            topology[sid] = (session.get("project_path"), attached)
+        return topology
 
     def resolve_interval(self) -> int:
         """Poll period in seconds. Precedence: the host-persisted
@@ -524,6 +548,11 @@ class Runtime:
     def resolve_required_checks_only(self) -> bool:
         return self._setting_bool(REQUIRED_CHECKS_SETTING_KEY, default=self._required_checks_only)
 
+    def resolve_approved_overrides_stale_block(self) -> bool:
+        return self._setting_bool(
+            APPROVED_OVERRIDES_STALE_BLOCK_SETTING_KEY, default=self._approved_overrides_stale_block
+        )
+
     def resolve_ignored_commenters(self) -> frozenset[str]:
         if self.stopped:
             return self._ignored_commenters
@@ -547,11 +576,10 @@ class Runtime:
         force: bool = False,
         only_session: str | None = None,
     ) -> None:
-        """Refresh, re-baseline the seen-id set, and push the network tick out.
-        A scoped refresh leaves other sessions in ``pushed_session_ids``, so the
-        re-baseline below still covers the whole tracked set."""
+        """Refresh and push the network tick out.
+        A scoped refresh leaves other sessions in ``pushed_session_ids``, so
+        tracking for other sessions and their UI slots remains intact."""
         self.run_refresh(sessions, force=force, only_session=only_session)
-        self._seen_ids = set(self.pushed_session_ids)
         if self._next_network is not None:
             self._next_network = time.monotonic() + self._interval + _network_jitter(self._interval)
 
@@ -567,8 +595,8 @@ class Runtime:
         if self._next_poll is not None and now >= self._next_poll:
             sessions = self.list_sessions(SESSION_LIST_TIMEOUT)
             if sessions is not None:
-                ids = {s["id"] for s in sessions if isinstance(s, dict) and isinstance(s.get("id"), str)}
-                if ids != self._seen_ids:
+                topology = self._session_topology(sessions)
+                if topology != self._seen_topology:
                     self._refresh_and_reset(sessions)
             self._next_poll = now + SESSION_POLL_SECS
         if self._next_network is not None and now >= self._next_network:
@@ -591,7 +619,6 @@ class Runtime:
             self.run_refresh(sessions)
         else:
             self.run_refresh()
-        self._seen_ids = set(self.pushed_session_ids)
         self._interval = self.resolve_interval()
         # interval 0 disables all background polling (startup + on github.refresh
         # still push); otherwise a fast local tick notices session changes and a

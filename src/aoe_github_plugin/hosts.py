@@ -108,8 +108,3 @@ def remote_parts(url: str) -> tuple[str, str, str] | None:
     if name is None or len(parts) != 2 or any(p in (".", "..") or not _REPO_PART.fullmatch(p) for p in parts):
         return None
     return name, parts[0], parts[1]
-
-
-def host_for_remote(url: str, trusted: dict[str, GitHubHost]) -> GitHubHost | None:
-    parts = remote_parts(url)
-    return trusted.get(parts[0]) if parts is not None else None

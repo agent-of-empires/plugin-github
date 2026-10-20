@@ -352,6 +352,19 @@ def drop_ignored_commenters(pull: dict[str, Any], ignored: frozenset[str]) -> di
     return {**pull, "review_state": "waiting"}
 
 
+def approve_over_stale_block(pull: dict[str, Any]) -> dict[str, Any]:
+    """``pull`` with ``changes-pushed`` upgraded to ``approved`` when another
+    reviewer approved the current head, for the ``approved_overrides_stale_block``
+    setting. GitHub still blocks the merge until the stale review is re-done or
+    dismissed. Returns a copy; a pull without ``reviewers`` is untouched."""
+    people = pull.get("reviewers")
+    if pull.get("review_state") != "changes-pushed" or not isinstance(people, list):
+        return pull
+    if any(isinstance(p, dict) and p.get("state") == "approved" for p in people):
+        return {**pull, "review_state": "approved"}
+    return pull
+
+
 def merge_state(pr: dict[str, Any]) -> str | None:
     """``conflicts`` when GitHub reports the PR head conflicts with its base, else
     ``None`` (no signal).
@@ -715,9 +728,9 @@ def review_summary(people: list[dict[str, str]]) -> str:
         return ""
     if any(p["state"] == "changes-requested" for p in people):
         return "changes requested"
-    if any(p["state"] == "changes-pushed" for p in people):
-        return "pushed since review"
     approved = sum(1 for p in people if p["state"] == "approved")
+    if any(p["state"] == "changes-pushed" for p in people):
+        return f"pushed since review, {approved} approved" if approved else "pushed since review"
     if approved == len(people):
         return f"{approved} approved" if approved != 1 else "1 approved"
     if approved:

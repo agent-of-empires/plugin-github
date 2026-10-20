@@ -178,6 +178,7 @@ def test_pane_leads_with_a_pr_selector_and_folds_repos_without_prs():
     assert [r["prefix"] for r in selector] == ["#9"]
     assert selector[0]["label"] == "Add x"
     assert selector[0]["href"] == "https://github.com/o/r/pull/9"
+    assert selector[0]["sublabel"] == "feature"
     # The only PR is selected by default, and clicking a row names it by key.
     assert selector[0]["selected"] is True
     assert selector[0]["method"] == uistate.SELECT_METHOD
@@ -1065,3 +1066,21 @@ def test_single_host_rate_limit_note_keeps_specific_wording(budget, expected):
     text = next(block["text"] for block in blocks if block.get("kind") == "note")
     assert text.startswith("a.corp:")
     assert expected in text
+
+
+def test_multi_repo_selector_disambiguates_equal_pr_numbers_and_targets_selection():
+    repos = [
+        _repo(name=name, repo=f"o/{name}", pulls=[{**_pull(), "url": f"https://github.com/o/{name}/pull/7"}])
+        for name in ("first", "second")
+    ]
+    params = uistate.snapshot_ui_state_params(
+        _snapshot(_session(repos=repos)), selected={"s1": "github.com/o/second#7"}
+    )
+    rows = [r for r in _rows(_pane(params)["payload"]["blocks"]) if r.get("method") == "github.select_pr"]
+    assert [r["params"]["pr"] for r in rows] == ["github.com/o/first#7", "github.com/o/second#7"]
+    assert [r["selected"] for r in rows] == [False, True]
+    assert [r["href"] for r in rows] == [
+        "https://github.com/o/first/pull/7",
+        "https://github.com/o/second/pull/7",
+    ]
+    assert all(repo["repo"] in row["sublabel"] for repo, row in zip(repos, rows, strict=True))

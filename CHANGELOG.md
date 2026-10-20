@@ -4,6 +4,22 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Features
+
+- Support GitHub Enterprise Server alongside github.com, using hosts registered
+  in GitHub CLI's `hosts.yml` and isolated credentials, caches and rate limits.
+
+### Compatibility
+
+- On github.com, `GH_TOKEN` now takes precedence over `GITHUB_TOKEN`, matching
+  GitHub CLI. If both are set, the plugin uses `GH_TOKEN`.
+- Enterprise environment tokens require a matching `GH_HOST` and a server
+  registered in `hosts.yml`. They never apply to other servers.
+- The snapshot cache moves to version 2; the first refresh after upgrading
+  rebuilds the old cache.
+
 ## [2.2.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.1) - 2026-10-16
 
 
