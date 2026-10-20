@@ -59,6 +59,10 @@ notification publish complete snapshots. Fetch failures or searches that exceed
 the 10-page, 50-results-per-page limit report `suggestions.error` and preserve
 the last good snapshot.
 
+Review histories are fetched chronologically in pages of up to 100 reviews (up
+to 10 pages per PR); exceeding that cap reports `suggestions.error` and preserves
+the last good snapshot.
+
 Configure `suggestion_criteria` (comma-separated `review_requested` and
 `changes_requested`), optional `suggestion_repositories` and
 `suggestion_organizations` scopes, and `suggestion_projects` (`owner/repo=project`

@@ -21,13 +21,14 @@ class FakeClient:
 
 def _pr(url="https://github.com/acme/widgets/pull/42", **overrides):
     pr = {
+        "id": "PR_kwDO42",
         "url": url,
         "number": 42,
         "title": "Fix widget",
         "body": "Please fix the widget",
         "repository": {"nameWithOwner": "acme/widgets"},
         "reviewRequests": {"nodes": [{"requestedReviewer": {"login": "me"}}]},
-        "reviews": {"nodes": []},
+        "reviews": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
         "commits": {"nodes": []},
     }
     pr.update(overrides)
@@ -84,7 +85,8 @@ def test_provider_uses_exact_mapping_and_builds_stable_task_not_source_instructi
 def test_overlapping_search_results_choose_highest_priority_eligible_criterion(review_oid, priority, expected):
     pr = _pr(
         reviews={
-            "nodes": [{"author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED", "commit": {"oid": review_oid}}]
+            "nodes": [{"author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED", "commit": {"oid": review_oid}}],
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
         },
         commits={"nodes": [{"commit": {"oid": "head"}}]},
     )
@@ -114,7 +116,8 @@ def test_overlapping_search_results_choose_highest_priority_eligible_criterion(r
 def test_single_search_result_does_not_invent_an_unmatched_criterion(criterion, review_oid, expected):
     pr = _pr(
         reviews={
-            "nodes": [{"author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED", "commit": {"oid": review_oid}}]
+            "nodes": [{"author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED", "commit": {"oid": review_oid}}],
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
         },
         commits={"nodes": [{"commit": {"oid": "head"}}]},
     )
@@ -124,6 +127,46 @@ def test_single_search_result_does_not_invent_an_unmatched_criterion(criterion, 
         pulls, criteria={"review_requested", "changes_requested"}, repos=set(), orgs=set(), mapping={}
     )
     assert [item["criterion"] for item in items] == expected
+
+
+@pytest.mark.parametrize(
+    ("newest_state", "expected"),
+    [("COMMENTED", "changes_requested"), ("DISMISSED", "review_requested")],
+)
+def test_review_history_paginates_before_classifying_latest_verdict(newest_state, expected):
+    pr = _pr(
+        reviews={
+            "nodes": [{"author": {"login": "reviewer"}, "state": newest_state, "commit": {"oid": "head"}}],
+            "pageInfo": {"hasNextPage": True, "endCursor": "review-page-2"},
+        },
+        commits={"nodes": [{"commit": {"oid": "head"}}]},
+    )
+    client = FakeClient(
+        [
+            {"data": {"search": {"nodes": [pr], "pageInfo": {"hasNextPage": False}}}},
+            {
+                "data": {
+                    "node": {
+                        "reviews": {
+                            "nodes": [
+                                {
+                                    "author": {"login": "reviewer"},
+                                    "state": "CHANGES_REQUESTED",
+                                    "commit": {"oid": "head"},
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": "review-page-3"},
+                        }
+                    }
+                }
+            },
+        ]
+    )
+
+    pulls = suggestions.discover_review_requests(client, criteria={"changes_requested"}, repos=set(), orgs=set())
+
+    assert suggestions._review_state(pulls[0]) == expected
+    assert client.variables[1] == {"id": "PR_kwDO42", "after": "review-page-2"}
 
 
 @pytest.mark.parametrize(
@@ -163,6 +206,47 @@ def test_search_pagination_cap_rejects_incomplete_snapshot():
         suggestions.discover_review_requests(client, criteria={"changes_requested"}, repos=set(), orgs=set())
 
     assert len(client.variables) == suggestions.MAX_PAGES
+
+
+def test_review_history_pagination_cap_rejects_incomplete_snapshot():
+    pr = _pr(reviews={"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": "review-page-2"}})
+    review_pages = [
+        {
+            "data": {
+                "node": {
+                    "reviews": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": True, "endCursor": f"review-page-{page + 3}"},
+                    }
+                }
+            }
+        }
+        for page in range(suggestions.MAX_PAGES - 1)
+    ]
+    client = FakeClient([{"data": {"search": {"nodes": [pr], "pageInfo": {"hasNextPage": False}}}}, *review_pages])
+
+    with pytest.raises(RuntimeError, match="complete pagination limit"):
+        suggestions.discover_review_requests(client, criteria={"review_requested"}, repos=set(), orgs=set())
+
+    assert len(client.variables) == suggestions.MAX_PAGES
+
+
+def test_failed_review_history_pagination_never_returns_partial_snapshot():
+    pr = _pr(
+        reviews={
+            "nodes": [],
+            "pageInfo": {"hasNextPage": True, "endCursor": "review-page-2"},
+        }
+    )
+    client = FakeClient(
+        [
+            {"data": {"search": {"nodes": [pr], "pageInfo": {"hasNextPage": False}}}},
+            {"errors": [{"message": "rate limited"}]},
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete pull request review history"):
+        suggestions.discover_review_requests(client, criteria={"review_requested"}, repos=set(), orgs=set())
 
 
 def test_failed_pagination_never_returns_partial_snapshot():
@@ -286,7 +370,8 @@ def test_worker_snapshot_and_config_error_round_trip_retains_last_good(monkeypat
     queries = []
     pr = _pr(
         reviews={
-            "nodes": [{"author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED", "commit": {"oid": "old-head"}}]
+            "nodes": [{"author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED", "commit": {"oid": "old-head"}}],
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
         },
         commits={"nodes": [{"commit": {"oid": "head"}}]},
     )

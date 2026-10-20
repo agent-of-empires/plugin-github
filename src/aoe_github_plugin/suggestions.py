@@ -20,12 +20,29 @@ query($query: String!, $after: String) {
     pageInfo { hasNextPage endCursor }
     nodes {
       ... on PullRequest {
+        id
         number title body url state isDraft updatedAt
         repository { nameWithOwner }
         author { login }
         reviewRequests(first: 50) { nodes { requestedReviewer { ... on User { login } ... on Team { name } } } }
-        reviews(last: 20) { nodes { author { login } state commit { oid } } }
+        reviews(first: 100, orderBy: { field: CREATED_AT, direction: DESC }) {
+          nodes { author { login } state commit { oid } }
+          pageInfo { hasNextPage endCursor }
+        }
         commits(last: 1) { nodes { commit { oid } } }
+      }
+    }
+  }
+}
+"""
+
+_PULL_REQUEST_REVIEWS_QUERY = """
+query($id: ID!, $after: String) {
+  node(id: $id) {
+    ... on PullRequest {
+      reviews(first: 100, after: $after, orderBy: { field: CREATED_AT, direction: DESC }) {
+        nodes { author { login } state commit { oid } }
+        pageInfo { hasNextPage endCursor }
       }
     }
   }
@@ -77,6 +94,39 @@ def _review_state(pr: dict[str, Any]) -> str:
     return "review_requested"
 
 
+def _complete_review_history(client: GitHubClient, pull_request: dict[str, Any]) -> dict[str, Any]:
+    review_connection = pull_request.get("reviews")
+    if not isinstance(review_connection, dict) or not isinstance(review_connection.get("nodes"), list):
+        raise TypeError("GitHub returned an invalid pull request review history")
+    reviews = list(review_connection["nodes"])
+    page_info = review_connection.get("pageInfo")
+    if not isinstance(page_info, dict) or not isinstance(page_info.get("hasNextPage"), bool):
+        raise TypeError("GitHub returned an invalid pull request review history")
+    pull_request_id = pull_request.get("id")
+    pages = 1
+    while page_info["hasNextPage"]:
+        if pages >= MAX_PAGES:
+            raise RuntimeError("GitHub review history exceeded the complete pagination limit")
+        cursor = page_info.get("endCursor")
+        if not isinstance(pull_request_id, str) or not isinstance(cursor, str):
+            raise TypeError("GitHub returned an invalid pull request review history cursor")
+        envelope = client.post_graphql(_PULL_REQUEST_REVIEWS_QUERY, {"id": pull_request_id, "after": cursor})
+        if envelope.get("errors"):
+            raise RuntimeError("GitHub returned incomplete pull request review history")
+        data = envelope.get("data")
+        node = data.get("node") if isinstance(data, dict) else None
+        next_connection = node.get("reviews") if isinstance(node, dict) else None
+        if not isinstance(next_connection, dict) or not isinstance(next_connection.get("nodes"), list):
+            raise TypeError("GitHub returned an invalid pull request review history")
+        page_info = next_connection.get("pageInfo")
+        if not isinstance(page_info, dict) or not isinstance(page_info.get("hasNextPage"), bool):
+            raise TypeError("GitHub returned an invalid pull request review history")
+        reviews.extend(next_connection["nodes"])
+        pages += 1
+    reviews.reverse()
+    return {**pull_request, "reviews": {"nodes": reviews}}
+
+
 def discover_review_requests(  # noqa: C901
     client: GitHubClient,
     *,
@@ -112,7 +162,10 @@ def discover_review_requests(  # noqa: C901
                 if isinstance(node, dict) and node.get("url"):
                     prior = all_items.get(node["url"])
                     if prior is None:
-                        all_items[node["url"]] = {**node, "_matched_criteria": {criterion}}
+                        all_items[node["url"]] = {
+                            **_complete_review_history(client, node),
+                            "_matched_criteria": {criterion},
+                        }
                     else:
                         prior["_matched_criteria"].add(criterion)
             info = search.get("pageInfo") or {}
