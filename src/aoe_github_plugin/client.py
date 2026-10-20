@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from aoe_github_plugin.hosts import GitHubHost
 from aoe_github_plugin.errors import ApiError
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import NetworkError
@@ -22,7 +23,6 @@ from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.errors import UnauthorizedError
 from aoe_github_plugin.errors import InsufficientScopeError
 
-DEFAULT_GITHUB_API_BASE = "https://api.github.com"
 DEFAULT_USER_AGENT = "agent-of-empires-github-plugin"
 DEFAULT_TIMEOUT = 10.0
 
@@ -37,22 +37,22 @@ def _body_message(body: str) -> str:
     return ""
 
 
-def classify_status(status: int, headers: Any, body: str) -> GitHubError:
+def classify_status(status: int, headers: Any, body: str, host: GitHubHost | None = None) -> GitHubError:
     """Map a non-2xx GitHub response to a typed error.
 
     ``headers`` is anything with a case-insensitive ``.get(name)`` (an
     ``httpx.Headers`` in production); ``body`` is the response text.
     """
     if status == 401:
-        return UnauthorizedError()
+        return UnauthorizedError(host)
     if status in (403, 429):
         remaining = headers.get("X-RateLimit-Remaining")
         if status == 429 or remaining == "0" or "rate limit" in body.lower():
-            return RateLimitedError()
+            return RateLimitedError(host)
         # A 403 that is not rate limiting is a missing OAuth scope. GitHub
         # echoes the scopes the token would need in this header when relevant.
         accepted = headers.get("X-Accepted-OAuth-Scopes") or "repo"
-        return InsufficientScopeError(accepted.strip() or "repo")
+        return InsufficientScopeError(accepted.strip() or "repo", host)
     if status == 404:
         return NotFoundError(_body_message(body) or "resource")
     return ApiError(status, _body_message(body) or body[:200])
@@ -70,11 +70,12 @@ class GitHubClient:
     def __init__(
         self,
         token: str | None = None,
-        api_base: str = DEFAULT_GITHUB_API_BASE,
+        host: GitHubHost | None = None,
         user_agent: str = DEFAULT_USER_AGENT,
         timeout: float = DEFAULT_TIMEOUT,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        self.host = host or GitHubHost.dotcom()
         headers = {
             "Accept": "application/vnd.github+json",
             "User-Agent": user_agent,
@@ -83,7 +84,8 @@ class GitHubClient:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         self._client = httpx.Client(
-            base_url=api_base.rstrip("/"),
+            base_url=self.host.rest_base,
+            follow_redirects=False,
             headers=headers,
             timeout=timeout,
             transport=transport,
@@ -98,23 +100,30 @@ class GitHubClient:
     def close(self) -> None:
         self._client.close()
 
+    def _check_origin(self, path: str) -> None:
+        url = self._client.base_url.join(path)
+        base = self._client.base_url
+        if (url.scheme, url.host, url.port) != (base.scheme, base.host, base.port) or url.userinfo:
+            raise ApiError(400, "Request URL is outside this GitHub host's API origin")
+
     def get_json(self, path: str, params: dict[str, str] | None = None) -> Any:
         """GET ``path`` (relative to the API base, or an absolute URL), return
         parsed JSON. Raises a typed ``GitHubError`` subclass on any failure.
         """
         try:
+            self._check_origin(path)
             resp = self._client.get(path, params=params)
         except httpx.RequestError as exc:
             raise NetworkError(exc) from exc
         if not resp.is_success:
-            raise classify_status(resp.status_code, resp.headers, resp.text)
+            raise classify_status(resp.status_code, resp.headers, resp.text, self.host)
         try:
             return resp.json()
         except ValueError as exc:
             raise ApiError(200, f"could not decode response: {exc}") from exc
 
     def post_graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
-        """POST a GraphQL query to ``/graphql`` and return the parsed envelope
+        """POST a GraphQL query to the host's absolute ``graphql_url`` and return the parsed envelope
         (``{"data": ..., "errors": ...}``). Raises a typed ``GitHubError`` on a
         transport/HTTP failure (4xx/5xx, including the 401 a missing/invalid
         token yields). Partial GraphQL errors (a 200 carrying both ``data`` and
@@ -122,11 +131,11 @@ class GitHubClient:
         unresolvable sub-resource never blanks the whole PR.
         """
         try:
-            resp = self._client.post("/graphql", json={"query": query, "variables": variables})
+            resp = self._client.post(self.host.graphql_url, json={"query": query, "variables": variables})
         except httpx.RequestError as exc:
             raise NetworkError(exc) from exc
         if not resp.is_success:
-            raise classify_status(resp.status_code, resp.headers, resp.text)
+            raise classify_status(resp.status_code, resp.headers, resp.text, self.host)
         try:
             data = resp.json()
         except ValueError as exc:
@@ -152,13 +161,14 @@ class GitHubClient:
         """
         headers = {"If-None-Match": etag} if etag else None
         try:
+            self._check_origin(path)
             resp = self._client.get(path, params=params, headers=headers)
         except httpx.RequestError as exc:
             raise NetworkError(exc) from exc
         if resp.status_code == 304:
             return 304, etag, None
         if not resp.is_success:
-            raise classify_status(resp.status_code, resp.headers, resp.text)
+            raise classify_status(resp.status_code, resp.headers, resp.text, self.host)
         try:
             return 200, resp.headers.get("ETag"), resp.json()
         except ValueError as exc:

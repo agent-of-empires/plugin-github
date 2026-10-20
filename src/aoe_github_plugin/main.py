@@ -45,6 +45,10 @@ from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
 from aoe_github_plugin import uistate
 from aoe_github_plugin import handlers
+from aoe_github_plugin.auth import TokenEnvironment
+from aoe_github_plugin.auth import SystemEnvironment
+from aoe_github_plugin.hosts import GitHubHost
+from aoe_github_plugin.hosts import discover_trusted_hosts
 from aoe_github_plugin.utils.rpc import error_response
 from aoe_github_plugin.utils.rpc import result_response
 
@@ -127,16 +131,22 @@ def _send(message: dict[str, Any]) -> None:
         sys.stdout.flush()
 
 
-def dispatch(method: str, params: dict[str, Any]) -> Any:
+def dispatch(
+    method: str,
+    params: dict[str, Any],
+    *,
+    trusted: dict[str, GitHubHost] | None = None,
+    env: TokenEnvironment | None = None,
+) -> Any:
     """Return the result for a single-path host request, or raise.
     ``LookupError`` signals an unknown method; ``errors.GitHubError`` carries an
     actionable hint. ``github.refresh`` only acknowledges here -- the actual
     aggregate refresh is scheduled by the runtime (see ``Runtime.handle_inbound``).
     """
     if method == "github.status":
-        return handlers.github_status(_checkout_path(params))
+        return handlers.github_status(_checkout_path(params), trusted=trusted, env=env)
     if method == "github.open":
-        return handlers.github_open(_checkout_path(params))
+        return handlers.github_open(_checkout_path(params), trusted=trusted, env=env)
     if method == "github.refresh":
         return {"accepted": True}
     if method == SELECT_PR_METHOD:
@@ -170,6 +180,8 @@ def _rate_limit_notify_params(notice: dict[str, Any]) -> dict[str, Any]:
         params["body"] = f"Resets in ~{minutes}m ({reset_at.strftime('%H:%M')})."
     else:
         params["body"] = "GitHub rate limit hit; showing cached data. Retrying shortly."
+    if notice.get("host"):
+        params["title"] = f"GitHub rate limited: {notice['host']}"
     return params
 
 
@@ -187,7 +199,9 @@ class Runtime:
     RPC correlation, and the periodic refresh. The reader thread is the only
     stdin reader; everything here runs on the main thread."""
 
-    def __init__(self, send: Sink = _send, stdin: Any = None) -> None:
+    def __init__(self, send: Sink = _send, stdin: Any = None, env: TokenEnvironment | None = None) -> None:
+        self.env = env or SystemEnvironment()
+        self.trusted_hosts = discover_trusted_hosts(self.env)
         self.send = send
         self.stdin = stdin if stdin is not None else sys.stdin
         self.inbox: queue.Queue[Any] = queue.Queue()
@@ -273,7 +287,7 @@ class Runtime:
         params = msg.get("params") or {}
         msg_id = msg.get("id")
         try:
-            result = dispatch(method, params)
+            result = dispatch(method, params, trusted=self.trusted_hosts, env=self.env)
         except Exception as exc:  # noqa: BLE001 - any failure becomes a JSON-RPC error
             if isinstance(msg_id, int):
                 self.send(error_response(msg_id, exc))
@@ -425,6 +439,8 @@ class Runtime:
         additive (no prune), so refreshing one pane never removes another
         session's slots. Vanished-session cleanup stays the job of the full
         background refresh. A target no longer in the session list is a no-op."""
+        if force:
+            self.trusted_hosts = discover_trusted_hosts(self.env, self.trusted_hosts)
         if sessions is None:
             sessions = self.list_sessions()
         if sessions is None:
@@ -438,6 +454,8 @@ class Runtime:
             self._approved_overrides_stale_block = self.resolve_approved_overrides_stale_block()
             snapshot = refresh.build_snapshot(
                 sessions,
+                env=self.env,
+                trusted=self.trusted_hosts,
                 force=force,
                 settings=refresh.SnapshotSettings(
                     ignore_submodules=self._ignore_submodules,

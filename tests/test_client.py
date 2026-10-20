@@ -6,8 +6,10 @@ import httpx
 import pytest
 
 from aoe_github_plugin import errors
+from aoe_github_plugin.hosts import GitHubHost
 from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.client import classify_status
+from aoe_github_plugin.errors import GitHubError
 
 
 def test_401_unauthorized():
@@ -132,3 +134,48 @@ def test_conditional_error_still_classifies():
 
     with _client(handler) as client, pytest.raises(errors.RateLimitedError):
         client.get_json_conditional("/x")
+
+
+def test_ghes_rest_and_graphql_endpoints():
+
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, json={})
+
+    with GitHubClient(host=GitHubHost.enterprise("gh.corp"), transport=httpx.MockTransport(handler)) as client:
+        client.get_json("/repos/o/r/pulls")
+        client.post_graphql("query {}", {})
+    assert seen == ["https://gh.corp/api/v3/repos/o/r/pulls", "https://gh.corp/api/graphql"]
+
+
+def test_redirects_and_absolute_off_origin_urls_cannot_disclose_token():
+
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(302, headers={"Location": "https://evil.corp/token"})
+
+    with GitHubClient(token="private", transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GitHubError):
+            client.get_json("/redirect")
+        with pytest.raises(GitHubError):
+            client.get_json("https://evil.corp/token")
+        with pytest.raises(GitHubError):
+            client.get_json_conditional("https://evil.corp/token")
+    assert len(calls) == 1
+    assert calls[0].url.host == "api.github.com"
+
+
+def test_ghes_unauthorized_hint_names_matching_login():
+    with (
+        GitHubClient(
+            host=GitHubHost.enterprise("gh.corp"),
+            token="invalid",
+            transport=httpx.MockTransport(lambda _r: httpx.Response(401)),
+        ) as client,
+        pytest.raises(errors.UnauthorizedError, match=r"gh auth login --hostname gh\.corp"),
+    ):
+        client.get_json("/repos/o/r/pulls")
