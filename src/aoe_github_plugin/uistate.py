@@ -518,11 +518,12 @@ def _pr_signals(pull: dict[str, Any]) -> list[dict[str, Any]]:
     return signals
 
 
-def _pr_row(repo: dict[str, Any], pull: dict[str, Any], *, selected: bool) -> dict[str, Any]:
-    """One row of the pane's PR selector: number, title, the branch/author line,
-    and the signal strip. Clicking the row body re-points the pane's detail at that
-    PR; the trailing href stays a separate affordance so selecting never navigates
-    away."""
+def _pr_row(repo: dict[str, Any], pull: dict[str, Any], *, selected: bool, show_repo: bool = False) -> dict[str, Any]:
+    """One row of the pane's PR selector: title, branch/author, and signals.
+
+    Repository identity is included when multiple repos contribute PRs. Clicking
+    the row selects its detail; the trailing link remains a separate affordance.
+    """
     icon, tone, color = _pull_visual(pull)
     row: dict[str, Any] = {
         "kind": "row",
@@ -534,7 +535,10 @@ def _pr_row(repo: dict[str, Any], pull: dict[str, Any], *, selected: bool) -> di
         "params": {"pr": _pull_key(repo, pull)},
         "selected": selected,
     }
-    sublabel = " · ".join(str(x) for x in (repo.get("branch"), pull.get("author")) if x)
+    sublabel = " · ".join(
+        str(x) for x in ((repo.get("repo") if show_repo else None), repo.get("branch"), pull.get("author")) if x
+    )
+
     if sublabel:
         row["sublabel"] = sublabel
     signals = _pr_signals(pull)
@@ -1269,7 +1273,15 @@ def _pane_blocks(
         middle.append(
             {
                 "kind": "section",
-                "children": [_pr_row(repo, pull, selected=_pull_key(repo, pull) == chosen_key) for repo, pull in pulls],
+                "children": [
+                    _pr_row(
+                        repo,
+                        pull,
+                        selected=_pull_key(repo, pull) == chosen_key,
+                        show_repo=len({item.get("repo") for item, _ in pulls}) > 1,
+                    )
+                    for repo, pull in pulls
+                ],
             }
         )
         stack = _stack_section(*selection)
