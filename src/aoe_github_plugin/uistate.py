@@ -1078,6 +1078,8 @@ def _rate_limit_note(rate_limit: Any) -> dict[str, Any] | None:
     text = _RATE_LIMIT_NOTE_TEXT.get(key, _RATE_LIMIT_NOTE_TEXT["mixed"])
     if rate_limit.get("host"):
         text = f"{rate_limit['host']}: {text}"
+    elif isinstance(rate_limit.get("hosts"), list) and rate_limit["hosts"]:
+        text = _RATE_LIMIT_NOTE_TEXT["mixed"]
     return {"kind": "note", "tone": "warn", "text": text}
 
 

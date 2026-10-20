@@ -194,3 +194,11 @@ def test_failed_helper_cannot_echo_credentials_into_hints():
     with pytest.raises(errors.GhCommandFailedError) as exc:
         resolve_token(env)
     assert "secret-credential" not in str(exc.value)
+
+
+def test_unauthorized_hint_replaces_the_higher_priority_token():
+    env = FakeEnv(gh_token="stale", github_token="replacement")
+    assert resolve_token(env) == ("stale", "env:GH_TOKEN")
+    message = str(errors.UnauthorizedError())
+    assert "export GH_TOKEN=<token>" in message
+    assert "overrides GITHUB_TOKEN" in message

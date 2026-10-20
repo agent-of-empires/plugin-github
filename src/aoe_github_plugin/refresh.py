@@ -67,10 +67,12 @@ GIT_TIMEOUT = 2.0
 # rate-limit interaction, so it parallelizes freely; the REST conditional
 # probes are independent per key and 304s are free, but the pool stays small to
 # keep well under GitHub's ~100-concurrent secondary-limit guidance. GraphQL
-# chunks stay serial on purpose: post-#69 they are few and cheap, and they are
-# the piece the secondary limits actually watch (#22).
+# chunks stay serial within each host: post-#69 they are few and cheap, and
+# they are the piece the secondary limits actually watch (#22).
 GIT_WORKERS = 16
 REST_PROBE_WORKERS = 6
+# Keep independent hosts moving without creating one thread per configured server.
+HOST_FETCH_WORKERS = 4
 # Back off proactively once the GraphQL point budget (5000/hr) is nearly spent,
 # so a busy workspace degrades to stale data rather than hard rate-limit errors.
 RATELIMIT_FLOOR = 50
@@ -1026,26 +1028,34 @@ def _fetch_all(  # noqa: PLR0913 - explicit token, host, transport, and polling 
     keep the basic REST open-PR path and report ``token_present_by_host[host]=False`` so the UI
     can show the "token needed" banner. ``force`` (a manual refresh) bypasses the
     staleness gate on the token path. REST probes fan out on a small bounded
-    pool (#70); GraphQL is batched per repo and stays serialized (sorted for
-    determinism), to stay under GitHub's secondary/concurrency limits (#22);
+    pool (#70); a separate bounded pool fetches independent host groups
+    concurrently. GraphQL stays serialized within each host to respect its
+    secondary limits. Results are collected in sorted host order;
     none of this touches stdin or host RPCs."""
     results: dict[RepoKey, dict[str, Any]] = {}
     present: dict[str, bool] = {}
     by_host: dict[str, list[RepoKey]] = defaultdict(list)
     for key in sorted(keys):
         by_host[key[0]].append(key)
-    for host_name, ordered in sorted(by_host.items()):
+    if not by_host:
+        return results, present
+
+    def fetch_host(item: tuple[str, list[RepoKey]]) -> tuple[str, bool, dict[RepoKey, dict[str, Any]]]:
+        host_name, ordered = item
         host = trusted[host_name]
         token = _resolve_optional_token(env, host)
-        present[host_name] = token is not None
         with GitHubClient(host=host, token=token, transport=transport) as client:
             if token is not None:
-                results.update(_fetch_rich(client, ordered, force=force, required_checks_only=required_checks_only))
+                out = _fetch_rich(client, ordered, force=force, required_checks_only=required_checks_only)
             else:
                 with ThreadPoolExecutor(max_workers=REST_PROBE_WORKERS) as pool:
-                    results.update(
-                        zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True)
-                    )
+                    out = dict(zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True))
+        return host_name, token is not None, out
+
+    with ThreadPoolExecutor(max_workers=min(HOST_FETCH_WORKERS, len(by_host))) as hosts_pool:
+        for host_name, has_token, out in hosts_pool.map(fetch_host, sorted(by_host.items())):
+            present[host_name] = has_token
+            results.update(out)
     return results, present
 
 

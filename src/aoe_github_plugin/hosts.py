@@ -61,7 +61,7 @@ class GitHubHost:
     @property
     def token_hint(self) -> str:
         if self.kind == "dotcom":
-            return "export GITHUB_TOKEN=<token> (or GH_TOKEN)"
+            return "export GH_TOKEN=<token> (overrides GITHUB_TOKEN)"
         return f"export GH_HOST={self.name} GH_ENTERPRISE_TOKEN=<token> (or GITHUB_ENTERPRISE_TOKEN)"
 
 

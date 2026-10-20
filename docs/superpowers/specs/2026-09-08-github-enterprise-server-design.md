@@ -225,21 +225,17 @@ and `_retry_cooldown` across, because the host is now part of every lookup.
 - The pane selection key includes the host as well as owner/repo/PR number, so
   identical PR numbers on different servers remain independently selectable.
 
-`_fetch_all` gains one grouping layer around today's logic:
+`_fetch_all` groups keys by `key[0]` and fetches host groups on a bounded
+pool of up to four workers. Each worker resolves that host's token, creates its own
+`GitHubClient`, and runs the existing rich or basic pipeline. Host workers
+return results and token-presence flags; only the collecting thread merges
+them, in sorted host order for determinism.
 
-```python
-by_host = group keys by key[0]
-for host_name, host_keys in sorted(by_host.items()):
-    host  = trusted[host_name]
-    token = _resolve_optional_token(env, host)   # existing helper, gains host
-    with GitHubClient(host=host, token=token) as client:
-        results |= _fetch_rich(client, host_keys, ...)
-```
-
-Hosts are iterated in sorted order for determinism, matching how `ordered` is
-already sorted today. `_fetch_rich`, `_probe_all`, `_fetch_chunk`, and the digest
-tier retain their pipeline, but must pass the host through cache-key unpacking,
-backoff checks, budget observations, and freshness calculations.
+Within a host, `_fetch_rich`, `_probe_all`, `_fetch_chunk`, and the digest tier
+retain their pipeline and existing REST concurrency; GraphQL stays serialized.
+They pass the host through cache-key unpacking, backoff checks, budget
+observations, and freshness calculations. Healthy hosts can begin requests while
+another host is offline. The combined snapshot still waits for all groups.
 
 `token_present` becomes a per-host map rather than one boolean.
 

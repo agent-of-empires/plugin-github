@@ -17,6 +17,7 @@ import pytest
 
 from aoe_github_plugin import refresh
 from aoe_github_plugin.auth import TokenEnvironment
+from aoe_github_plugin.hosts import GitHubHost
 
 
 class _Env(TokenEnvironment):
@@ -1540,3 +1541,34 @@ def test_uncached_ghes_repo_under_rest_backoff_names_own_host(tmp_path):
     assert error["kind"] == "rate_limited"
     assert "gh auth login --hostname a.corp" in error["hint"]
     assert "GH_HOST=a.corp" in error["hint"]
+
+
+@pytest.mark.parametrize("authenticated", [False, True])
+def test_healthy_host_starts_fetching_while_enterprise_host_is_offline(authenticated):
+    public = GitHubHost.dotcom()
+    enterprise = GitHubHost.enterprise("a.corp")
+    keys = {(host.name, "o", "r", "feature") for host in (public, enterprise)}
+    healthy_started = threading.Event()
+    observed_concurrency = []
+
+    def handler(request):
+        if request.url.host == "a.corp":
+            observed_concurrency.append(healthy_started.wait(timeout=2))
+            raise httpx.ConnectError("enterprise server offline", request=request)
+        healthy_started.set()
+        if request.method == "POST":
+            return httpx.Response(200, json={"data": {"repository": _alias_repo(request, {"feature": [_gql_node(7)]})}})
+        return httpx.Response(200, json=[_pull(7)])
+
+    results, present = refresh._fetch_all(
+        keys,
+        _MultiHostEnv() if authenticated else _NoToken(),
+        httpx.MockTransport(handler),
+        trusted={host.name: host for host in (public, enterprise)},
+    )
+    assert observed_concurrency == [True]
+    assert results[("a.corp", "o", "r", "feature")]["error"]["kind"] == "network"
+    assert results[("github.com", "o", "r", "feature")]["pulls"][0]["number"] == 7
+    assert present == {"a.corp": authenticated, "github.com": authenticated}
+    assert list(present) == ["a.corp", "github.com"]
+    assert list(results) == sorted(keys)

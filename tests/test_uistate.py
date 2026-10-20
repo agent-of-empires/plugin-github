@@ -1045,3 +1045,23 @@ def test_ghes_auth_note_with_no_pulls():
     snap = {"version": 2, "sessions": [_session(repos=[repo])], "auth": {"gh.corp": {"present": False}}}
     blocks = _pane(uistate.snapshot_ui_state_params(snap))["payload"]["blocks"]
     assert any("No token for gh.corp" in b.get("text", "") for b in blocks)
+
+
+@pytest.mark.parametrize("budget", ["rest", "graphql"])
+def test_multi_host_rate_limit_note_uses_aggregate_wording(budget):
+    snapshot = _rate_limited_snapshot(budget)
+    snapshot["rate_limit"]["hosts"] = ["a.corp", "github.com"]
+    blocks = _pane(uistate.snapshot_ui_state_params(snapshot))["payload"]["blocks"]
+    text = next(block["text"] for block in blocks if block.get("kind") == "note")
+    assert "showing cached pull request data" in text
+    assert "still updates" not in text
+
+
+@pytest.mark.parametrize(("budget", "expected"), [("rest", "list may be stale"), ("graphql", "still updates")])
+def test_single_host_rate_limit_note_keeps_specific_wording(budget, expected):
+    snapshot = _rate_limited_snapshot(budget)
+    snapshot["rate_limit"]["host"] = "a.corp"
+    blocks = _pane(uistate.snapshot_ui_state_params(snapshot))["payload"]["blocks"]
+    text = next(block["text"] for block in blocks if block.get("kind") == "note")
+    assert text.startswith("a.corp:")
+    assert expected in text

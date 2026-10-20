@@ -123,8 +123,8 @@ session-less `github.refresh` cover every session and prune vanished ones:
 3. Resolve each checkout to `(host, owner, repo, branch)`, deduplicate (a branch shared
    across workspaces is fetched once), and look up its PRs. Local git identity
    and the REST lookups fan out on small bounded thread pools so a big workspace
-   set refreshes in seconds; GraphQL queries stay serial to stay clear of
-   GitHub's secondary/concurrency limits.
+   set refreshes in seconds; GraphQL queries stay serial within each host to
+   stay clear of GitHub's secondary/concurrency limits.
    With a token the per-branch lookup is a cheap REST conditional check
    first (see "Rate limits" below); only when that reports a change (or on a
    forced refresh, a cold cache, or a cheap digest query detecting a change past
@@ -400,7 +400,9 @@ Host names are lowercase with a trailing dot removed. HTTPS, scp-style SSH, and
 443; custom HTTPS ports, IP-literal servers, localhost, and GitHub Cloud tenancy
 hosts (`*.ghe.com`) are currently unsupported. Unconfigured servers are skipped.
 REST/GraphQL budgets, ETags, rich caches, and retry cooldowns are separate per
-host. A missing token produces a hint for the selected PR's server. Old disk
+host. Host groups fetch on a bounded pool, allowing independent servers to make
+requests concurrently. The combined snapshot is published after all groups
+finish. A missing token produces a hint for the selected PR's server. Old disk
 snapshots are discarded once on upgrade to the version 2 snapshot format.
 
 ## Releases
