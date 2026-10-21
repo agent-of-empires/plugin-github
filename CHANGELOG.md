@@ -9,6 +9,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 ### Features
 
 - **github:** Show merge-queue status and position in session status and PR details, with a GitHub queue link.
+- **github:** Add a `github_queue` filter facet (`queue:*` values) so sessions can be filtered or automated by merge-queue state.
 
 ### Bug Fixes
 

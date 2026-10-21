@@ -827,6 +827,7 @@ def test_snapshot_emits_global_filter_facets_on_the_status_column():
         "github_pr",
         "github_comments",
         "github_conflicts",
+        "github_queue",
     ]
     assert all("session_id" not in f for f in facets)
     assert all(f["payload"]["column"] == uistate.ROW_COLUMN_SLOT[1] for f in facets)
@@ -836,6 +837,7 @@ def test_snapshot_emits_global_filter_facets_on_the_status_column():
         "GitHub PR",
         "GitHub comments",
         "GitHub conflicts",
+        "GitHub merge queue",
     ]
     assert _facet(params, "github_ci")["payload"]["options"] == [
         {"value": "ci:passing", "label": "passing", "tone": "success"},
@@ -861,6 +863,13 @@ def test_snapshot_emits_global_filter_facets_on_the_status_column():
     assert _facet(params, "github_conflicts")["payload"]["options"] == [
         {"value": "conflicts:yes", "label": "conflicts", "tone": "danger"},
     ]
+    assert [o["value"] for o in _facet(params, "github_queue")["payload"]["options"]] == [
+        "queue:awaiting-checks",
+        "queue:locked",
+        "queue:mergeable",
+        "queue:queued",
+        "queue:unmergeable",
+    ]
 
 
 def test_column_filter_values_cover_every_facet_option():
@@ -875,7 +884,11 @@ def test_column_filter_values_cover_every_facet_option():
             for draft in (False, True):
                 pull = _rich_pull(review=review, checks={"state": cstate, "runs": []}, comments=comments, draft=draft)
                 emitted |= uistate._pull_filter_values(pull)
+    for state in [*uistate._QUEUE_VISUAL, "weird"]:
+        emitted |= uistate._pull_filter_values({**_rich_pull(), "merge_queue": {"state": state, "position": 1}})
     assert emitted == offered
+    assert not any(v.startswith("queue:") for v in uistate._pull_filter_values(_rich_pull()))
+    assert "queue:queued" in uistate._pull_filter_values({**_rich_pull(), "merge_queue": {"state": "weird"}})
 
 
 def test_column_shows_healthy_state_not_empty():

@@ -255,6 +255,10 @@ id = "github_comments"
 slot = "filter-facet"
 id = "github_conflicts"
 
+[[ui]]
+slot = "filter-facet"
+id = "github_queue"
+
 # Tier 1 worker: the executable the host spawns and supervises, speaking
 # ndjson JSON-RPC over stdio. The host requires the entrypoint to be
 # plugin-relative so the daemon's PATH never decides whether the worker
