@@ -4,6 +4,16 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Features
+
+- **github:** Show merge-queue status and position in session status and PR details, with a GitHub queue link.
+
+### Bug Fixes
+
+- **graphql:** Keep queued pull-request digest signatures aligned with full responses.
+
 ## [2.2.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.1) - 2026-10-16
 
 

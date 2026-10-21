@@ -174,18 +174,19 @@ FILTER_FACETS: tuple[tuple[str, dict[str, Any]], ...] = (
 # notable); "draft" is WIP.
 _ATTENTION_VISUAL: dict[str, tuple[int, str, str, str]] = {
     "error": (0, _ICON_ERROR, "danger", "error"),
-    "conflicts": (1, "triangle-alert", "danger", "conflicts"),
-    "changes-requested": (2, *_REVIEW_VISUAL["changes-requested"][:2], "changes requested"),
-    "checks-failing": (3, *_CHECK_VISUAL["failing"][:2], "CI failing"),
-    "unresolved": (4, "message-square", "warn", "unresolved comments"),
-    "checks-running": (5, *_CHECK_VISUAL["running"][:2], "CI running"),
-    "checks-queued": (6, *_CHECK_VISUAL["queued"][:2], "CI queued"),
-    "changes-pushed": (7, *_REVIEW_VISUAL["changes-pushed"][:2], "pushed since review"),
-    "awaiting-review": (8, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
-    "commented": (9, *_REVIEW_VISUAL["commented"][:2], "commented"),
-    "approved": (10, *_REVIEW_VISUAL["approved"][:2], "approved"),
-    "open": (11, _ICON_OPEN, "success", "open PR"),
-    "draft": (12, _ICON_DRAFT, "warn", "draft"),
+    "queue": (1, "git-merge", "info", "in merge queue"),
+    "conflicts": (2, "triangle-alert", "danger", "conflicts"),
+    "changes-requested": (3, *_REVIEW_VISUAL["changes-requested"][:2], "changes requested"),
+    "checks-failing": (4, *_CHECK_VISUAL["failing"][:2], "CI failing"),
+    "unresolved": (5, "message-square", "warn", "unresolved comments"),
+    "checks-running": (6, *_CHECK_VISUAL["running"][:2], "CI running"),
+    "checks-queued": (7, *_CHECK_VISUAL["queued"][:2], "CI queued"),
+    "changes-pushed": (8, *_REVIEW_VISUAL["changes-pushed"][:2], "pushed since review"),
+    "awaiting-review": (9, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
+    "commented": (10, *_REVIEW_VISUAL["commented"][:2], "commented"),
+    "approved": (11, *_REVIEW_VISUAL["approved"][:2], "approved"),
+    "open": (12, _ICON_OPEN, "success", "open PR"),
+    "draft": (13, _ICON_DRAFT, "warn", "draft"),
 }
 
 
@@ -208,6 +209,23 @@ _KIND_CATEGORY: dict[str, str] = {
 _ALL_CHIPS = frozenset(_KIND_CATEGORY.values())
 
 
+def _queue_label(pull: dict[str, Any]) -> tuple[str, str, str] | None:
+    queue = pull.get("merge_queue")
+    if not isinstance(queue, dict):
+        return None
+    state = queue.get("state")
+    labels = {
+        "awaiting-checks": ("loader", "info", "awaiting merge queue checks"),
+        "locked": ("lock-keyhole", "warn", "merge queue locked"),
+        "mergeable": ("git-merge", "success", "ready in merge queue"),
+        "queued": ("git-merge", "info", "in merge queue"),
+        "unmergeable": ("circle-x", "danger", "unmergeable in queue"),
+    }
+    if not isinstance(state, str):
+        return ("git-merge", "neutral", "in merge queue")
+    return labels.get(state, ("git-merge", "neutral", "in merge queue"))
+
+
 def _pull_attention(pull: dict[str, Any], chips: frozenset[str]) -> str:
     """The attention kind for one non-merged PR, in issue #36 priority order,
     skipping any kind whose category the user disabled (``chips``). The rich
@@ -216,9 +234,10 @@ def _pull_attention(pull: dict[str, Any], chips: frozenset[str]) -> str:
     basic view rather than mislabeling state it cannot see."""
     if pull.get("draft"):
         return "draft"
-    # A merge conflict is a hard blocker that no reviewer can clear, so it wins
-    # over the whole toggle ladder and is never user-suppressible (kept out of
-    # _KIND_CATEGORY, matched here before the ladder so it cannot KeyError).
+    # Queue membership is not user-suppressible and takes precedence over stale
+    # per-commit signals while GitHub processes the queued merge.
+    if pull.get("merge_queue") is not None:
+        return "queue"
     if pull.get("merge_state") == "conflicts":
         return "conflicts"
     review = pull.get("review_state")
@@ -309,10 +328,15 @@ def _pr_badge_chips(repo_name: str, pull: dict[str, Any], chips_on: frozenset[st
         return [_chip(_ICON_DRAFT, "warn", f"{head} (draft)", href)]
     chips = [_chip(_ICON_OPEN, "success", head, href)]
 
-    # Conflicts are ungated (not a suppressible category): a merge-blocked PR
-    # always shows the danger chip. Exact match, so a malformed/future value
-    # never trips a false conflict.
+    queue = pull.get("merge_queue")
+    if isinstance(queue, dict):
+        icon, tone, label = _queue_label(pull) or ("git-merge", "neutral", "in merge queue")
+        position = queue.get("position")
+        suffix = f" · position {position}" if isinstance(position, int) and not isinstance(position, bool) else ""
+        chips.append(_chip(icon, tone, f"{head} ({label}{suffix})", href))
     if pull.get("merge_state") == "conflicts":
+        # Conflicts are ungated (not a suppressible category): a merge-blocked
+        # PR always shows the danger chip. Exact match avoids false conflicts.
         chips.append(_chip("triangle-alert", "danger", f"{head} (conflicts)", href))
 
     review_state = pull.get("review_state")
@@ -502,6 +526,15 @@ def _pr_signals(pull: dict[str, Any]) -> list[dict[str, Any]]:
     if visual is not None:
         icon, tone, label = visual
         signals.append({"icon": icon, "tone": tone, "tooltip": label})
+    queue_label = _queue_label(pull)
+    if queue_label is not None:
+        icon, tone, label = queue_label
+        queue = pull.get("merge_queue")
+        position = queue.get("position") if isinstance(queue, dict) else None
+        tooltip = (
+            f"{label} · position {position}" if isinstance(position, int) and not isinstance(position, bool) else label
+        )
+        signals.append({"icon": icon, "tone": tone, "tooltip": tooltip})
     if pull.get("merge_state") == "conflicts":
         signals.append({"icon": "triangle-alert", "tone": "danger", "tooltip": "conflicts with base branch"})
     unresolved = _unresolved_count(pull)
@@ -856,6 +889,27 @@ def _verdict(title: str, detail: str, visual: tuple[str, str], short: str, *, re
     return {"title": title, "detail": detail, "icon": icon, "tone": tone, "short": short, "ready": ready}
 
 
+def _queue_verdict_detail(pull: dict[str, Any]) -> str:
+    queue = pull.get("merge_queue")
+    if not isinstance(queue, dict):
+        return "GitHub is processing this pull request in the merge queue."
+    position = queue.get("position")
+    position_text = (
+        f" It is position {position}." if isinstance(position, int) and not isinstance(position, bool) else ""
+    )
+    details = {
+        "awaiting-checks": "The merge queue is waiting for its checks to pass.",
+        "locked": "The merge queue is currently locked.",
+        "mergeable": "The merge queue reports this pull request as mergeable.",
+        "queued": "GitHub will merge this pull request when it reaches the front of the queue.",
+        "unmergeable": "The merge queue reports this pull request as unmergeable.",
+    }
+    state = queue.get("state")
+    default = "GitHub is processing this pull request in the merge queue."
+    detail = details.get(state, default) if isinstance(state, str) else default
+    return detail + position_text
+
+
 def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
     """Whether the selected PR can merge, and why not when it cannot.
 
@@ -865,10 +919,10 @@ def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
     is blocking (the reason #80 left it unselected). ``short`` is the footer's
     one-word version.
 
-    The rungs are ordered by who can clear the block: a state only the author can
-    change (draft, conflicts) outranks one a reviewer owns, which outranks one CI
-    will resolve on its own. First match wins, so the pane always names the thing
-    to do next rather than the worst thing that is true.
+    The rungs are ordered by who can clear the block: draft outranks active
+    merge-queue state, which outranks ordinary PR checks and review. First match
+    wins, so the pane always names the thing to do next rather than the worst
+    thing that is true.
     """
     buckets = _check_buckets(pull.get("checks")) or {k: [] for k in ("failing", "running", "queued", "passing")}
     base = pull.get("base") or "the base branch"
@@ -878,6 +932,7 @@ def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
     def plural(count: int) -> str:
         return "check" if count == 1 else "checks"
 
+    queue_visual = _queue_label(pull) or ("git-merge", "neutral", "in merge queue")
     ladder: tuple[tuple[bool, dict[str, Any]], ...] = (
         (
             _is_merged(pull),
@@ -886,6 +941,15 @@ def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
         (
             bool(pull.get("draft")),
             _verdict("Draft", "Mark the PR ready for review to merge it.", (_ICON_DRAFT, "warn"), "draft"),
+        ),
+        (
+            pull.get("merge_queue") is not None,
+            _verdict(
+                queue_visual[2].capitalize(),
+                _queue_verdict_detail(pull),
+                queue_visual[:2],
+                "in queue",
+            ),
         ),
         (
             pull.get("merge_state") == "conflicts",
@@ -966,11 +1030,23 @@ def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
 
 
 def _merge_callout(pull: dict[str, Any]) -> dict[str, Any]:
-    """The pane's headline verdict card. Its button is deliberately not a merge:
-    this plugin is read-only, so a mergeable PR gets a link out to GitHub and a
-    blocked one gets an inert button naming the block."""
+    """The headline verdict and its outbound action. This plugin is read-only:
+    a queued PR links to GitHub's queue, a directly mergeable PR links to GitHub,
+    and a blocked one gets an inert button.
+    """
     verdict = _merge_verdict(pull)
-    if verdict["ready"] and pull.get("url"):
+    queue = pull.get("merge_queue")
+    queue_url = queue.get("url") if isinstance(queue, dict) else None
+    if isinstance(queue, dict) and isinstance(queue_url, str) and queue_url:
+        action: dict[str, Any] = {
+            "kind": "action",
+            "label": "View queue on GitHub",
+            "variant": "primary",
+            "icon": "git-merge",
+            "href": queue_url,
+            "tooltip": "Opens this pull request's merge queue on GitHub.",
+        }
+    elif verdict["ready"] and pull.get("url"):
         action = {
             "kind": "action",
             "label": "Merge on GitHub",

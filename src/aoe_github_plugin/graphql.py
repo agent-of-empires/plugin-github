@@ -45,6 +45,8 @@ _PR_CONNECTION_FRAGMENT = """
 fragment PRConnection on PullRequestConnection {
   nodes {
     id number title url state isDraft merged mergeable reviewDecision updatedAt headRefOid
+    mergeQueueEntry { position state }
+    mergeQueue { url }
     baseRefName additions deletions changedFiles
     author { login }
     baseRef { branchProtectionRule {
@@ -143,6 +145,7 @@ _DIGEST_ALIAS_FIELD = """    b{i}: pullRequests(
       orderBy: {{field: UPDATED_AT, direction: DESC}}
     ) {{ nodes {{
       number state isDraft merged mergeable reviewDecision updatedAt headRefOid
+      mergeQueueEntry {{ position state }}
       commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }}
       reviewThreads(first: 1) {{ totalCount }}
     }} }}"""
@@ -187,6 +190,10 @@ def digest_signature(conn: Any) -> str | None:
         commits = _nodes(pr, "commits")
         rollup = commits[0].get("commit", {}).get("statusCheckRollup") if commits else None
         threads = pr.get("reviewThreads")
+        merge_queue = _merge_queue(pr)
+        if merge_queue is not None:
+            # The queue URL is display-only and absent from the digest query.
+            merge_queue.pop("url", None)
         sig.append(
             {
                 "number": pr.get("number"),
@@ -205,6 +212,7 @@ def digest_signature(conn: Any) -> str | None:
                 # GitHub reports it (the digest reads the same scalar), so this
                 # loses no detection latency (#80).
                 "conflicts": merge_state(pr) == "conflicts",
+                "merge_queue": merge_queue,
                 "rollup": rollup.get("state") if isinstance(rollup, dict) else None,
                 "threads": threads.get("totalCount") if isinstance(threads, dict) else None,
             }
@@ -376,6 +384,26 @@ def merge_state(pr: dict[str, Any]) -> str | None:
     deliberately not consulted: it conflates conflicts (DIRTY) with policy/CI/
     behind-base blockers, which are not this signal (#80)."""
     return "conflicts" if pr.get("mergeable") == "CONFLICTING" else None
+
+
+def _merge_queue(pr: dict[str, Any]) -> dict[str, Any] | None:
+    """Queue membership is independent of PR mergeability and head-commit CI."""
+    entry = pr.get("mergeQueueEntry")
+    if not isinstance(entry, dict) or not entry:
+        return None
+    position = entry.get("position")
+    if not isinstance(position, int) or isinstance(position, bool) or position < 1:
+        position = None
+    state = entry.get("state")
+    queue = pr.get("mergeQueue")
+    queue_url = queue.get("url") if isinstance(queue, dict) else None
+    normalized = {
+        "position": position,
+        "state": state.lower().replace("_", "-") if isinstance(state, str) and state else "unknown",
+    }
+    if isinstance(queue_url, str) and queue_url:
+        normalized["url"] = queue_url
+    return normalized
 
 
 # Per-check conclusion -> our state vocabulary. Anything unlisted reads "unknown".
@@ -853,6 +881,7 @@ def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -
         "draft": bool(pr.get("isDraft", False)),
         "merged": bool(pr.get("merged", False)),
         "merge_state": merge_state(pr),
+        "merge_queue": _merge_queue(pr),
         "review_state": review_state(pr),
         "commenters": commenters(pr),
         "checks": check_summary(pr, required_checks_only=required_checks_only),
