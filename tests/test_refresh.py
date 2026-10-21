@@ -132,6 +132,8 @@ def _transport(pulls, etag='W/"v1"', capture=None):
     def handler(request):
         if capture is not None:
             capture.append(request)
+        if request.url.path.endswith("/stacks"):
+            return httpx.Response(404, json={"message": "Not Found"})
         if request.headers.get("If-None-Match") == etag:
             return httpx.Response(304)
         return httpx.Response(200, headers={"ETag": etag}, json=pulls)
@@ -1550,6 +1552,8 @@ def test_workspace_metadata_uses_session_branches_not_source_head(tmp_path):
     requests = []
 
     def handler(request):
+        if request.url.path.endswith("/stacks"):
+            return httpx.Response(404, json={"message": "Not Found"})
         branch = request.url.params["head"].split(":", 1)[1]
         requests.append(branch)
         return httpx.Response(200, json=[_pull(number=1 if branch == "session-a" else 2)])
@@ -1692,6 +1696,7 @@ def test_mixed_workspace_paths_keep_valid_worktrees_authoritative(tmp_path):
         (str(worktree), "o/attached", "session-branch"),
     ]
     assert repos[0]["pulls"][0]["number"] == 12
-    assert [(r.url.path, r.url.params["head"]) for r in requests] == [
-        ("/repos/o/attached/pulls", "o:session-branch"),
+    assert [(r.url.path, r.url.params.get("head"), r.url.params.get("pull_request")) for r in requests] == [
+        ("/repos/o/attached/pulls", "o:session-branch", None),
+        ("/repos/o/attached/stacks", None, "12"),
     ]
