@@ -276,8 +276,9 @@ The pane is one-PR-focused, and reads top to bottom:
    A fully merged range reads `Already merged`; closed, unmerged members are
    blocked and do not count as open PRs or show an inferred review verdict.
    PRs above the selected one do not affect its readiness. Stack data is cached
-   for up to five minutes (a manual refresh fetches it again) and may be absent
-   when GitHub does not return it.
+   for up to five minutes. Manual refresh bypasses this freshness TTL unless
+   REST backoff or a stack retry cooldown is active; data may be absent when GitHub
+   does not return it.
 3. **Merge verdict** (`callout`). Why the PR can or cannot merge, derived here
    rather than fetched: `mergeStateStatus` collapses conflicts, policy, CI and
    review into one enum and so cannot say which is blocking. The ladder is
