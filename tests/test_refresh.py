@@ -392,6 +392,24 @@ def test_graphql_path_parses_rich_fields(tmp_path):
     assert pull["comments"]["items"][0]["author"] == "al"
 
 
+def test_graphql_path_parses_merge_queue_state(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    node = _gql_node()
+    node["mergeQueueEntry"] = {"position": 3, "state": "QUEUED"}
+    snap = refresh.build_snapshot(
+        [{"id": "s1", "project_path": str(ws)}],
+        env=_Env(),
+        transport=_rich_transport([node]),
+    )
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["merge_queue"] == {"position": 3, "state": "queued"}
+
+
+def test_queued_pull_uses_active_refresh_ceiling():
+    assert refresh._is_active([{"merged": False, "merge_queue": {"position": 2, "state": "queued"}}])
+
+
 def test_forced_rich_refresh_advances_freshness_when_data_unchanged(tmp_path, monkeypatch):
     ws = tmp_path / "ws"
     ws.mkdir()

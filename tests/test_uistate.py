@@ -878,6 +878,7 @@ def test_snapshot_emits_global_filter_facets_on_the_status_column():
         "github_pr",
         "github_comments",
         "github_conflicts",
+        "github_queue",
     ]
     assert all("session_id" not in f for f in facets)
     assert all(f["payload"]["column"] == uistate.ROW_COLUMN_SLOT[1] for f in facets)
@@ -887,6 +888,7 @@ def test_snapshot_emits_global_filter_facets_on_the_status_column():
         "GitHub PR",
         "GitHub comments",
         "GitHub conflicts",
+        "GitHub merge queue",
     ]
     assert _facet(params, "github_ci")["payload"]["options"] == [
         {"value": "ci:passing", "label": "passing", "tone": "success"},
@@ -912,6 +914,13 @@ def test_snapshot_emits_global_filter_facets_on_the_status_column():
     assert _facet(params, "github_conflicts")["payload"]["options"] == [
         {"value": "conflicts:yes", "label": "conflicts", "tone": "danger"},
     ]
+    assert [o["value"] for o in _facet(params, "github_queue")["payload"]["options"]] == [
+        "queue:awaiting-checks",
+        "queue:locked",
+        "queue:mergeable",
+        "queue:queued",
+        "queue:unmergeable",
+    ]
 
 
 def test_column_filter_values_cover_every_facet_option():
@@ -926,7 +935,11 @@ def test_column_filter_values_cover_every_facet_option():
             for draft in (False, True):
                 pull = _rich_pull(review=review, checks={"state": cstate, "runs": []}, comments=comments, draft=draft)
                 emitted |= uistate._pull_filter_values(pull)
+    for state in [*uistate._QUEUE_VISUAL, "weird"]:
+        emitted |= uistate._pull_filter_values({**_rich_pull(), "merge_queue": {"state": state, "position": 1}})
     assert emitted == offered
+    assert not any(v.startswith("queue:") for v in uistate._pull_filter_values(_rich_pull()))
+    assert "queue:queued" in uistate._pull_filter_values({**_rich_pull(), "merge_queue": {"state": "weird"}})
 
 
 def test_column_shows_healthy_state_not_empty():
@@ -954,6 +967,47 @@ def test_conflict_chip_is_ungated_by_categories():
     # toggle category disabled.
     repos = [_repo(pulls=[_rich_pull(review="approved", merge_state="conflicts")])]
     assert "triangle-alert" in _badge_icons_with(repos, frozenset())
+
+
+def test_merge_queue_is_visible_in_badge_column_and_verdict():
+    pull = _rich_pull(review="approved", merge_state="conflicts")
+    pull["merge_queue"] = {"position": 2, "state": "queued"}
+    repo = _repo(pulls=[pull])
+    payload = _column_payload([repo])
+    assert payload["text"] == "in merge queue"
+    assert payload["sort_value"] == uistate._ATTENTION_VISUAL["queue"][0]
+    chips = uistate._pr_badge_chips("r", pull, frozenset({"review", "ci", "comments"}))
+    assert any("position 2" in chip["tooltip"] for chip in chips)
+    verdict = uistate._merge_verdict(pull)
+    assert verdict["title"] == "In merge queue"
+    assert verdict["detail"] == (
+        "GitHub will merge this pull request when it reaches the front of the queue. It is position 2."
+    )
+    assert verdict["ready"] is False
+
+
+def test_merge_queue_state_renders_in_pr_selector_and_links_to_queue():
+    pull = _rich_pull(review="approved")
+    queue_url = "https://github.com/o/r/queue/main"
+    pull["merge_queue"] = {"position": 1, "state": "awaiting-checks", "url": queue_url}
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])])))
+    blocks = _pane(params)["payload"]["blocks"]
+    row = _rows(blocks)[0]
+    callout = next(block for block in blocks if block.get("kind") == "callout")
+    assert any("awaiting merge queue checks" in badge["tooltip"] for badge in row["badges"])
+    assert callout["title"] == "Awaiting merge queue checks"
+    assert callout["actions"][0]["label"] == "View queue on GitHub"
+    assert callout["actions"][0]["href"] == queue_url
+    assert callout["actions"][0]["href"] != pull["url"]
+    assert "disabled" not in callout["actions"][0]
+
+
+def test_merge_queue_without_queue_url_does_not_link_to_pull():
+    pull = _rich_pull(review="approved")
+    pull["merge_queue"] = {"position": 1, "state": "queued"}
+    action = _callout([_repo(pulls=[pull])])["actions"][0]
+    assert action["disabled"] is True
+    assert "href" not in action
 
 
 def _callout(repos):

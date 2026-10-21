@@ -11,7 +11,7 @@
 
 id = "agent-of-empires.github"
 name = "GitHub"
-version = "2.2.1"
+version = "2.3.0"
 # Manifest schema / host API version. api_version 5 added the [[screenshots]]
 # list (declared below); 6 lets a command declare a client-executed `action`
 # (the `open_pr` command below uses `open-ui-link`); 7 adds the `icon` /
@@ -254,6 +254,10 @@ id = "github_comments"
 [[ui]]
 slot = "filter-facet"
 id = "github_conflicts"
+
+[[ui]]
+slot = "filter-facet"
+id = "github_queue"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking
 # ndjson JSON-RPC over stdio. The host requires the entrypoint to be
