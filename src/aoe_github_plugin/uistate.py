@@ -2,12 +2,12 @@
 
 The host renders the slots; the worker only pushes typed display state. From one
 aggregate snapshot (see ``refresh.build_snapshot``) this produces one global
-sort option, five global filter facets, plus three pushes per session:
+sort option, six global filter facets, plus three pushes per session:
 
 - a global ``sort-key`` whose payload points at the ``github_pr_status``
   ``row-column`` and sorts by the same PR attention rank the row already uses.
   The host keeps the sorting client-side over the pushed scalar values.
-- global ``filter-facet`` entries (CI, review, PR, comments, conflicts; see
+- global ``filter-facet`` entries (CI, review, PR, comments, conflicts, merge queue; see
   ``FILTER_FACETS``) that also point at ``github_pr_status``, so the sidebar and
   other plugins can filter sessions by one PR fact such as "CI failing".
 
@@ -107,6 +107,15 @@ _CHECK_VISUAL: dict[str, tuple[str, str, str]] = {
     "unknown": ("circle-help", "neutral", "unknown"),
 }
 
+# merge-queue entry state -> (lucide icon, host Tone, human label)
+_QUEUE_VISUAL: dict[str, tuple[str, str, str]] = {
+    "awaiting-checks": ("loader", "info", "awaiting merge queue checks"),
+    "locked": ("lock-keyhole", "warn", "merge queue locked"),
+    "mergeable": ("git-merge", "success", "ready in merge queue"),
+    "queued": ("git-merge", "info", "in merge queue"),
+    "unmergeable": ("circle-x", "danger", "unmergeable in queue"),
+}
+
 # Global `filter-facet` entries: (facet id, payload). Each facet matches a session
 # when the `github_pr_status` row-column's `filter_values` holds any selected
 # option value, so the values here and in `_pull_filter_values` share one
@@ -162,6 +171,17 @@ FILTER_FACETS: tuple[tuple[str, dict[str, Any]], ...] = (
             "options": [{"value": "conflicts:yes", "label": "conflicts", "tone": "danger"}],
         },
     ),
+    (
+        "github_queue",
+        {
+            "label": "GitHub merge queue",
+            "column": ROW_COLUMN_SLOT[1],
+            "options": [
+                {"value": f"queue:{state}", "label": state.replace("-", " "), "tone": tone}
+                for state, (_icon, tone, _label) in _QUEUE_VISUAL.items()
+            ],
+        },
+    ),
 )
 
 # PR attention kind -> (rank, lucide icon, host Tone, compact label). Lower rank
@@ -214,16 +234,9 @@ def _queue_label(pull: dict[str, Any]) -> tuple[str, str, str] | None:
     if not isinstance(queue, dict):
         return None
     state = queue.get("state")
-    labels = {
-        "awaiting-checks": ("loader", "info", "awaiting merge queue checks"),
-        "locked": ("lock-keyhole", "warn", "merge queue locked"),
-        "mergeable": ("git-merge", "success", "ready in merge queue"),
-        "queued": ("git-merge", "info", "in merge queue"),
-        "unmergeable": ("circle-x", "danger", "unmergeable in queue"),
-    }
     if not isinstance(state, str):
         return ("git-merge", "neutral", "in merge queue")
-    return labels.get(state, ("git-merge", "neutral", "in merge queue"))
+    return _QUEUE_VISUAL.get(state, ("git-merge", "neutral", "in merge queue"))
 
 
 def _pull_attention(pull: dict[str, Any], chips: frozenset[str]) -> str:
@@ -441,6 +454,11 @@ def _pull_filter_values(pull: dict[str, Any]) -> set[str]:
         values.add("comments:unresolved")
     if pull.get("merge_state") == "conflicts":
         values.add("conflicts:yes")
+    queue = pull.get("merge_queue")
+    if isinstance(queue, dict):
+        state = queue.get("state")
+        # An unrecognized state is still queued, like `_queue_label`'s fallback.
+        values.add(f"queue:{state if state in _QUEUE_VISUAL else 'queued'}")
     return values
 
 
