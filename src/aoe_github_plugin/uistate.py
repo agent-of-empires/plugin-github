@@ -465,23 +465,43 @@ def _pull_key(repo: dict[str, Any], pull: dict[str, Any]) -> str:
 
 
 def _session_pulls(repos: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """Every PR in the session as ``(repo, pull)``, most-actionable first.
+    """Return one entry per PR, most-actionable first.
 
-    Ranked per PR rather than per repo (the pane's selector is a flat list across
-    the workspace), using the same attention ladder the session row uses so the
-    two orders agree. Merged PRs sink below every open one: they are history, not
-    work. Ties keep snapshot order, which keeps the list stable between refreshes.
+    Duplicate stack-only copies must not shadow a checked-out PR. Preserve a
+    usable stack from another copy when the preferred entry lacks one.
     """
-    ranked: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
-    order = 0
+    unique: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for repo in repos:
         for pull in repo.get("pulls") or []:
-            if _is_merged(pull) or _is_closed(pull):
-                rank = len(_ATTENTION_VISUAL)
-            else:
-                rank = _ATTENTION_VISUAL[_pull_attention(pull, _ALL_CHIPS)][0]
-            ranked.append((rank, order, repo, pull))
-            order += 1
+            key = _pull_key(repo, pull)
+            current = unique.get(key)
+            if current is None:
+                unique[key] = (repo, pull)
+                continue
+
+            preferred = current
+            other_pull = pull
+            if current[1].get("stack_only") and not pull.get("stack_only"):
+                preferred = (repo, pull)
+                other_pull = current[1]
+            preferred_pull = preferred[1]
+            preferred_stack = preferred_pull.get("stack")
+            other_stack = other_pull.get("stack")
+            if (
+                (not isinstance(preferred_stack, list) or len(preferred_stack) < 2)
+                and isinstance(other_stack, list)
+                and len(other_stack) >= 2
+            ):
+                preferred = (preferred[0], {**preferred_pull, "stack": other_stack})
+            unique[key] = preferred
+
+    ranked: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
+    for order, (repo, pull) in enumerate(unique.values()):
+        if _is_merged(pull) or _is_closed(pull):
+            rank = len(_ATTENTION_VISUAL)
+        else:
+            rank = _ATTENTION_VISUAL[_pull_attention(pull, _ALL_CHIPS)][0]
+        ranked.append((rank, order, repo, pull))
     ranked.sort(key=lambda item: (item[0], item[1]))
     return [(repo, pull) for _, _, repo, pull in ranked]
 

@@ -666,6 +666,35 @@ def test_stack_only_pulls_stay_in_pane_navigation_not_session_status():
     assert [row["params"]["pr"] for row in stack["children"][1:]] == ["o/r#1", "o/r#2"]
 
 
+def test_session_pull_selection_deduplicates_stack_only_copy_and_keeps_stack():
+    real = _rich_pull(review="approved")
+    real.update(number=2, url="https://github.com/o/r/pull/2")
+    stack_only = _rich_pull(review="changes-requested")
+    stack_only.update(number=2, stack_only=True, url=real["url"])
+    stack = [
+        {"number": 1, "state": "open", "mergeable_state": "clean"},
+        {"number": 2, "state": "open", "mergeable_state": "clean"},
+    ]
+    stack_only["stack"] = stack
+    real_repo = _repo(name="checkout", pulls=[real])
+    stack_repo = _repo(name="stack", pulls=[stack_only])
+
+    selected = uistate._session_pulls([real_repo, stack_repo])
+    assert len(selected) == 1
+    selected_repo, selected_pull = selected[0]
+    assert selected_repo is real_repo
+    assert selected_pull["review_state"] == "approved"
+    assert selected_pull["stack"] == stack
+
+    params = uistate.snapshot_ui_state_params(
+        _auth_snapshot(_session(repos=[real_repo, stack_repo])),
+        selected={"s1": "o/r#2"},
+    )
+    blocks = _pane(params)["payload"]["blocks"]
+    assert any(block.get("title") == "Stack · PR 2 of 2" for block in blocks)
+    assert not any(block.get("kind") == "note" for block in blocks)
+
+
 def test_badge_emits_pr_review_ci_comment_chip_sequence():
     checks = {"state": "failing", "runs": [{"name": "t", "state": "failing"}]}
     comments = {"unresolved": 3, "items": [{"author": "a", "body": "x", "resolved": False}]}
