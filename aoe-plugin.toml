@@ -24,7 +24,6 @@ version = "2.3.0"
 # verdict, no diff, and no way to switch PRs. 19 adds host-managed suggested
 # sessions (the `[suggestions]` block below).
 api_version = 19
-suggestions = true
 # Host-app compatibility range (different axis from api_version, which is the
 # manifest-schema version). The host refuses install/update outside this range
 # and skips loading if a later aoe upgrade moves out of it. Requires api_version
@@ -140,16 +139,9 @@ max = 86400
 advanced = true
 
 [[settings]]
-key = "suggestion_criteria"
-label = "GitHub suggestion criteria"
-description = "Comma-separated review_requested and changes_requested criteria."
-type = "string"
-default = "review_requested,changes_requested"
-
-[[settings]]
 key = "suggestion_repositories"
 label = "GitHub suggestion repositories"
-description = "Optional comma-separated owner/repo allowlist; empty includes all repositories."
+description = "Optional comma-separated owner/repo allowlist. Empty searches every repository you can see; new issues then come from your registered projects' repositories."
 type = "string"
 default = ""
 advanced = true
@@ -165,17 +157,9 @@ advanced = true
 [[settings]]
 key = "suggestion_projects"
 label = "GitHub suggestion project mappings"
-description = "Explicit owner/repo=registered project name or canonical local path, one mapping per line."
+description = "owner/repo=registered project name or canonical local path, one per line. Overrides the mapping derived from your registered projects' git remotes."
 type = "string"
 default = ""
-advanced = true
-
-[[settings]]
-key = "suggestion_priority"
-label = "GitHub suggestion ranking"
-description = "Comma-separated criterion priority, using review_requested and changes_requested."
-type = "string"
-default = "changes_requested,review_requested"
 advanced = true
 
 [[settings]]
@@ -337,3 +321,65 @@ platforms = ["linux", "macos"]
 [[runtime.build]]
 command = [".aoe-build/venv/bin/pip", "install", "."]
 platforms = ["linux", "macos"]
+
+# Suggested sessions (api_version 19). Each source is one criterion the host
+# can switch off per profile; the worker asks `suggestions.sources` before every
+# discovery and never queries GitHub for a criterion that is off. Variables are
+# the `{name}` placeholders a user can put in a prompt template for that
+# criterion; every item of that criterion carries all of them. Order here is
+# the provider's ranking order (mirrored by CRITERIA in suggestions.py).
+[suggestions]
+
+[[suggestions.sources]]
+criterion = "changes_requested"
+label = "Changes requested on your PRs"
+description = "Your open PRs where a reviewer's current verdict on the head commit is changes requested."
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "reviewer"]
+
+[[suggestions.sources]]
+criterion = "review_requested"
+label = "Review requests"
+description = "Open PRs where your review is requested."
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha"]
+
+[[suggestions.sources]]
+criterion = "re_review"
+label = "Re-reviews"
+description = "Open PRs you reviewed that got new commits since your last review, without a formal re-request."
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "reviewed_commit_sha"]
+
+[[suggestions.sources]]
+criterion = "review_thread_reply"
+label = "Review threads awaiting your reply"
+description = "Your open PRs with unresolved review threads where someone else commented last."
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "unresolved_threads"]
+
+[[suggestions.sources]]
+criterion = "merge_conflict"
+label = "Merge conflicts on your PRs"
+description = "Your open PRs that conflict with their base branch."
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha"]
+
+[[suggestions.sources]]
+criterion = "ci_failed"
+label = "Failing checks on your PRs"
+description = "Your open PRs whose head commit has failed or errored checks."
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "failed_checks"]
+
+[[suggestions.sources]]
+criterion = "mentioned"
+label = "Mentions"
+description = "Unread issue and PR comments that mention you or your team. Dismissing here does not mark the GitHub thread read."
+variables = ["repo", "org", "title", "url", "timestamp", "number", "kind", "comment_url"]
+
+[[suggestions.sources]]
+criterion = "assigned_issues"
+label = "Issues assigned to you"
+description = "Open issues assigned to you."
+variables = ["repo", "org", "title", "url", "timestamp", "issue_number", "author", "labels"]
+
+[[suggestions.sources]]
+criterion = "new_issues"
+label = "New issues"
+description = "Issues opened by others in the last 7 days in your allowlisted repositories, or in your registered projects' repositories when no allowlist is set."
+variables = ["repo", "org", "title", "url", "timestamp", "issue_number", "author", "labels"]

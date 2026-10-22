@@ -8,6 +8,10 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 ### Features
 
 - **suggestions:** Publish session-independent GitHub review-request suggestions with scoped discovery, explicit project mapping, and stale-snapshot error handling. Requires AoE 1.20.0+ (SDK API 19).
+- **suggestions:** Declare every criterion in the manifest `[suggestions]` block with its label and prompt variables; honor the host's per-criterion switches (`suggestions.sources`) so a source that is off never queries GitHub.
+- **suggestions:** Add re-review (new commits since your review), review threads awaiting your reply, merge conflicts and failing checks on your PRs, mentions (from unread notifications), issues assigned to you, and new issues in your repositories.
+- **suggestions:** Derive the repository-to-project mapping and the new-issue repository list from registered AoE projects (`projects.list`); explicit `suggestion_projects` entries still override.
+- **suggestions:** Report GraphQL rate-limit spend and share the plugin's backoff gate with the pane refresh.
 
 ### Bug Fixes
 

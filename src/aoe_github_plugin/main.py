@@ -52,12 +52,15 @@ from aoe_github_plugin.utils.rpc import result_response
 SUGGESTIONS_SET = "suggestions.set"
 SUGGESTIONS_ERROR = "suggestions.error"
 SUGGESTIONS_REFRESH = "suggestions.refresh"
+# Host RPCs the provider reads before each discovery: which criteria the user
+# left on (an off criterion never queries GitHub) and the registered projects
+# (repos for the new-issue search, and the repo -> project mapping).
+SUGGESTIONS_SOURCES = "suggestions.sources"
+PROJECTS_LIST = "projects.list"
 SUGGESTION_SETTING_KEYS = (
-    "suggestion_criteria",
     "suggestion_repositories",
     "suggestion_organizations",
     "suggestion_projects",
-    "suggestion_priority",
     "suggestion_limit",
 )
 
@@ -584,9 +587,39 @@ class Runtime:
         if self._next_network is not None:
             self._next_network = time.monotonic() + self._interval + _network_jitter(self._interval)
 
+    def _enabled_criteria(self) -> set[str]:
+        """Criteria the host left on. A host that cannot answer (older API, or
+        a wedged RPC) gets the manifest defaults, never an empty set: silence
+        must not blank the snapshot."""
+        result = self.call_host(SUGGESTIONS_SOURCES, {})
+        sources = result.get("sources") if isinstance(result, dict) else None
+        if not isinstance(sources, list):
+            return set(suggestions.DEFAULT_ENABLED)
+        return {
+            source["criterion"]
+            for source in sources
+            if isinstance(source, dict) and source.get("enabled") is True and isinstance(source.get("criterion"), str)
+        }
+
+    def _project_repos(self) -> dict[str, str]:
+        """``owner/repo`` -> registered project path, from the host's project
+        list and each checkout's origin. Fail-soft: no host answer, no mapping."""
+        result = self.call_host(PROJECTS_LIST, {})
+        projects = result.get("projects") if isinstance(result, dict) else None
+        mapping: dict[str, str] = {}
+        for project in projects if isinstance(projects, list) else []:
+            path = project.get("path") if isinstance(project, dict) else None
+            if not isinstance(path, str) or not path:
+                continue
+            repo = refresh.checkout_repo(path)
+            if repo:
+                mapping.setdefault(repo.lower(), path)
+        return mapping
+
     def _refresh_suggestions(self) -> None:
-        """Fetch and publish a complete review snapshot; retain last-good on errors."""
+        """Fetch and publish a complete snapshot of the enabled criteria; retain last-good on errors."""
         try:
+            enabled = self._enabled_criteria()
             settings = {}
             for key in SUGGESTION_SETTING_KEYS:
                 result = self.call_host(CONFIG_GET, {"key": key})
@@ -594,12 +627,12 @@ class Runtime:
                     raise TypeError(f"Failed to read suggestion setting {key!r}")  # noqa: TRY301
                 settings[key] = result.get("value")
             items = suggestions.fetch_suggestions(
-                criteria_raw=settings.get("suggestion_criteria") or "review_requested,changes_requested",
+                enabled=enabled,
                 repos_raw=settings.get("suggestion_repositories"),
                 orgs_raw=settings.get("suggestion_organizations"),
                 mapping_raw=settings.get("suggestion_projects"),
-                priority_raw=settings.get("suggestion_priority"),
                 limit_raw=settings.get("suggestion_limit"),
+                project_repos=self._project_repos() if enabled else {},
             )
         except Exception as exc:  # noqa: BLE001 - report failure, keep last-good snapshot
             self.send(

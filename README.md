@@ -49,32 +49,56 @@ anything is written.
 | UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), six `filter-facet`s (`github_ci`, `github_review`, `github_pr`, `github_comments`, `github_conflicts`, `github_queue`), and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
-### GitHub review suggestions
+### GitHub suggestions
 
 On Agent of Empires 1.20.0+ (SDK API 19), this plugin publishes host-managed
-suggestions, independent of AoE sessions. It queries GitHub for open PRs
-requesting your review and open PRs you authored with a current
-changes-requested review (`author:@me`); it does not include PRs you merely
-reviewed. Startup, periodic polling, and the `suggestions.refresh` host
-notification publish complete snapshots. Fetch failures or searches that exceed
-the 10-page, 50-results-per-page limit report `suggestions.error` and preserve
-the last good snapshot.
+suggested sessions, independent of AoE sessions. Each source below is one
+criterion declared in the manifest's `[suggestions]` block. The host owns the
+per-profile on/off switch for every criterion (Suggested sessions view); before
+each discovery the worker asks the host which are on and never queries GitHub
+for one that is off, so switching sources off saves time and rate-limit budget.
 
-Review histories are fetched chronologically in pages of up to 100 reviews (up
-to 10 pages per PR); exceeding that cap reports `suggestions.error` and preserves
-the last good snapshot.
+| Criterion | What it finds | GitHub query |
+|---|---|---|
+| `changes_requested` | Your open PRs with a current changes-requested verdict on the head commit | `is:open is:pr author:@me` |
+| `review_requested` | Open PRs where your review is requested | `is:open is:pr review-requested:@me` |
+| `re_review` | PRs you reviewed that got new commits since, without a formal re-request | `is:open is:pr reviewed-by:@me -author:@me -review-requested:@me` |
+| `review_thread_reply` | Your open PRs with unresolved review threads where someone else commented last | shares the `author:@me` search |
+| `merge_conflict` | Your open PRs that conflict with their base branch | shares the `author:@me` search |
+| `ci_failed` | Your open PRs whose head commit has failed or errored checks | shares the `author:@me` search |
+| `mentioned` | Unread issue or PR comments that mention you or your team | `GET /notifications` (ETag-cached, so an unchanged inbox is free) |
+| `assigned_issues` | Open issues assigned to you | `is:open is:issue assignee:@me` |
+| `new_issues` | Issues opened by others in the last 7 days | `is:open is:issue -author:@me created:>=<date>` over the repositories below |
 
-Configure `suggestion_criteria` (comma-separated `review_requested` and
-`changes_requested`), optional `suggestion_repositories` and
-`suggestion_organizations` scopes, and `suggestion_projects` (`owner/repo=project`
-per line). Project values are explicit registered project names or canonical
-local paths; unmapped repositories stay unmapped.
-`suggestion_priority` sets criterion ordering (defaulting to changes requested
-first), and `suggestion_limit` caps the published snapshot (1-500) after a
-complete search.
+The four `author:@me` criteria run one search and publish one item per PR; its
+criterion is the first match in the order above and its reason lists every
+match. Items are ranked in that table order, then by recency, and deduplicated
+by source URL. Every item carries `variables` (`repo`, `org`, `title`, `url`,
+`timestamp`, plus `pr_number`/`author`/`branch`/`base_branch`/`commit_sha` for
+PRs, `issue_number`/`author`/`labels` for issues, and criterion-specific extras
+such as `reviewer`, `failed_checks`, `unresolved_threads`, `reviewed_commit_sha`,
+`comment_url`) for the host's prompt templates; the manifest lists them per
+criterion.
 
-Each suggestion links to its canonical GitHub PR URL and includes a short PR
-description preview. That remote text is source material, not trusted
+Scope: `suggestion_repositories` (comma-separated `owner/repo`) and
+`suggestion_organizations` restrict every criterion; empty means everything
+the token can see. `new_issues` needs a repository list: the allowlist or
+organizations when set, else the repositories of your registered AoE projects
+(read from each project's `origin` remote via the host's `projects.list`).
+Those same projects give each item its `project`; `suggestion_projects`
+(`owner/repo=project name or path`, one per line) overrides that mapping.
+`suggestion_limit` caps the published snapshot (1-500) after a complete fetch.
+
+Searches and review histories are fetched to completion (10 pages of 50, 10
+pages of 100 reviews per PR); exceeding a cap, a GraphQL error, or a rate
+limit reports `suggestions.error` and keeps the last good snapshot. The
+notification inbox is read newest first and stops after 500 entries. A rate
+limit also arms the plugin's shared backoff gate, so the next refresh waits
+for the budget to reset. Dismissing a `mentioned` item in AoE does not mark
+the GitHub notification read; it stays dismissed in AoE only.
+
+Each suggestion links to its canonical GitHub URL and includes a short body or
+comment preview. That remote text is source material, not trusted
 instructions. The provider supplies a proposed task prompt but never creates
 sessions or grants unattended access; the host owns the reviewed start flow and
 its opt-in automation policy.
