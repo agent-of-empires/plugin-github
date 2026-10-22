@@ -334,7 +334,7 @@ platforms = ["linux", "macos"]
 criterion = "changes_requested"
 label = "Changes requested on your PRs"
 description = "Your open PRs where a reviewer's current verdict on the head commit is changes requested."
-variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "reviewer"]
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "reviewer", "unresolved_threads", "failed_checks"]
 
 [[suggestions.sources]]
 criterion = "review_requested"
@@ -352,19 +352,19 @@ variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", 
 criterion = "review_thread_reply"
 label = "Review threads awaiting your reply"
 description = "Your open PRs with unresolved review threads where someone else commented last."
-variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "unresolved_threads"]
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "reviewer", "unresolved_threads", "failed_checks"]
 
 [[suggestions.sources]]
 criterion = "merge_conflict"
 label = "Merge conflicts on your PRs"
 description = "Your open PRs that conflict with their base branch."
-variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha"]
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "reviewer", "unresolved_threads", "failed_checks"]
 
 [[suggestions.sources]]
 criterion = "ci_failed"
 label = "Failing checks on your PRs"
 description = "Your open PRs whose head commit has failed or errored checks."
-variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "failed_checks"]
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "reviewer", "unresolved_threads", "failed_checks"]
 
 [[suggestions.sources]]
 criterion = "mentioned"
