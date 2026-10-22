@@ -212,6 +212,18 @@ def test_pane_footer_carries_freshness_and_the_selected_verdict(monkeypatch):
     assert payload["blocks"][-1]["method"] == "github.refresh"
 
 
+def test_pane_footer_omits_verdict_for_stack_only_selection(monkeypatch):
+    _set_tz(monkeypatch, "UTC")
+    stack_only = _rich_pull(review="approved")
+    stack_only.update(number=2, stack_only=True, url="https://github.com/o/r/pull/2")
+    session = _session(repos=[_repo(pulls=[stack_only])])
+    session["freshness"] = {"refreshed_at": "2026-06-29T14:32:10Z", "stale": False}
+
+    payload = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(session)))["payload"]
+
+    assert payload["footer"] == {"text": "refreshed 14:32", "icon": "refresh-cw"}
+
+
 def test_pane_footer_marks_stale_freshness(monkeypatch):
     _set_tz(monkeypatch, "UTC")
     session = _session(repos=[_repo()])
@@ -644,6 +656,57 @@ def test_snapshot_emits_global_sort_key():
     }
 
 
+def test_stack_only_pulls_stay_in_pane_navigation_not_session_status():
+    checked_out = _rich_pull(review="approved")
+    checked_out["number"] = 1
+    stack_only = _rich_pull(review="changes-requested")
+    stack_only.update(number=2, stack_only=True, url="https://github.com/o/r/pull/2")
+    checked_out["stack"] = [
+        {"number": 1, "state": "open", "mergeable_state": "clean"},
+        {"number": 2, "state": "open", "mergeable_state": "clean"},
+    ]
+    repo = _repo(pulls=[checked_out, stack_only])
+
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[repo])), selected={"s1": "o/r#1"})
+    assert uistate._open_pulls(repo) == [checked_out]
+    items = _badge(params)["payload"]["items"]
+    assert all(item.get("href") != stack_only["url"] for item in items)
+    column = _column(params)["payload"]
+    assert "PR #1" in column["tooltip"]
+    assert "PR #2" not in column["tooltip"]
+    stack = next(block for block in _pane(params)["payload"]["blocks"] if block.get("title") == "Stack · PR 1 of 2")
+    assert [row["params"]["pr"] for row in stack["children"][1:]] == ["o/r#1", "o/r#2"]
+
+
+def test_session_pull_selection_deduplicates_stack_only_copy_and_keeps_stack():
+    real = _rich_pull(review="approved")
+    real.update(number=2, url="https://github.com/o/r/pull/2")
+    stack_only = _rich_pull(review="changes-requested")
+    stack_only.update(number=2, stack_only=True, url=real["url"])
+    stack = [
+        {"number": 1, "state": "open", "mergeable_state": "clean"},
+        {"number": 2, "state": "open", "mergeable_state": "clean"},
+    ]
+    stack_only["stack"] = stack
+    real_repo = _repo(name="checkout", pulls=[real])
+    stack_repo = _repo(name="stack", pulls=[stack_only])
+
+    selected = uistate._session_pulls([real_repo, stack_repo])
+    assert len(selected) == 1
+    selected_repo, selected_pull = selected[0]
+    assert selected_repo is real_repo
+    assert selected_pull["review_state"] == "approved"
+    assert selected_pull["stack"] == stack
+
+    params = uistate.snapshot_ui_state_params(
+        _auth_snapshot(_session(repos=[real_repo, stack_repo])),
+        selected={"s1": "o/r#2"},
+    )
+    blocks = _pane(params)["payload"]["blocks"]
+    assert any(block.get("title") == "Stack · PR 2 of 2" for block in blocks)
+    assert not any(block.get("kind") == "note" for block in blocks)
+
+
 def test_badge_emits_pr_review_ci_comment_chip_sequence():
     checks = {"state": "failing", "runs": [{"name": "t", "state": "failing"}]}
     comments = {"unresolved": 3, "items": [{"author": "a", "body": "x", "resolved": False}]}
@@ -1007,6 +1070,104 @@ def test_merged_pr_verdict_replaces_the_conflict_signal():
     # Merged PRs suppress all live detail, including a stale conflict signal.
     pull = _rich_pull(state="MERGED", merged=True, merge_state="conflicts")
     assert _callout([_repo(pulls=[pull])])["title"] == "Merged"
+
+
+def test_stack_shows_position_navigation_and_readiness_only_through_selection():
+    selected = _rich_pull(review="approved")
+    selected["number"] = 2
+    selected["stack"] = [
+        {
+            "number": 1,
+            "title": "Foundation",
+            "url": "https://github.com/o/r/pull/1",
+            "state": "open",
+            "mergeable_state": "clean",
+            "head": "foundation",
+        },
+        {
+            "number": 2,
+            "title": "Selected",
+            "url": "https://github.com/o/r/pull/2",
+            "state": "open",
+            "mergeable_state": "clean",
+            "head": "feature",
+        },
+        {
+            "number": 3,
+            "title": "Blocked above",
+            "url": "https://github.com/o/r/pull/3",
+            "state": "open",
+            "draft": True,
+            "mergeable_state": "draft",
+            "head": "top",
+        },
+    ]
+    blocks = _pane(
+        uistate.snapshot_ui_state_params(
+            _auth_snapshot(_session(repos=[_repo(pulls=[selected])])), selected={"s1": "o/r#2"}
+        )
+    )["payload"]["blocks"]
+    stack = next(block for block in blocks if block.get("title") == "Stack · PR 2 of 3")
+    rows = stack["children"]
+    assert rows[0]["value"] == "Mergeable through this PR"
+    assert [row["params"]["pr"] for row in rows[1:]] == ["o/r#1", "o/r#2", "o/r#3"]
+    assert rows[2]["selected"] is True
+    assert rows[3]["value"] == "draft"
+
+
+@pytest.mark.parametrize(
+    ("mergeable_state", "expected", "row_tone"),
+    [
+        ("blocked", "Blocked at #1", "danger"),
+        ("dirty", "Blocked at #1", "danger"),
+        ("behind", "Mergeability unknown", "warn"),
+        ("unstable", "Mergeability unknown", "warn"),
+        ("has_hooks", "Mergeability unknown", "warn"),
+        (None, "Mergeability unknown", "warn"),
+    ],
+)
+def test_stack_readiness_distinguishes_hard_blocks_from_advisory_states(mergeable_state, expected, row_tone):
+    pull = _rich_pull(review="approved")
+    pull["number"] = 2
+    pull["stack"] = [
+        {"number": 1, "state": "open", "mergeable_state": mergeable_state},
+        {"number": 2, "state": "open", "mergeable_state": "clean"},
+    ]
+    blocks = _pane(
+        uistate.snapshot_ui_state_params(
+            _auth_snapshot(_session(repos=[_repo(pulls=[pull])])), selected={"s1": "o/r#2"}
+        )
+    )["payload"]["blocks"]
+    stack = next(block for block in blocks if block.get("title") == "Stack · PR 2 of 2")
+    assert stack["children"][0]["value"] == expected
+    assert stack["children"][1]["value_tone"] == row_tone
+
+
+def test_closed_unmerged_stack_member_is_not_presented_as_open():
+    closed = _rich_pull(state="CLOSED", merged=False)
+    closed["stack"] = [
+        {"number": 4, "state": "closed", "merged": False, "mergeable_state": "unknown"},
+        {"number": 5, "state": "open", "mergeable_state": "clean"},
+    ]
+    closed["number"] = 4
+    repo = _repo(pulls=[closed])
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[repo])))
+    row = _rows(_pane(params)["payload"]["blocks"])[0]
+    assert row["icon"] == "circle-x"
+    assert _badge(params)["payload"]["items"] == []
+    callout = next(block for block in _pane(params)["payload"]["blocks"] if block.get("kind") == "callout")
+    assert callout["title"] == "Closed"
+
+
+def test_fully_merged_stack_range_is_not_described_as_mergeable():
+    pull = _rich_pull(state="MERGED", merged=True)
+    pull["stack"] = [
+        {"number": 1, "state": "closed", "merged": True},
+        {"number": 2, "state": "closed", "merged": True},
+    ]
+    pull["number"] = 2
+    stack = uistate._stack_section(_repo(), pull)
+    assert stack["children"][0]["value"] == "Already merged"
 
 
 def test_column_is_empty_when_no_prs_to_clear_stale_state():

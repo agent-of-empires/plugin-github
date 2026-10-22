@@ -98,12 +98,14 @@ class GitHubClient:
     def close(self) -> None:
         self._client.close()
 
-    def get_json(self, path: str, params: dict[str, str] | None = None) -> Any:
+    def get_json(self, path: str, params: dict[str, str] | None = None, *, api_version: str | None = None) -> Any:
         """GET ``path`` (relative to the API base, or an absolute URL), return
-        parsed JSON. Raises a typed ``GitHubError`` subclass on any failure.
+        parsed JSON. ``api_version`` overrides the client default for endpoints
+        that require a newer version. Raises a typed ``GitHubError`` on failure.
         """
+        headers = {"X-GitHub-Api-Version": api_version} if api_version else None
         try:
-            resp = self._client.get(path, params=params)
+            resp = self._client.get(path, params=params, headers=headers)
         except httpx.RequestError as exc:
             raise NetworkError(exc) from exc
         if not resp.is_success:

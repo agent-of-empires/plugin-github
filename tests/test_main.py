@@ -533,6 +533,50 @@ def test_select_pr_survives_a_drifted_cached_snapshot(monkeypatch):
     assert not [m for m in sent if m["method"] == "ui.state.set"]
 
 
+def test_stack_navigation_repoints_pane_without_host_checkout_rpc():
+    stack = [
+        {
+            "number": 1,
+            "title": "Base",
+            "url": "https://github.com/o/r/pull/1",
+            "state": "open",
+            "mergeable_state": "clean",
+        },
+        {
+            "number": 2,
+            "title": "Top",
+            "url": "https://github.com/o/r/pull/2",
+            "state": "open",
+            "mergeable_state": "clean",
+        },
+    ]
+    pulls = [
+        {"number": member["number"], "url": member["url"], "title": member["title"], "state": "open", "stack": stack}
+        for member in stack
+    ]
+    snapshot = {
+        "sessions": [{"session_id": "s1", "repos": [{"repo": "o/r", "name": "r", "pulls": pulls}]}],
+        "auth": {"present": True},
+    }
+    sent = []
+    rt = main.Runtime(send=sent.append)
+    rt._push_snapshot(snapshot)
+    sent.clear()
+
+    rt.handle_inbound({"method": main.SELECT_PR_METHOD, "params": {"session_id": "s1", "pr": "o/r#2"}})
+
+    pane = next(
+        message["params"]["payload"]
+        for message in sent
+        if message["method"] == "ui.state.set" and message["params"]["slot"] == "pane"
+    )
+    assert rt._selected_pr == {"s1": "o/r#2"}
+    assert (
+        next(block["title"] for block in pane["blocks"] if block.get("title", "").startswith("Stack"))
+        == "Stack · PR 2 of 2"
+    )
+
+
 def test_fast_poll_refreshes_changed_workspace_repos_without_new_session(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     source = tmp_path / "source"

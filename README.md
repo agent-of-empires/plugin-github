@@ -261,16 +261,32 @@ prepends a warn `note` telling the user a token unlocks review/CI/comments/merge
 
 The pane is one-PR-focused, and reads top to bottom:
 
-1. **PR selector.** Every PR in the session, most-actionable first (the same
-   attention ladder the session row uses, with merged PRs sinking below every open
-   one). Each row carries `#number`, the title, `branch · author`, and a glyph
-   strip for CI / review / conflicts / merge-queue state and position /
-   unresolved-comment count. Clicking a row fires `github.select_pr { pr }`; the
-   trailing arrow is a separate link to GitHub, so picking a PR never navigates
-   away. The selection is remembered in memory per session, and falls back to the
-   top of the list whenever the PR it named is no longer in the snapshot (merged,
-   closed, renamed).
-2. **Merge verdict** (`callout`). Why the PR can or cannot merge, derived here
+1. **PR selector.** Every PR in the session plus any additional members of its
+   GitHub-native stacks, most-actionable first (the same attention ladder the
+   session row uses, with merged PRs sinking below every open one). Each row
+   carries `#number`, the title, `branch · author`, and a glyph strip for CI /
+   review / conflicts / merge-queue state and position / unresolved-comment
+   count. Clicking a row fires `github.select_pr { pr }`; the trailing arrow is a
+   separate link to GitHub, so picking a PR never navigates away or changes a
+   checkout. The selection is remembered in memory per session, and falls back
+   to the top of the list whenever the PR it named is no longer in the snapshot
+   (merged, closed, renamed).
+2. **Stack map.** GitHub's native stack membership and ordering show the selected
+   PR's position and provide one-click selection of every layer. The readiness
+   row covers only unmerged PRs from the bottom through the selected PR: GitHub
+   must report each as `clean` (or already merged). A draft, `dirty`, or
+   `blocked` state blocks readiness. Advisory `behind`, `unstable`, and
+   `has_hooks` states remain visible but leave readiness unknown; missing status
+   is also unknown.
+   A fully merged range reads `Already merged`; closed, unmerged members are
+   blocked and do not count as open PRs or show an inferred review verdict.
+   PRs above the selected one do not affect its readiness. Stack data is fetched
+   only when a token is available. Successful data is rechecked after five
+   minutes; on failures, the last stack data may remain available and the pane
+   freshness is marked stale. Manual refresh bypasses the freshness TTL only
+   when no REST backoff or stack retry cooldown is active; data may be absent
+   when GitHub does not return it.
+3. **Merge verdict** (`callout`). Why the PR can or cannot merge, derived here
    rather than fetched: `mergeStateStatus` collapses conflicts, policy, CI and
    review into one enum and so cannot say which is blocking. The ladder is
    draft, merge queue state, conflicts, changes requested, awaiting re-review, failing checks, running
@@ -282,23 +298,23 @@ The pane is one-PR-focused, and reads top to bottom:
    directly mergeable. **This plugin never merges for you:** queued PRs link to
    the merge queue on GitHub; a directly mergeable PR gets a merge link, and a
    blocked one gets an inert button naming the block.
-3. **Review.** One row per reviewer (initials, name, current position), from
+4. **Review.** One row per reviewer (initials, name, current position), from
    `latestReviews` plus any outstanding `reviewRequests`, under the summary GitHub
    itself would show. Degrades to the single aggregate review-state row when
    per-reviewer data is absent.
-4. **Checks.** Count pills in the header; the runs needing attention (failing,
+5. **Checks.** Count pills in the header; the runs needing attention (failing,
    running, queued) listed outright with `workflow · duration`; the passes folded
    into a collapsed group; skipped runs on their own line. The body scrolls in
    place, so a twenty-check repo does not bury everything below it. A skipped run
    still counts as passing for the rollup (it blocks nothing) but is listed apart
    from the real passes.
-5. **Unresolved comments**, as read-only `comment` blocks.
-6. **Diff and Linked** (`columns`), side by side: `+added / -removed` with a
+6. **Unresolved comments**, as read-only `comment` blocks.
+7. **Diff and Linked** (`columns`), side by side: `+added / -removed` with a
    proportional bar and a file count, and the issues the PR closes on merge (from
    GitHub's own `closingIssuesReferences`). Either can be absent, and a lone
    survivor spans the full width.
-7. **Activity.** Recent timeline events, newest first, with local wall-clock times.
-8. **Footer**, pinned below the scroll: the last refresh time and the verdict in a
+8. **Activity.** Recent timeline events, newest first, with local wall-clock times.
+9. **Footer**, pinned below the scroll: the last refresh time and the verdict in a
    word.
 
 Repos that contribute no PR (a failed lookup, a non-GitHub checkout, a clean

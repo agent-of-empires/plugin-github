@@ -76,6 +76,15 @@ def test_get_json_success_sends_bearer_token():
         assert client.get_json("/repos/o/r/pulls") == [{"number": 7}]
 
 
+def test_get_json_can_override_api_version_for_new_endpoints():
+    def handler(request):
+        assert request.headers["X-GitHub-Api-Version"] == "2026-03-10"
+        return httpx.Response(200, json={})
+
+    with _client(handler) as client:
+        assert client.get_json("/repos/o/r/stacks", api_version="2026-03-10") == {}
+
+
 def test_get_json_403_missing_scope_maps_to_insufficient_scope():
     def handler(request):
         return httpx.Response(403, headers={"X-Accepted-OAuth-Scopes": "repo"}, json={"message": "x"})
