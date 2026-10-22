@@ -80,13 +80,14 @@ APPROVED_OVERRIDES_STALE_BLOCK_SETTING_KEY = "approved_overrides_stale_block"
 # The pane's PR selector fires this with the clicked row's `params` (`{"pr": key}`);
 # `uistate.SELECT_METHOD` is the same name on the block-building side.
 SELECT_PR_METHOD = uistate.SELECT_METHOD
-# Default NETWORK poll interval. Sized so worst-case (every key changes every
-# tick, so each spends a REST + a GraphQL query) stays well under the user's
-# shared 5000/hr budgets: at 120s a 20-key workspace tops out around 600 REST
-# req/hr and ~600 GraphQL queries/hr, a small fraction of either limit. In the
-# common steady state the REST conditional check returns 304 (free) and no
-# GraphQL fires, so the real cost is far lower. The fast local session tick
-# (SESSION_POLL_SECS) stays separate and unthrottled. See refresh.py and README.
+# Default NETWORK poll interval. The primary PR-list + rich-query estimate below
+# assumes every key changes every tick: at 120s a 20-key workspace makes ~600
+# REST requests/hr and ~600 GraphQL queries/hr. It excludes token-gated native
+# stack lookups, which add REST calls as their five-minute cache expires and use
+# a separate retry cooldown. In unchanged primary state, REST returns 304 and
+# rich GraphQL fetches are gated by digest/freshness ceilings. The fast local
+# session tick (SESSION_POLL_SECS) stays separate and unthrottled. See refresh.py
+# and README.
 DEFAULT_REFRESH_SECS = 120
 # A wedged host must never freeze the worker: outbound host RPCs time out and
 # the caller falls back (default interval, empty session list).

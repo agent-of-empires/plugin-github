@@ -212,6 +212,18 @@ def test_pane_footer_carries_freshness_and_the_selected_verdict(monkeypatch):
     assert payload["blocks"][-1]["method"] == "github.refresh"
 
 
+def test_pane_footer_omits_verdict_for_stack_only_selection(monkeypatch):
+    _set_tz(monkeypatch, "UTC")
+    stack_only = _rich_pull(review="approved")
+    stack_only.update(number=2, stack_only=True, url="https://github.com/o/r/pull/2")
+    session = _session(repos=[_repo(pulls=[stack_only])])
+    session["freshness"] = {"refreshed_at": "2026-06-29T14:32:10Z", "stale": False}
+
+    payload = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(session)))["payload"]
+
+    assert payload["footer"] == {"text": "refreshed 14:32", "icon": "refresh-cw"}
+
+
 def test_pane_footer_marks_stale_freshness(monkeypatch):
     _set_tz(monkeypatch, "UTC")
     session = _session(repos=[_repo()])
@@ -1104,10 +1116,17 @@ def test_stack_shows_position_navigation_and_readiness_only_through_selection():
 
 
 @pytest.mark.parametrize(
-    ("mergeable_state", "expected"),
-    [("blocked", "Blocked at #1"), (None, "Mergeability unknown")],
+    ("mergeable_state", "expected", "row_tone"),
+    [
+        ("blocked", "Blocked at #1", "danger"),
+        ("dirty", "Blocked at #1", "danger"),
+        ("behind", "Mergeability unknown", "warn"),
+        ("unstable", "Mergeability unknown", "warn"),
+        ("has_hooks", "Mergeability unknown", "warn"),
+        (None, "Mergeability unknown", "warn"),
+    ],
 )
-def test_stack_readiness_reports_blocked_and_unknown_dependencies(mergeable_state, expected):
+def test_stack_readiness_distinguishes_hard_blocks_from_advisory_states(mergeable_state, expected, row_tone):
     pull = _rich_pull(review="approved")
     pull["number"] = 2
     pull["stack"] = [
@@ -1121,6 +1140,7 @@ def test_stack_readiness_reports_blocked_and_unknown_dependencies(mergeable_stat
     )["payload"]["blocks"]
     stack = next(block for block in blocks if block.get("title") == "Stack · PR 2 of 2")
     assert stack["children"][0]["value"] == expected
+    assert stack["children"][1]["value_tone"] == row_tone
 
 
 def test_closed_unmerged_stack_member_is_not_presented_as_open():

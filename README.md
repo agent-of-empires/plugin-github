@@ -274,14 +274,18 @@ The pane is one-PR-focused, and reads top to bottom:
 2. **Stack map.** GitHub's native stack membership and ordering show the selected
    PR's position and provide one-click selection of every layer. The readiness
    row covers only unmerged PRs from the bottom through the selected PR: GitHub
-   must report each as `clean` (or already merged). A draft or known non-clean
-   merge state blocks the range; missing/unknown status is shown as unknown.
+   must report each as `clean` (or already merged). A draft, `dirty`, or
+   `blocked` state blocks readiness. Advisory `behind`, `unstable`, and
+   `has_hooks` states remain visible but leave readiness unknown; missing status
+   is also unknown.
    A fully merged range reads `Already merged`; closed, unmerged members are
    blocked and do not count as open PRs or show an inferred review verdict.
-   PRs above the selected one do not affect its readiness. Stack data is cached
-   for up to five minutes. Manual refresh bypasses this freshness TTL unless
-   REST backoff or a stack retry cooldown is active; data may be absent when GitHub
-   does not return it.
+   PRs above the selected one do not affect its readiness. Stack data is fetched
+   only when a token is available. Successful data is rechecked after five
+   minutes; on failures, the last stack data may remain available and the pane
+   freshness is marked stale. Manual refresh bypasses the freshness TTL only
+   when no REST backoff or stack retry cooldown is active; data may be absent
+   when GitHub does not return it.
 3. **Merge verdict** (`callout`). Why the PR can or cannot merge, derived here
    rather than fetched: `mergeStateStatus` collapses conflicts, policy, CI and
    review into one enum and so cannot say which is blocking. The ladder is

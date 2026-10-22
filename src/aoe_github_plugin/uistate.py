@@ -1126,7 +1126,8 @@ def _stack_member_status(member: dict[str, Any]) -> tuple[str, str]:
     if status == "clean":
         return "clean", "success"
     if status in ("dirty", "blocked", "behind", "unstable", "has_hooks"):
-        return status, "danger"
+        tone = "danger" if status in ("dirty", "blocked") else "warn"
+        return status, tone
     return status if isinstance(status, str) else "unknown", "warn"
 
 
@@ -1434,7 +1435,7 @@ def _pane_footer(freshness: Any, selection: tuple[dict[str, Any], dict[str, Any]
             stale = freshness.get("stale") is True
             footer["text"] = f"last good refresh {at}" if stale else f"refreshed {at}"
             footer["icon"] = "clock" if stale else "refresh-cw"
-    if selection is not None:
+    if selection is not None and not selection[1].get("stack_only"):
         verdict = _merge_verdict(selection[1])
         footer["value"] = verdict["short"]
         footer["tone"] = verdict["tone"]
