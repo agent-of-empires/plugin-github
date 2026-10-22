@@ -45,6 +45,8 @@ _PR_CONNECTION_FRAGMENT = """
 fragment PRConnection on PullRequestConnection {
   nodes {
     id number title url state isDraft merged mergeable reviewDecision updatedAt headRefOid
+    mergeQueueEntry { position state }
+    mergeQueue { url }
     baseRefName additions deletions changedFiles
     author { login }
     baseRef { branchProtectionRule {
@@ -143,6 +145,7 @@ _DIGEST_ALIAS_FIELD = """    b{i}: pullRequests(
       orderBy: {{field: UPDATED_AT, direction: DESC}}
     ) {{ nodes {{
       number state isDraft merged mergeable reviewDecision updatedAt headRefOid
+      mergeQueueEntry {{ position state }}
       commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }}
       reviewThreads(first: 1) {{ totalCount }}
     }} }}"""
@@ -187,6 +190,10 @@ def digest_signature(conn: Any) -> str | None:
         commits = _nodes(pr, "commits")
         rollup = commits[0].get("commit", {}).get("statusCheckRollup") if commits else None
         threads = pr.get("reviewThreads")
+        merge_queue = _merge_queue(pr)
+        if merge_queue is not None:
+            # The queue URL is display-only and absent from the digest query.
+            merge_queue.pop("url", None)
         sig.append(
             {
                 "number": pr.get("number"),
@@ -205,6 +212,7 @@ def digest_signature(conn: Any) -> str | None:
                 # GitHub reports it (the digest reads the same scalar), so this
                 # loses no detection latency (#80).
                 "conflicts": merge_state(pr) == "conflicts",
+                "merge_queue": merge_queue,
                 "rollup": rollup.get("state") if isinstance(rollup, dict) else None,
                 "threads": threads.get("totalCount") if isinstance(threads, dict) else None,
             }
@@ -352,6 +360,19 @@ def drop_ignored_commenters(pull: dict[str, Any], ignored: frozenset[str]) -> di
     return {**pull, "review_state": "waiting"}
 
 
+def approve_over_stale_block(pull: dict[str, Any]) -> dict[str, Any]:
+    """``pull`` with ``changes-pushed`` upgraded to ``approved`` when another
+    reviewer approved the current head, for the ``approved_overrides_stale_block``
+    setting. GitHub still blocks the merge until the stale review is re-done or
+    dismissed. Returns a copy; a pull without ``reviewers`` is untouched."""
+    people = pull.get("reviewers")
+    if pull.get("review_state") != "changes-pushed" or not isinstance(people, list):
+        return pull
+    if any(isinstance(p, dict) and p.get("state") == "approved" for p in people):
+        return {**pull, "review_state": "approved"}
+    return pull
+
+
 def merge_state(pr: dict[str, Any]) -> str | None:
     """``conflicts`` when GitHub reports the PR head conflicts with its base, else
     ``None`` (no signal).
@@ -363,6 +384,26 @@ def merge_state(pr: dict[str, Any]) -> str | None:
     deliberately not consulted: it conflates conflicts (DIRTY) with policy/CI/
     behind-base blockers, which are not this signal (#80)."""
     return "conflicts" if pr.get("mergeable") == "CONFLICTING" else None
+
+
+def _merge_queue(pr: dict[str, Any]) -> dict[str, Any] | None:
+    """Queue membership is independent of PR mergeability and head-commit CI."""
+    entry = pr.get("mergeQueueEntry")
+    if not isinstance(entry, dict) or not entry:
+        return None
+    position = entry.get("position")
+    if not isinstance(position, int) or isinstance(position, bool) or position < 1:
+        position = None
+    state = entry.get("state")
+    queue = pr.get("mergeQueue")
+    queue_url = queue.get("url") if isinstance(queue, dict) else None
+    normalized = {
+        "position": position,
+        "state": state.lower().replace("_", "-") if isinstance(state, str) and state else "unknown",
+    }
+    if isinstance(queue_url, str) and queue_url:
+        normalized["url"] = queue_url
+    return normalized
 
 
 # Per-check conclusion -> our state vocabulary. Anything unlisted reads "unknown".
@@ -715,9 +756,9 @@ def review_summary(people: list[dict[str, str]]) -> str:
         return ""
     if any(p["state"] == "changes-requested" for p in people):
         return "changes requested"
-    if any(p["state"] == "changes-pushed" for p in people):
-        return "pushed since review"
     approved = sum(1 for p in people if p["state"] == "approved")
+    if any(p["state"] == "changes-pushed" for p in people):
+        return f"pushed since review, {approved} approved" if approved else "pushed since review"
     if approved == len(people):
         return f"{approved} approved" if approved != 1 else "1 approved"
     if approved:
@@ -840,6 +881,7 @@ def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -
         "draft": bool(pr.get("isDraft", False)),
         "merged": bool(pr.get("merged", False)),
         "merge_state": merge_state(pr),
+        "merge_queue": _merge_queue(pr),
         "review_state": review_state(pr),
         "commenters": commenters(pr),
         "checks": check_summary(pr, required_checks_only=required_checks_only),

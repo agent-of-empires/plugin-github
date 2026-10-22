@@ -11,10 +11,18 @@
 
 id = "agent-of-empires.github"
 name = "GitHub"
-version = "2.2.1"
-# Manifest schema / host API version. api_version 5 added screenshots; 6 adds
-# client-executed command actions; 7 adds identity icons; 12 adds the rich pane
-# blocks and actions; 19 adds host-managed suggestions.
+version = "2.3.0"
+# Manifest schema / host API version. api_version 5 added the [[screenshots]]
+# list (declared below); 6 lets a command declare a client-executed `action`
+# (the `open_pr` command below uses `open-ui-link`); 7 adds the `icon` /
+# `icon_asset` identity fields (declared below); 12 adds the pane block kinds
+# this plugin's pane is now built from (`callout`, `bar`, `columns`), clickable
+# `row`s carrying `params` (the PR selector), header summaries and scrollable
+# bodies on `section`, `disabled` / `variant` / `href` actions, and the
+# pane-level `footer`. A host older than 12 rejects this manifest outright,
+# which is the intent: it would render the pane as a bare list of rows with no
+# verdict, no diff, and no way to switch PRs. 19 adds host-managed suggested
+# sessions (the `[suggestions]` block below).
 api_version = 19
 suggestions = true
 # Host-app compatibility range (different axis from api_version, which is the
@@ -222,6 +230,14 @@ default = "coderabbitai, codecov"
 advanced = true
 
 [[settings]]
+key = "approved_overrides_stale_block"
+label = "Approval overrides a stale changes-requested review"
+description = "When a reviewer requested changes on an older commit and someone else approved the current head, show the PR as approved instead of \"pushed since review\". GitHub still blocks the merge until the stale review is re-done or dismissed. Off keeps \"pushed since review\" and notes the approval."
+type = "boolean"
+default = false
+advanced = true
+
+[[settings]]
 key = "show_status_text"
 label = "Show PR status summary text in session row"
 description = "Show the words summary at the end of each session row (e.g. \"CI failing\", \"approved\"). Turn off to keep only the PR status icons. The GitHub pane is unaffected."
@@ -288,6 +304,10 @@ id = "github_comments"
 [[ui]]
 slot = "filter-facet"
 id = "github_conflicts"
+
+[[ui]]
+slot = "filter-facet"
+id = "github_queue"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking
 # ndjson JSON-RPC over stdio. The host requires the entrypoint to be

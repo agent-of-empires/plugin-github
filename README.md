@@ -8,9 +8,10 @@ common git/GitHub operations from #658 without dropping into a terminal.
 > layer from AoE core (PR #1681 / issue #1667) into a Tier 1 plugin worker, with
 > structured `github.status` (open PRs for the branch, each with its URL) and
 > `github.open` (open-in-GitHub). The per-session pane shows rich PR state
-> (state incl. merged, review state, merge conflicts, CI checks, and unresolved comments) when a
-> token is present, degrading to open PRs only without one. The write operations
-> (create/merge PR, push, pull, fix-CI) land in follow-ups.
+> (state incl. merged, review state, merge conflicts, merge queue position and
+> state, CI checks, and unresolved comments) when a token is present, degrading
+> to open PRs only without one. The write operations (create/merge PR, push, pull,
+> fix-CI) land in follow-ups.
 
 ## Layout
 
@@ -45,7 +46,7 @@ anything is written.
 | Command | `refresh` -> worker method `github.refresh`                        |
 | Command | `open` (open-in-GitHub) -> worker method `github.open`             |
 | Command | `open_pr` (`GitHub: open PR`) -> client `open-ui-link` action, default chord `Ctrl+Shift+G` |
-| UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), five `filter-facet`s (`github_ci`, `github_review`, `github_pr`, `github_comments`, `github_conflicts`), and a `pane` tool-window (`github_pane`) |
+| UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), six `filter-facet`s (`github_ci`, `github_review`, `github_pr`, `github_comments`, `github_conflicts`, `github_queue`), and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
 ### GitHub review suggestions
@@ -90,7 +91,7 @@ highest-attention PR and is present whenever an open PR exists, independent of t
 
 Compatible with the [Board](https://github.com/agent-of-empires/plugin-kanban)
 (kanban) plugin. Its Cards show the PR badges and status text as the sidebar
-does, and its Signal columns can match on the five filter facets below, e.g. a
+does, and its Signal columns can match on the six filter facets below, e.g. a
 column holding every session where `GitHub CI is failing` or `GitHub review is
 changes requested`.
 
@@ -142,12 +143,15 @@ session-less `github.refresh` cover every session and prune vanished ones:
 1. `sessions.list` (host RPC) -> every active session and its workspace
    `project_path`. Archived and snoozed sessions are skipped: they are inactive,
    so polling them would only spend GitHub quota for no UI change.
-2. For each workspace, discover the git checkouts: the workspace root plus each
-   immediate child directory that is its own checkout (worktree-safe, a
-   worktree's `.git` is a file, so discovery asks `git rev-parse --show-toplevel`
-   rather than looking for a `.git` directory). Immediate child submodules are
-   skipped by default; turn off `ignore_submodules` to include them again. The
-   workspace root is still scanned when it is itself a submodule.
+2. Prefer the host's explicit `workspace_repos` list: each entry supplies a
+   source checkout path and the branch attached to this session. This branch
+   is authoritative even when the source checkout's current branch differs.
+   Metadata paths must name checkout roots (including worktrees and symlink
+   aliases); stale paths and repository subdirectories are skipped. If no
+   metadata entry names a checkout, use shallow discovery under
+   `project_path`: the workspace root and immediate child checkouts. Immediate
+   child submodules are skipped by default; turn off `ignore_submodules` to
+   include them.
 3. Resolve each checkout to `(owner, repo, branch)`, deduplicate (a branch shared
    across workspaces is fetched once), and look up its PRs. Local git identity
    and the REST lookups fan out on small bounded thread pools so a big workspace
@@ -158,18 +162,18 @@ session-less `github.refresh` cover every session and prune vanished ones:
    forced refresh, a cold cache, or a cheap digest query detecting a change past
    the freshness ceiling) does it spend the expensive
    GraphQL query for the rich state (PR state incl. MERGED, `reviewDecision`,
-   mergeability (merge conflicts with the base), the
-   head commit's check rollup + per-check runs, and every unresolved review
-   thread with its first comment). Branches of the same repo that need a fresh
+   mergeability (merge conflicts with the base), merge queue membership/state/
+   position, the head commit's check rollup + per-check runs, and every unresolved
+   review thread with its first comment). Branches of the same repo that need a fresh
    fetch are aliased into one batched GraphQL query rather than one per branch, so
    a workspace of many worktrees of one repo costs a single query (split into a
    few once it exceeds the per-query alias cap). Without a token it is the basic
    REST open-PR lookup only.
-4. Push one global `sort-key`, five global `filter-facet`s (below), and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
+4. Push one global `sort-key`, six global `filter-facet`s (below), and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
    chip sequence per open PR: a clickable PR icon, a merge-conflict chip when the
-   PR conflicts with its base, then review-state, CI-rollup,
-   and unresolved-comment chips, each shown only when a token supplies that field,
-   concatenated across the workspace's repos, plus an error marker per failed
+   PR conflicts with its base, a merge-queue status/position chip when queued, then
+   review-state, CI-rollup, and unresolved-comment chips, each shown only when a
+   token supplies that field, concatenated across the workspace's repos, plus an error marker per failed
    repo. Each chip is colored by tone, so failing CI / changes requested read as
    danger, unresolved comments as warn, and a healthy PR as success,
    distinguishing a broken PR from a healthy one at a glance; a draft shows the PR
@@ -191,7 +195,7 @@ session-less `github.refresh` cover every session and prune vanished ones:
 Filter facets: each session's `row-column` carries `filter_values`, the sorted
 union of facts across every open (non-merged) PR in the workspace, drafts
 included. They are data, not display, so the session-row chip toggles do not
-affect them. The five global `filter-facet` entries point at that column
+affect them. The six global `filter-facet` entries point at that column
 (`column: "github_pr_status"`) and list the values a user can pick; a facet
 matches a session when its `filter_values` holds any selected value, so the
 dashboard sidebar and other plugins (such as the Board) can filter sessions by
@@ -204,6 +208,7 @@ dashboard sidebar and other plugins (such as the Board) can filter sessions by
 | `github_pr`       | GitHub PR       | `pr:open`, `pr:draft`                                                                                     |
 | `github_comments` | GitHub comments | `comments:unresolved` (at least one unresolved review thread)                                            |
 | `github_conflicts` | GitHub conflicts | `conflicts:yes` (the PR conflicts with its base)                                                        |
+| `github_queue`    | GitHub merge queue | `queue:queued`, `queue:awaiting-checks`, `queue:mergeable`, `queue:locked`, `queue:unmergeable` (only while the PR is in a merge queue) |
 
 Each option is `{ value, label, tone }`, with the label and tone matching the
 pane's CI and review vocabulary. Without a token only the `pr:*` values exist.
@@ -225,15 +230,14 @@ no `304`) is two-tier: the expensive rich query (per-check runs, review threads,
 comment excerpts; roughly 25-30 points per 10-branch batch) fires only when the
 conditional check reports a change, on a forced refresh, on a cold cache, or when
 the cheap DIGEST query detects a change. The digest (~1 point per batch) carries
-just the change-detection fields (PR state, `reviewDecision`, `updatedAt`, head
-commit, check rollup state, review-thread count) and revalidates cached rich
+just the change-detection fields (PR state, `reviewDecision`, `updatedAt`, head commit, merge queue membership/state/position, check rollup state, review-thread count) and revalidates cached rich
 state past its freshness ceiling; a matching signature serves the cache and
 re-arms the window, so an idle workspace revalidates for pennies instead of
 re-paying the rich query every 5 minutes. The ceilings exist because the `/pulls`
 list ETag does not reliably bump when a CI check completes or a review thread
 changes. They are state-aware: a branch whose cached state is active (a CI check
-running or queued) digests on a short ceiling so a finishing CI run shows up on
-the next tick, while a terminal or awaiting-review branch uses the 300s ceiling.
+running or queued, or a PR in a merge queue) digests on a short ceiling so
+finishing checks and queue transitions show up on the next tick, while a terminal or awaiting-review branch uses the 300s ceiling.
 Because the digest cannot see everything the pane renders (a comment body edit,
 a per-check change under an unchanged rollup), a hard full-refresh ceiling
 (2h idle, 5m active) bounds how long a full fetch can be deferred. Either way a
@@ -290,22 +294,24 @@ The pane is one-PR-focused, and reads top to bottom:
 1. **PR selector.** Every PR in the session, most-actionable first (the same
    attention ladder the session row uses, with merged PRs sinking below every open
    one). Each row carries `#number`, the title, `branch · author`, and a glyph
-   strip for CI / review / conflicts / unresolved-comment count. Clicking a row
-   fires `github.select_pr { pr }`; the trailing arrow is a separate link to
-   GitHub, so picking a PR never navigates away. The selection is remembered in
-   memory per session, and falls back to the top of the list whenever the PR it
-   named is no longer in the snapshot (merged, closed, renamed).
+   strip for CI / review / conflicts / merge-queue state and position /
+   unresolved-comment count. Clicking a row fires `github.select_pr { pr }`; the
+   trailing arrow is a separate link to GitHub, so picking a PR never navigates
+   away. The selection is remembered in memory per session, and falls back to the
+   top of the list whenever the PR it named is no longer in the snapshot (merged,
+   closed, renamed).
 2. **Merge verdict** (`callout`). Why the PR can or cannot merge, derived here
    rather than fetched: `mergeStateStatus` collapses conflicts, policy, CI and
    review into one enum and so cannot say which is blocking. The ladder is
-   draft, conflicts, changes requested, awaiting re-review, failing checks, running
+   draft, merge queue state, conflicts, changes requested, awaiting re-review, failing checks, running
    checks, unresolved comments, ready, awaiting review, ordered by who can clear
    the block. "Awaiting re-review" (`pushed since review` in the row) is a
    changes-requested decision whose blocking reviews were all made on an older
    commit; it still blocks the merge on GitHub until the reviewer re-reviews or
-   dismisses, but reads as info, not an alarm. **This
-   plugin never merges for you:** a mergeable PR gets a link out to GitHub, and a
-   blocked one an inert button naming the block.
+   dismisses, but reads as info, not an alarm. A queued PR is never shown as
+   directly mergeable. **This plugin never merges for you:** queued PRs link to
+   the merge queue on GitHub; a directly mergeable PR gets a merge link, and a
+   blocked one gets an inert button naming the block.
 3. **Review.** One row per reviewer (initials, name, current position), from
    `latestReviews` plus any outstanding `reviewRequests`, under the summary GitHub
    itself would show. Degrades to the single aggregate review-state row when
@@ -353,6 +359,12 @@ comma-separated list of GitHub logins whose COMMENTED reviews and unresolved
 threads never make a PR read "commented", so that state means a person
 commented. The PR author's own comments (e.g. replies to review threads) never
 count either. Their unresolved threads still count toward unresolved comments.
+
+The advanced `approved_overrides_stale_block` setting (default off) makes a PR
+read "approved" when a reviewer requested changes on an older commit and another
+reviewer approved the current head. Off, it stays "pushed since review" and the
+reviewer summary notes the approval. GitHub still blocks the merge until the
+stale review is re-done or dismissed.
 
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol
