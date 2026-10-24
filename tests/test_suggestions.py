@@ -1,0 +1,685 @@
+import json
+import time
+import queue
+import subprocess
+
+import httpx
+import pytest
+
+from aoe_github_plugin import main
+from aoe_github_plugin import refresh
+from aoe_github_plugin import suggestions
+from aoe_github_plugin.client import GitHubClient
+from aoe_github_plugin.errors import RateLimitedError
+
+ALL = set(suggestions.CRITERIA)
+PAGE_DONE = {"hasNextPage": False, "endCursor": None}
+
+
+class FakeClient:
+    """Routes each GraphQL search by a substring of its query string, so a test
+    declares which GitHub answers exist and asserts which queries ran."""
+
+    def __init__(self, searches=None, *, login="me", notifications=None, comments=None, review_pages=None):
+        self.searches = searches or {}
+        self.login = login
+        self.notifications = notifications if notifications is not None else []
+        self.comments = comments or {}
+        self.review_pages = list(review_pages or [])
+        self.queries = []
+        self.rest = []
+        self.notifications_status = 200
+
+    def post_graphql(self, query, variables):
+        if " viewer {" in query:
+            self.queries.append("viewer")
+            return {"data": {"viewer": {"login": self.login}}}
+        if "node(id:" in query:
+            self.queries.append("reviews")
+            return self.review_pages.pop(0)
+        search = variables["query"]
+        self.queries.append(search)
+        for needle, pages in self.searches.items():
+            if needle in search:
+                if callable(pages):
+                    return pages(variables)
+                return {
+                    "data": {
+                        "rateLimit": {"cost": 1, "remaining": 4000},
+                        "search": {"nodes": pages, "pageInfo": PAGE_DONE},
+                    }
+                }
+        return {"data": {"search": {"nodes": [], "pageInfo": PAGE_DONE}}}
+
+    def get_json_conditional(self, path, params=None, etag=None):
+        self.rest.append((path, dict(params or {}), etag))
+        if self.notifications_status == 304:
+            return 304, etag, None
+        return 200, "etag-1", self.notifications
+
+    def get_json(self, path, params=None):
+        self.rest.append((path, dict(params or {}), None))
+        if path.startswith("/notifications"):
+            return []
+        return self.comments[path]
+
+
+def _pr(url="https://github.com/acme/widgets/pull/42", **overrides):
+    pr = {
+        "id": "PR_kwDO42",
+        "url": url,
+        "number": 42,
+        "title": "Fix widget",
+        "body": "Please fix the widget",
+        "updatedAt": "2026-10-20T10:00:00Z",
+        "headRefName": "fix-widget",
+        "baseRefName": "main",
+        "repository": {"nameWithOwner": "acme/widgets"},
+        "author": {"login": "someone"},
+        "reviewRequests": {"nodes": [{"requestedReviewer": {"login": "me"}}]},
+        "reviews": {"nodes": [], "pageInfo": PAGE_DONE},
+        "commits": {"nodes": [{"commit": {"oid": "head"}}]},
+    }
+    pr.update(overrides)
+    return pr
+
+
+def _issue(number=7, url="https://github.com/acme/widgets/issues/7", **overrides):
+    issue = {
+        "number": number,
+        "url": url,
+        "title": "Widget breaks",
+        "body": "Steps to reproduce",
+        "createdAt": "2026-10-21T10:00:00Z",
+        "updatedAt": "2026-10-21T11:00:00Z",
+        "repository": {"nameWithOwner": "acme/widgets"},
+        "author": {"login": "reporter"},
+        "labels": {"nodes": [{"name": "bug"}, {"name": "p1"}]},
+    }
+    issue.update(overrides)
+    return issue
+
+
+def _review(login, state, oid="head"):
+    return {"author": {"login": login}, "state": state, "commit": {"oid": oid}}
+
+
+def _discover(client, enabled, **kwargs):
+    return suggestions._discover(client, enabled=set(enabled), repos=set(), orgs=set(), projects={}, **kwargs)
+
+
+def _authored_pr(**overrides):
+    return _pr(author={"login": "me"}, reviewRequests={"nodes": []}, **overrides)
+
+
+@pytest.fixture(autouse=True)
+def _reset_caches(monkeypatch):
+    monkeypatch.setattr(suggestions, "_notifications_cache", {"etag": None, "items": []})
+    monkeypatch.setattr(refresh, "graphql_backoff_until", lambda: 0.0)
+
+
+# --- one query per criterion, none when it is off -----------------------------
+
+
+def test_review_requested_builds_item_with_variables_and_untrusted_prompt():
+    client = FakeClient({" review-requested:@me": [_pr()]})
+    items = _discover(client, {"review_requested"})
+    assert client.queries == ["is:open is:pr review-requested:@me"]
+    assert len(items) == 1
+    item = items[0]
+    assert item["criterion"] == "review_requested"
+    assert item["source_ref"] == "https://github.com/acme/widgets/pull/42"
+    assert item["variables"] == {
+        "repo": "acme/widgets",
+        "org": "acme",
+        "title": "Fix widget",
+        "url": "https://github.com/acme/widgets/pull/42",
+        "timestamp": "2026-10-20T10:00:00Z",
+        "pr_number": "42",
+        "author": "someone",
+        "branch": "fix-widget",
+        "base_branch": "main",
+        "commit_sha": "head",
+    }
+    assert item["draft"]["prompt"].endswith(suggestions.UNTRUSTED)
+    assert "project" not in item
+
+
+@pytest.mark.parametrize(
+    ("off", "needle"),
+    [
+        ({"review_requested"}, " review-requested:@me"),
+        ({"re_review"}, "reviewed-by:@me"),
+        (set(suggestions.AUTHORED_CRITERIA), " author:@me"),
+        ({"assigned_issues"}, "assignee:@me"),
+        ({"new_issues"}, "created:>="),
+    ],
+)
+def test_disabled_criterion_never_queries_github(off, needle):
+    client = FakeClient({needle: [_pr()]})
+    suggestions._discover(client, enabled=ALL - off, repos=set(), orgs=set(), projects={"acme/widgets": "/w"})
+    assert client.queries
+    assert not any(needle in query for query in client.queries)
+
+
+def test_authored_search_runs_once_for_its_four_criteria_and_not_at_all_when_all_off():
+    client = FakeClient({" author:@me": [_authored_pr(mergeable="CONFLICTING")]})
+    _discover(client, set(suggestions.AUTHORED_CRITERIA))
+    assert client.queries == ["is:open is:pr author:@me"]
+    off = FakeClient({" author:@me": [_authored_pr(mergeable="CONFLICTING")]})
+    _discover(off, ALL - set(suggestions.AUTHORED_CRITERIA) - {"new_issues"})
+    assert not any(" author:@me" in query for query in off.queries)
+
+
+def test_mentions_off_skips_notifications_entirely():
+    client = FakeClient(notifications=[{"unread": True, "reason": "mention"}])
+    _discover(client, ALL - {"mentioned", "new_issues"})
+    assert client.rest == []
+
+
+def test_no_enabled_criteria_makes_no_requests_at_all(monkeypatch):
+    monkeypatch.setattr(suggestions, "resolve_token", lambda _env: pytest.fail("token resolved for nothing"))
+    assert suggestions.fetch_suggestions(enabled=set(), repos_raw="", orgs_raw="", mapping_raw="") == []
+
+
+# --- authored PR classification -----------------------------------------------
+
+
+def test_authored_pr_reports_every_matched_reason_under_the_first_criterion():
+    pr = _authored_pr(
+        mergeable="CONFLICTING",
+        reviews={"nodes": [_review("rev", "CHANGES_REQUESTED")], "pageInfo": PAGE_DONE},
+        reviewThreads={
+            "nodes": [
+                {"isResolved": False, "comments": {"nodes": [{"author": {"login": "rev"}}]}},
+                {"isResolved": False, "comments": {"nodes": [{"author": {"login": "me"}}]}},
+                {"isResolved": True, "comments": {"nodes": [{"author": {"login": "rev"}}]}},
+            ]
+        },
+        commits={
+            "nodes": [
+                {
+                    "commit": {
+                        "oid": "head",
+                        "statusCheckRollup": {
+                            "contexts": {
+                                "nodes": [
+                                    {"name": "lint", "conclusion": "FAILURE"},
+                                    {"name": "test", "conclusion": "SUCCESS"},
+                                    {"context": "ci/status", "state": "ERROR"},
+                                ]
+                            }
+                        },
+                    }
+                }
+            ]
+        },
+    )
+    client = FakeClient({" author:@me": [pr]})
+    items = _discover(client, set(suggestions.AUTHORED_CRITERIA))
+    assert len(items) == 1
+    item = items[0]
+    assert item["criterion"] == "changes_requested"
+    assert item["reason"] == (
+        "Changes requested by rev; 1 unresolved review thread(s) await your reply; "
+        "Merge conflict with the base branch; Failing checks: lint, ci/status"
+    )
+    assert item["variables"]["reviewer"] == "rev"
+    assert item["variables"]["unresolved_threads"] == "1"
+    assert item["variables"]["failed_checks"] == "lint, ci/status"
+
+
+def test_authored_pr_only_reports_enabled_reasons():
+    pr = _authored_pr(
+        mergeable="CONFLICTING", reviews={"nodes": [_review("rev", "CHANGES_REQUESTED")], "pageInfo": PAGE_DONE}
+    )
+    items = _discover(FakeClient({" author:@me": [pr]}), {"merge_conflict"})
+    assert [item["criterion"] for item in items] == ["merge_conflict"]
+    assert items[0]["reason"] == "Merge conflict with the base branch"
+    assert "reviewer" not in items[0]["variables"]
+
+
+@pytest.mark.parametrize(
+    ("reviews", "expected"),
+    [
+        ([_review("rev", "CHANGES_REQUESTED", "old")], []),
+        ([_review("rev", "CHANGES_REQUESTED"), _review("rev", "APPROVED")], []),
+        ([_review("rev", "CHANGES_REQUESTED"), _review("rev", "DISMISSED")], []),
+        ([_review("rev", "CHANGES_REQUESTED"), _review("rev", "COMMENTED")], ["changes_requested"]),
+        ([_review("a", "CHANGES_REQUESTED"), _review("b", "APPROVED")], ["changes_requested"]),
+    ],
+)
+def test_changes_requested_needs_a_current_blocking_verdict_on_head(reviews, expected):
+    pr = _authored_pr(reviews={"nodes": list(reviews), "pageInfo": PAGE_DONE})
+    items = _discover(FakeClient({" author:@me": [pr]}), {"changes_requested"})
+    assert [item["criterion"] for item in items] == expected
+
+
+def test_authored_pr_with_nothing_wrong_is_not_suggested():
+    assert (
+        _discover(
+            FakeClient({" author:@me": [_authored_pr(mergeable="MERGEABLE")]}), set(suggestions.AUTHORED_CRITERIA)
+        )
+        == []
+    )
+
+
+# --- re-review ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("reviews", "head", "expected"),
+    [
+        ([_review("me", "APPROVED", "old")], "head", ["re_review"]),
+        ([_review("me", "COMMENTED", "old")], "head", ["re_review"]),
+        ([_review("me", "APPROVED", "head")], "head", []),
+        ([_review("other", "APPROVED", "old")], "head", []),
+        ([_review("me", "APPROVED", "old"), _review("me", "COMMENTED", "head")], "head", []),
+    ],
+)
+def test_re_review_needs_new_commits_since_my_last_review(reviews, head, expected):
+    pr = _pr(
+        reviews={"nodes": list(reviews), "pageInfo": PAGE_DONE},
+        commits={"nodes": [{"commit": {"oid": head}}]},
+        reviewRequests={"nodes": []},
+    )
+    client = FakeClient({"reviewed-by:@me": [pr]})
+    items = _discover(client, {"re_review"})
+    assert client.queries[0] == "viewer"
+    assert client.queries[1] == "is:open is:pr reviewed-by:@me -author:@me -review-requested:@me"
+    assert [item["criterion"] for item in items] == expected
+    if expected:
+        assert items[0]["variables"]["reviewed_commit_sha"] == "old"
+
+
+def test_formal_review_request_wins_over_re_review_for_the_same_pr():
+    pr = _pr(reviews={"nodes": [_review("me", "APPROVED", "old")], "pageInfo": PAGE_DONE})
+    items = _discover(
+        FakeClient({" review-requested:@me": [pr], "reviewed-by:@me": [pr]}), {"review_requested", "re_review"}
+    )
+    assert [item["criterion"] for item in items] == ["review_requested"]
+
+
+def test_review_history_paginates_before_classifying(monkeypatch):
+    first = {"nodes": [_review("me", "APPROVED", "old")], "pageInfo": {"hasNextPage": True, "endCursor": "c2"}}
+    pr = _pr(reviews=first, reviewRequests={"nodes": []})
+    client = FakeClient(
+        {"reviewed-by:@me": [pr]},
+        review_pages=[
+            {"data": {"node": {"reviews": {"nodes": [_review("me", "COMMENTED", "head")], "pageInfo": PAGE_DONE}}}}
+        ],
+    )
+    # The first page holds the oldest review (on "old"); the newest, on the next page, is on head.
+    assert _discover(client, {"re_review"}) == []
+    assert "reviews" in client.queries
+
+
+# --- mentions -------------------------------------------------------------------
+
+
+def _notification(**overrides):
+    base = {
+        "unread": True,
+        "reason": "mention",
+        "updated_at": "2026-10-22T08:00:00Z",
+        "repository": {"full_name": "acme/widgets"},
+        "subject": {
+            "type": "PullRequest",
+            "title": "Fix widget",
+            "url": "https://api.github.com/repos/acme/widgets/pulls/42",
+            "latest_comment_url": "https://api.github.com/repos/acme/widgets/issues/comments/9",
+        },
+    }
+    base.update(overrides)
+    return base
+
+
+def test_mentions_come_from_unread_mention_notifications_with_comment_preview():
+    client = FakeClient(
+        notifications=[
+            _notification(),
+            _notification(reason="subscribed"),
+            _notification(unread=False),
+            _notification(subject={"type": "Release", "title": "v1", "url": "https://api.github.com/x/1"}),
+        ],
+        comments={
+            "https://api.github.com/repos/acme/widgets/issues/comments/9": {
+                "body": "@me  look",
+                "html_url": "https://github.com/acme/widgets/pull/42#issuecomment-9",
+            }
+        },
+    )
+    items = _discover(client, {"mentioned"})
+    assert len(items) == 1
+    item = items[0]
+    assert item["criterion"] == "mentioned"
+    assert item["source_ref"] == "https://github.com/acme/widgets/pull/42"
+    assert item["preview"] == "@me look"
+    assert item["variables"]["kind"] == "pr"
+    assert item["variables"]["number"] == "42"
+    assert item["variables"]["comment_url"] == "https://github.com/acme/widgets/pull/42#issuecomment-9"
+    assert client.rest[0] == ("/notifications", {"per_page": "50", "page": "1"}, None)
+
+
+def test_mentions_replay_cached_inbox_on_304():
+    client = FakeClient(
+        notifications=[
+            _notification(
+                subject={"type": "Issue", "title": "t", "url": "https://api.github.com/repos/acme/widgets/issues/5"}
+            )
+        ]
+    )
+    assert len(_discover(client, {"mentioned"})) == 1
+    client.notifications_status = 304
+    client.notifications = []
+    items = _discover(client, {"mentioned"})
+    assert len(items) == 1
+    assert client.rest[-1][2] == "etag-1"
+
+
+def test_mentions_respect_repo_scope():
+    client = FakeClient(notifications=[_notification()])
+    items = suggestions._discover(client, enabled={"mentioned"}, repos={"other/repo"}, orgs=set(), projects={})
+    assert items == []
+
+
+# --- issues ---------------------------------------------------------------------
+
+
+def test_assigned_issue_builds_issue_variables():
+    client = FakeClient({"assignee:@me": [_issue()]})
+    items = _discover(client, {"assigned_issues"})
+    assert client.queries == ["is:open is:issue assignee:@me"]
+    assert items[0]["source_ref"] == "https://github.com/acme/widgets/issues/7"
+    assert items[0]["variables"]["issue_number"] == "7"
+    assert items[0]["variables"]["labels"] == "bug, p1"
+    assert items[0]["variables"]["author"] == "reporter"
+
+
+def test_new_issues_use_registered_project_repos_when_no_scope_and_skip_without_any():
+    client = FakeClient({"created:>=": [_issue()]})
+    projects = {f"acme/r{i}": f"/code/r{i}" for i in range(25)}
+    items = suggestions._discover(client, enabled={"new_issues"}, repos=set(), orgs=set(), projects=projects)
+    searches = [query for query in client.queries if "created:>=" in query]
+    assert len(searches) == 2
+    assert searches[0].startswith("is:open is:issue -author:@me created:>=")
+    assert searches[0].count("repo:") == 20
+    assert searches[1].count("repo:") == 5
+    assert items[0]["criterion"] == "new_issues"
+    assert items[0]["variables"]["timestamp"] == "2026-10-21T10:00:00Z"
+    empty = FakeClient({"created:>=": [_issue()]})
+    assert _discover(empty, {"new_issues"}) == []
+    assert empty.queries == []
+
+
+def test_new_issues_use_explicit_scope_instead_of_project_repos():
+    client = FakeClient({"created:>=": [_issue()]})
+    suggestions._discover(
+        client, enabled={"new_issues"}, repos={"acme/widgets"}, orgs={"other"}, projects={"x/y": "/x"}
+    )
+    assert client.queries[0].endswith(" repo:acme/widgets org:other")
+    assert "repo:x/y" not in client.queries[0]
+
+
+# --- ranking, dedup, projects, limits ---------------------------------------------
+
+
+def test_fetch_ranks_by_criterion_then_recency_and_dedups_by_source(monkeypatch):
+    assigned = _issue(updatedAt="2026-10-01T00:00:00Z")
+    new = _issue(number=8, url="https://github.com/acme/widgets/issues/8", createdAt="2026-10-22T00:00:00Z")
+    older_new = _issue(number=9, url="https://github.com/acme/widgets/issues/9", createdAt="2026-10-20T00:00:00Z")
+    client = FakeClient({"assignee:@me": [assigned], "created:>=": [new, older_new, _issue()]})
+    monkeypatch.setattr(suggestions, "GitHubClient", lambda _token: _Ctx(client))
+    monkeypatch.setattr(suggestions, "resolve_token", lambda _env: ("t", "env"))
+    items = suggestions.fetch_suggestions(
+        enabled={"assigned_issues", "new_issues"},
+        repos_raw="",
+        orgs_raw="",
+        mapping_raw="acme/widgets=/code/widgets",
+        project_repos={"ACME/widgets": "/derived"},
+    )
+    assert [(item["criterion"], item["source_ref"].rsplit("/", 1)[1]) for item in items] == [
+        ("assigned_issues", "7"),
+        ("new_issues", "8"),
+        ("new_issues", "9"),
+    ]
+    assert all(item["project"] == "/code/widgets" for item in items)
+
+
+def test_fetch_applies_limit_and_derived_project_mapping(monkeypatch):
+    client = FakeClient(
+        {"assignee:@me": [_issue(number=n, url=f"https://github.com/acme/widgets/issues/{n}") for n in range(5)]}
+    )
+    monkeypatch.setattr(suggestions, "GitHubClient", lambda _token: _Ctx(client))
+    monkeypatch.setattr(suggestions, "resolve_token", lambda _env: ("t", "env"))
+    items = suggestions.fetch_suggestions(
+        enabled={"assigned_issues"},
+        repos_raw=None,
+        orgs_raw=None,
+        mapping_raw=None,
+        limit_raw=2,
+        project_repos={"acme/widgets": "/derived"},
+    )
+    assert len(items) == 2
+    assert items[0]["project"] == "/derived"
+
+
+class _Ctx:
+    def __init__(self, client):
+        self.client = client
+
+    def __enter__(self):
+        return self.client
+
+    def __exit__(self, *exc):
+        return False
+
+
+# --- rate limits ------------------------------------------------------------------
+
+
+def test_active_backoff_gate_raises_before_any_request(monkeypatch):
+    monkeypatch.setattr(refresh, "graphql_backoff_until", lambda: time.monotonic() + 60)
+    monkeypatch.setattr(suggestions, "resolve_token", lambda _env: pytest.fail("token resolved while backed off"))
+    with pytest.raises(RuntimeError, match="rate limited"):
+        suggestions.fetch_suggestions(enabled={"assigned_issues"}, repos_raw="", orgs_raw="", mapping_raw="")
+
+
+def test_rate_limited_response_arms_backoff_and_reports_error(monkeypatch):
+    armed = []
+    monkeypatch.setattr(refresh, "arm_backoff", lambda api, _reset_at=None: armed.append(api))
+    monkeypatch.setattr(suggestions, "resolve_token", lambda _env: ("t", "env"))
+
+    class Limited(FakeClient):
+        def post_graphql(self, query, variables):
+            raise RateLimitedError
+
+    monkeypatch.setattr(suggestions, "GitHubClient", lambda _token: _Ctx(Limited()))
+    with pytest.raises(RuntimeError, match="rate limit"):
+        suggestions.fetch_suggestions(enabled={"assigned_issues"}, repos_raw="", orgs_raw="", mapping_raw="")
+    assert armed == ["graphql", "rest"]
+
+
+def test_search_reports_rate_limit_spend(monkeypatch):
+    seen = []
+    monkeypatch.setattr(refresh, "note_graphql_rate_limit", seen.append)
+    _discover(FakeClient({"assignee:@me": [_issue()]}), {"assigned_issues"})
+    assert seen == [{"cost": 1, "remaining": 4000}]
+
+
+def test_search_pagination_cap_rejects_incomplete_snapshot():
+    def pages(variables):
+        return {"data": {"search": {"nodes": [_issue()], "pageInfo": {"hasNextPage": True, "endCursor": "next"}}}}
+
+    with pytest.raises(RuntimeError, match="pagination limit"):
+        _discover(FakeClient({"assignee:@me": pages}), {"assigned_issues"})
+
+
+def test_graphql_errors_never_yield_a_partial_snapshot():
+    def pages(variables):
+        return {"data": {"search": {"nodes": [_issue()], "pageInfo": PAGE_DONE}}, "errors": [{"message": "boom"}]}
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        _discover(FakeClient({"assignee:@me": pages}), {"assigned_issues"})
+
+
+# --- runtime wiring -----------------------------------------------------------------
+
+
+def _host(sources=None, projects=None, settings=None):
+    def call_host(method, params, timeout=None):
+        if method == main.SUGGESTIONS_SOURCES:
+            return sources
+        if method == main.PROJECTS_LIST:
+            return projects
+        if method == main.CONFIG_GET:
+            return {"value": (settings or {}).get(params["key"])}
+        return None
+
+    return call_host
+
+
+def test_runtime_passes_host_enabled_criteria_and_derived_projects(monkeypatch, tmp_path):
+    checkout = tmp_path / "widgets"
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "remote", "add", "origin", "git@github.com:Acme/Widgets.git"], check=True
+    )
+    sent = []
+    runtime = main.Runtime(send=sent.append)
+    runtime.call_host = _host(
+        sources={
+            "sources": [{"criterion": "mentioned", "enabled": True}, {"criterion": "new_issues", "enabled": False}]
+        },
+        projects={"projects": [{"name": "widgets", "path": str(checkout)}, {"name": "nogit", "path": str(tmp_path)}]},
+        settings={"suggestion_limit": 5},
+    )
+    captured = {}
+
+    def fetch(**kwargs):
+        captured.update(kwargs)
+        return [{"id": "x"}]
+
+    monkeypatch.setattr(main.suggestions, "fetch_suggestions", fetch)
+    runtime._refresh_suggestions()
+    assert captured["enabled"] == {"mentioned"}
+    assert captured["project_repos"] == {"acme/widgets": str(checkout)}
+    assert captured["limit_raw"] == 5
+    assert sent[-1]["method"] == "suggestions.set"
+    assert sent[-1]["params"] == {"items": [{"id": "x"}]}
+
+
+def test_runtime_falls_back_to_manifest_defaults_when_host_cannot_list_sources(monkeypatch):
+    runtime = main.Runtime(send=lambda _m: None)
+    runtime.call_host = _host(sources=None, projects=None, settings={})
+    captured = {}
+    monkeypatch.setattr(main.suggestions, "fetch_suggestions", lambda **kw: captured.update(kw) or [])
+    runtime._refresh_suggestions()
+    assert captured["enabled"] == set(suggestions.DEFAULT_ENABLED)
+    assert captured["project_repos"] == {}
+
+
+def test_runtime_publishes_empty_snapshot_without_fetching_when_everything_is_off(monkeypatch):
+    sent = []
+    runtime = main.Runtime(send=sent.append)
+    runtime.call_host = _host(sources={"sources": [{"criterion": "mentioned", "enabled": False}]}, settings={})
+    monkeypatch.setattr(main.suggestions, "resolve_token", lambda _env: pytest.fail("fetched with everything off"))
+    runtime._refresh_suggestions()
+    assert sent[-1] == {"jsonrpc": "2.0", "id": sent[-1]["id"], "method": "suggestions.set", "params": {"items": []}}
+
+
+def test_runtime_retains_last_good_snapshot_on_error(monkeypatch):
+    sent = []
+    runtime = main.Runtime(send=sent.append)
+    runtime.call_host = _host(sources=None, settings={})
+    monkeypatch.setattr(main.suggestions, "fetch_suggestions", lambda **_kw: [{"id": "ok"}])
+    runtime._refresh_suggestions()
+    previous = runtime._suggestions_last_good
+
+    def fail(**kwargs):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(main.suggestions, "fetch_suggestions", fail)
+    runtime._refresh_suggestions()
+    assert runtime._suggestions_last_good is previous
+    assert sent[-1]["method"] == "suggestions.error"
+    assert sent[-1]["params"]["message"] == "offline"
+
+
+@pytest.mark.parametrize("failed_key", main.SUGGESTION_SETTING_KEYS)
+def test_runtime_config_failure_never_fetches_or_replaces_last_good_snapshot(monkeypatch, failed_key):
+    sent = []
+    runtime = main.Runtime(send=sent.append)
+    runtime._suggestions_last_good = [{"id": "keep"}]
+
+    def call_host(method, params, timeout=None):
+        if method == main.CONFIG_GET and params["key"] == failed_key:
+            return None
+        return _host(sources=None, settings={})(method, params)
+
+    runtime.call_host = call_host
+    monkeypatch.setattr(
+        main.suggestions, "fetch_suggestions", lambda **_kw: pytest.fail("fetched after config failure")
+    )
+    runtime._refresh_suggestions()
+    assert sent[-1]["method"] == "suggestions.error"
+    assert failed_key in sent[-1]["params"]["message"]
+    assert runtime._suggestions_last_good == [{"id": "keep"}]
+
+
+def test_host_refresh_notification_runs_provider_on_main_thread(monkeypatch):
+    runtime = main.Runtime(send=lambda _m: None)
+    runs = []
+    monkeypatch.setattr(runtime, "_refresh_suggestions", lambda: runs.append(True))
+    runtime.handle_inbound({"jsonrpc": "2.0", "method": "suggestions.refresh"})
+    assert runs == []
+    runtime._service_ticks()
+    assert runs == [True]
+
+
+def test_worker_round_trip_queries_only_enabled_sources(monkeypatch, tmp_path):
+    """Smoke the worker loop, real host RPCs, and discovery with mocked HTTP only."""
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    stdin = queue.Queue()
+    sent = []
+    queries = []
+
+    def graphql(request):
+        assert request.url.path == "/graphql"
+        queries.append(json.loads(request.content)["variables"]["query"])
+        return httpx.Response(200, json={"data": {"search": {"nodes": [_issue()], "pageInfo": PAGE_DONE}}})
+
+    monkeypatch.setattr(
+        suggestions, "GitHubClient", lambda token: GitHubClient(token, transport=httpx.MockTransport(graphql))
+    )
+
+    def host(message):
+        sent.append(message)
+        method = message.get("method")
+        reply = {"jsonrpc": "2.0", "id": message.get("id")}
+        if method == "config.get":
+            values = {"suggestion_repositories": "acme/widgets", "ui_refresh_secs": 0}
+            reply["result"] = {"value": values.get(message["params"]["key"])}
+            stdin.put(json.dumps(reply))
+        elif method == main.SUGGESTIONS_SOURCES:
+            reply["result"] = {"sources": [{"criterion": "assigned_issues", "enabled": True}]}
+            stdin.put(json.dumps(reply))
+        elif method == main.PROJECTS_LIST:
+            reply["result"] = {"projects": []}
+            stdin.put(json.dumps(reply))
+        elif method == "sessions.list":
+            reply["result"] = {"sessions": []}
+            stdin.put(json.dumps(reply))
+        elif method == "suggestions.set":
+            stdin.put(None)
+
+    runtime = main.Runtime(send=host, stdin=iter(stdin.get, None))
+    runtime.run()
+
+    snapshots = [message["params"]["items"] for message in sent if message.get("method") == "suggestions.set"]
+    assert len(snapshots) == 1
+    assert [item["criterion"] for item in snapshots[0]] == ["assigned_issues"]
+    assert snapshots[0][0]["source_ref"] == "https://github.com/acme/widgets/issues/7"
+    assert queries == ["is:open is:issue assignee:@me repo:acme/widgets"]
+    assert not [message for message in sent if message.get("method") == "suggestions.error"]

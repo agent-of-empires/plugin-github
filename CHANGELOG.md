@@ -3,6 +3,23 @@
 All notable changes to the Agent of Empires GitHub plugin will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
+## Unreleased
+
+### Features
+
+- **suggestions:** Publish session-independent GitHub review-request suggestions with scoped discovery, explicit project mapping, and stale-snapshot error handling. Requires AoE 1.20.0+ (SDK API 19).
+- **suggestions:** Declare every criterion in the manifest `[suggestions]` block with its label and prompt variables; honor the host's per-criterion switches (`suggestions.sources`) so a source that is off never queries GitHub.
+- **suggestions:** Add re-review (new commits since your review), review threads awaiting your reply, merge conflicts and failing checks on your PRs, mentions (from unread notifications), issues assigned to you, and new issues in your repositories.
+- **suggestions:** Derive the repository-to-project mapping and the new-issue repository list from registered AoE projects (`projects.list`); explicit `suggestion_projects` entries still override.
+- **suggestions:** Report GraphQL rate-limit spend and share the plugin's backoff gate with the pane refresh.
+
+### Bug Fixes
+
+- **suggestions:** Keep the last-good snapshot when configuration reads fail, and retain pending review requests when an overlapping changes-requested review is stale.
+- **suggestions:** Ignore non-verdict review states when tracking current changes requests, clear dismissed verdicts, and restrict changes-requested searches to the authenticated user's PRs.
+- **suggestions:** Paginate review history before classifying current verdicts; reject incomplete histories instead of publishing partial
+  snapshots.
+
 
 ## [2.3.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.3.0) - 2026-10-21
 
@@ -249,6 +266,3 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - Multi-session multi-repo GitHub UI refresh (+ manifest/worker fixes) in [#6](https://github.com/agent-of-empires/plugin-github/pull/6) by [@Seluj78](https://github.com/Seluj78) ([`352a981`](https://github.com/agent-of-empires/plugin-github/commit/352a981eca8473059dbc4f171f2570d70b28b07d))
 - Dockable pane slot, fresh-on-session-change, and a Refresh button in [#7](https://github.com/agent-of-empires/plugin-github/pull/7) by [@Seluj78](https://github.com/Seluj78) ([`795c6d3`](https://github.com/agent-of-empires/plugin-github/commit/795c6d367f5e81be0bf32aa3aff63c639cff8e27))
 - **pane:** Rich per-PR state (merged/review/CI/comments) via token-gated GraphQL in [#13](https://github.com/agent-of-empires/plugin-github/pull/13) by [@Seluj78](https://github.com/Seluj78) ([`4b66d82`](https://github.com/agent-of-empires/plugin-github/commit/4b66d8212709a4dca18185f35e78db490ea5fc04))
-
-
-
