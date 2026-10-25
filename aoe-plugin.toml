@@ -143,7 +143,7 @@ advanced = true
 [[settings]]
 key = "show_review_status"
 label = "Show review status in session row"
-description = "Show the PR review-state chip (approved / changes requested / awaiting review) on each session row. The GitHub pane still shows review state when this is off."
+description = "Show the PR review-state chip (approved / partially approved / changes requested / awaiting review) on each session row. The GitHub pane still shows review state when this is off."
 type = "boolean"
 default = true
 
@@ -182,7 +182,7 @@ advanced = true
 [[settings]]
 key = "approved_overrides_stale_block"
 label = "Approval overrides a stale changes-requested review"
-description = "When a reviewer requested changes on an older commit and someone else approved the current head, show the PR as approved instead of \"pushed since review\". GitHub still blocks the merge until the stale review is re-done or dismissed. Off keeps \"pushed since review\" and notes the approval."
+description = "When a reviewer requested changes on an older commit and someone else approved the current head, show the PR as approved (or \"partially approved\" if another reviewer is still requested) instead of \"pushed since review\". GitHub still blocks the merge until the stale review is re-done or dismissed. Off keeps \"pushed since review\" and notes the approval."
 type = "boolean"
 default = false
 advanced = true
@@ -219,7 +219,7 @@ id = "github_pane"
 
 # A per-session text cell on the session row: one deterministic words summary of
 # the session's most-urgent PR signal (changes requested / CI failing /
-# unresolved comments / awaiting review / healthy), so the list is scannable
+# unresolved comments / partially approved / awaiting review / healthy), so the list is scannable
 # without hovering the badge or opening the pane (#36). The badge carries the
 # per-repo icon; this carries the words. Driven by one push per session; an empty
 # payload clears it.

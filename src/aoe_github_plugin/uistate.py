@@ -89,6 +89,8 @@ _ICON_ERROR = "circle-alert"
 # review_state -> (lucide icon, host Tone, human label).
 _REVIEW_VISUAL: dict[str, tuple[str, str, str]] = {
     "approved": ("badge-check", "success", "approved"),
+    # Approved, but a reviewer or code-owner group is still outstanding.
+    "partially-approved": ("circle-dashed", "info", "partially approved"),
     "changes-requested": ("circle-x", "danger", "changes requested"),
     # Blocking review made on an older commit: still merge-blocking on GitHub, but
     # likely addressed, so it reads as info rather than an alarm.
@@ -204,9 +206,10 @@ _ATTENTION_VISUAL: dict[str, tuple[int, str, str, str]] = {
     "changes-pushed": (8, *_REVIEW_VISUAL["changes-pushed"][:2], "pushed since review"),
     "awaiting-review": (9, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
     "commented": (10, *_REVIEW_VISUAL["commented"][:2], "commented"),
-    "approved": (11, *_REVIEW_VISUAL["approved"][:2], "approved"),
-    "open": (12, _ICON_OPEN, "success", "open PR"),
-    "draft": (13, _ICON_DRAFT, "warn", "draft"),
+    "partially-approved": (11, *_REVIEW_VISUAL["partially-approved"][:2], "partially approved"),
+    "approved": (12, *_REVIEW_VISUAL["approved"][:2], "approved"),
+    "open": (13, _ICON_OPEN, "success", "open PR"),
+    "draft": (14, _ICON_DRAFT, "warn", "draft"),
 }
 
 
@@ -218,6 +221,7 @@ _KIND_CATEGORY: dict[str, str] = {
     "changes-pushed": "review",
     "awaiting-review": "review",
     "commented": "review",
+    "partially-approved": "review",
     "approved": "review",
     "checks-failing": "ci",
     "checks-running": "ci",
@@ -269,6 +273,7 @@ def _pull_attention(pull: dict[str, Any], chips: frozenset[str]) -> str:
         (review == "changes-pushed", "changes-pushed"),
         (review == "waiting", "awaiting-review"),
         (review == "commented", "commented"),
+        (review == "partially-approved", "partially-approved"),
         (review == "approved", "approved"),
     )
     for cond, kind in rules:
@@ -1021,6 +1026,15 @@ def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
                 "Resolve the open review threads before merging.",
                 ("message-square", "warn"),
                 "unresolved",
+            ),
+        ),
+        (
+            pull.get("review_state") == "partially-approved",
+            _verdict(
+                "Awaiting more approvals",
+                "Approved so far, but another reviewer or code owner group has yet to approve.",
+                _REVIEW_VISUAL["partially-approved"][:2],
+                "partially approved",
             ),
         ),
         (
