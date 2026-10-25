@@ -304,10 +304,12 @@ def _awaiting_approval(pr: dict[str, Any]) -> bool:
     blocked by definition and never count."""
     if _nodes(pr, "reviewRequests"):
         return True
-    commits = _nodes(pr, "commits")
-    rollup = commits[0].get("commit", {}).get("statusCheckRollup") if commits else None
-    green = isinstance(rollup, dict) and rollup.get("state") == "SUCCESS"
-    return pr.get("mergeStateStatus") == "BLOCKED" and green and not pr.get("isDraft")
+    if pr.get("mergeStateStatus") != "BLOCKED" or pr.get("isDraft"):
+        return False
+    # The state the pane shows, not the raw rollup, which stays FAILURE after a
+    # failed run is re-run green (#98).
+    checks = check_summary(pr)
+    return checks is not None and checks["state"] == "succeeded"
 
 
 def review_state(pr: dict[str, Any]) -> str:

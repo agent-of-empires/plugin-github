@@ -793,6 +793,26 @@ def test_review_state_approved_needs_nobody_else_outstanding():
     assert graphql.review_state(pr(mergeStateStatus="BLOCKED")) == "approved"
     assert graphql.review_state(pr(mergeStateStatus="BLOCKED", commits=green, isDraft=True)) == "approved"
     assert graphql.review_state(pr(mergeStateStatus="CLEAN", commits=green)) == "approved"
+    # A failed run re-run green: the raw rollup stays FAILURE but the checks read green.
+    rerun = {
+        "nodes": [
+            {
+                "commit": {
+                    "statusCheckRollup": {
+                        "state": "FAILURE",
+                        "contexts": {
+                            "totalCount": 2,
+                            "nodes": [
+                                _checkrun("Clippy", "COMPLETED", "FAILURE", completed_at="2026-01-01T00:00:00Z"),
+                                _checkrun("Clippy", "COMPLETED", "SUCCESS", completed_at="2026-01-01T00:05:00Z"),
+                            ],
+                        },
+                    }
+                }
+            }
+        ]
+    }
+    assert graphql.review_state(pr(mergeStateStatus="BLOCKED", commits=rerun)) == "partially-approved"
 
 
 def test_head_approved_ignores_approvals_on_older_commits():
