@@ -762,12 +762,15 @@ def test_check_runs_carry_duration_workflow_group_and_a_skipped_flag():
 
 def test_approve_over_stale_block_upgrades_only_when_someone_approved_the_head():
     people = [{"name": "a", "state": "approved"}, {"name": "b", "state": "changes-pushed"}]
-    pull = {"review_state": "changes-pushed", "reviewers": people, "head_approved": True}
+    pull = {"review_state": "changes-pushed", "reviewers": people, "head_approved": True, "review_requested": False}
     assert graphql.approve_over_stale_block(pull)["review_state"] == "approved"
     assert pull["review_state"] == "changes-pushed"
     # Someone is still requested (e.g. a code-owner group): not fully approved.
-    waiting = {**pull, "reviewers": [*people, {"name": "acp", "state": "pending"}]}
+    waiting = {**pull, "reviewers": [*people, {"name": "acp", "state": "pending"}], "review_requested": True}
     assert graphql.approve_over_stale_block(waiting)["review_state"] == "partially-approved"
+    # The stale reviewer themselves was re-requested: no separate pending entry, still requested.
+    rerequested = {**pull, "review_requested": True}
+    assert graphql.approve_over_stale_block(rerequested)["review_state"] == "partially-approved"
     # No approval on the current head, or no approval at all.
     assert graphql.approve_over_stale_block({**pull, "head_approved": False})["review_state"] == "changes-pushed"
     lone = {"review_state": "changes-pushed", "reviewers": people[1:]}

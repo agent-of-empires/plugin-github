@@ -398,8 +398,9 @@ def approve_over_stale_block(pull: dict[str, Any]) -> dict[str, Any]:
         return pull
     if not pull.get("head_approved"):
         return pull
-    pending = any(isinstance(p, dict) and p.get("state") == "pending" for p in people)
-    return {**pull, "review_state": "partially-approved" if pending else "approved"}
+    # Not the reviewers' ``pending`` entries: a re-requested reviewer keeps their
+    # ``changes-pushed`` state, so only the request itself is reliable.
+    return {**pull, "review_state": "partially-approved" if pull.get("review_requested") else "approved"}
 
 
 def merge_state(pr: dict[str, Any]) -> str | None:
@@ -925,6 +926,7 @@ def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -
         "base": pr.get("baseRefName"),
         "reviewers": people,
         "head_approved": head_approved(pr),
+        "review_requested": bool(_nodes(pr, "reviewRequests")),
         "review_summary": review_summary(people),
         "diff": diff_summary(pr),
         "issues": linked_issues(pr),
