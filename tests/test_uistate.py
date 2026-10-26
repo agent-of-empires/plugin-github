@@ -805,6 +805,12 @@ def test_column_filter_values_ignore_chip_toggles():
     assert payload["filter_values"] == ["ci:running", "pr:open", "review:waiting"]
 
 
+def test_column_filter_values_include_partially_approved():
+    payload = _column_payload([_repo(pulls=[_rich_pull(review="partially-approved")])])
+    assert "review:partially-approved" in payload["filter_values"]
+    assert "review:approved" not in payload["filter_values"]
+
+
 def test_column_filter_values_map_unrecognized_ci_state_to_unknown():
     repos = [_repo(pulls=[_rich_pull(review=None, checks={"state": "weird", "runs": []})])]
     assert _column_payload(repos)["filter_values"] == ["ci:unknown", "pr:open"]
@@ -848,6 +854,7 @@ def test_snapshot_emits_global_filter_facets_on_the_status_column():
     ]
     assert _facet(params, "github_review")["payload"]["options"] == [
         {"value": "review:approved", "label": "approved", "tone": "success"},
+        {"value": "review:partially-approved", "label": "partially approved", "tone": "info"},
         {"value": "review:changes-requested", "label": "changes requested", "tone": "danger"},
         {"value": "review:changes-pushed", "label": "pushed since review", "tone": "info"},
         {"value": "review:commented", "label": "commented", "tone": "info"},

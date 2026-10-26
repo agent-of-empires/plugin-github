@@ -760,13 +760,66 @@ def test_check_runs_carry_duration_workflow_group_and_a_skipped_flag():
     assert "skipped" not in runs["Clippy"]
 
 
-def test_approve_over_stale_block_upgrades_only_when_someone_approved():
+def test_approve_over_stale_block_upgrades_only_when_someone_approved_the_head():
     people = [{"name": "a", "state": "approved"}, {"name": "b", "state": "changes-pushed"}]
-    pull = {"review_state": "changes-pushed", "reviewers": people}
+    pull = {"review_state": "changes-pushed", "reviewers": people, "head_approved": True, "review_requested": False}
     assert graphql.approve_over_stale_block(pull)["review_state"] == "approved"
     assert pull["review_state"] == "changes-pushed"
+    # Someone is still requested (e.g. a code-owner group): not fully approved.
+    waiting = {**pull, "reviewers": [*people, {"name": "acp", "state": "pending"}], "review_requested": True}
+    assert graphql.approve_over_stale_block(waiting)["review_state"] == "partially-approved"
+    # The stale reviewer themselves was re-requested: no separate pending entry, still requested.
+    rerequested = {**pull, "review_requested": True}
+    assert graphql.approve_over_stale_block(rerequested)["review_state"] == "partially-approved"
+    # No approval on the current head, or no approval at all.
+    assert graphql.approve_over_stale_block({**pull, "head_approved": False})["review_state"] == "changes-pushed"
     lone = {"review_state": "changes-pushed", "reviewers": people[1:]}
     assert graphql.approve_over_stale_block(lone) is lone
-    live = {"review_state": "changes-requested", "reviewers": people}
+    live = {"review_state": "changes-requested", "reviewers": people, "head_approved": True}
     assert graphql.approve_over_stale_block(live) is live
     assert graphql.approve_over_stale_block({"review_state": "changes-pushed"})["review_state"] == "changes-pushed"
+
+
+def test_review_state_approved_needs_nobody_else_outstanding():
+    def pr(**extra):
+        out = _pr(decision="APPROVED")
+        out.update(extra)
+        return out
+
+    green = {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS", "contexts": {"nodes": []}}}}]}
+    assert graphql.review_state(pr()) == "approved"
+    # A requested reviewer or team (code-owner group) is still outstanding.
+    requested = {"nodes": [{"requestedReviewer": {"__typename": "Team", "name": "acp"}}]}
+    assert graphql.review_state(pr(reviewRequests=requested)) == "partially-approved"
+    # Blocked with green CI can only be a missing review; blocked with no green CI says nothing.
+    assert graphql.review_state(pr(mergeStateStatus="BLOCKED", commits=green)) == "partially-approved"
+    assert graphql.review_state(pr(mergeStateStatus="BLOCKED")) == "approved"
+    assert graphql.review_state(pr(mergeStateStatus="BLOCKED", commits=green, isDraft=True)) == "approved"
+    assert graphql.review_state(pr(mergeStateStatus="CLEAN", commits=green)) == "approved"
+    # A failed run re-run green: the raw rollup stays FAILURE but the checks read green.
+    rerun = {
+        "nodes": [
+            {
+                "commit": {
+                    "statusCheckRollup": {
+                        "state": "FAILURE",
+                        "contexts": {
+                            "totalCount": 2,
+                            "nodes": [
+                                _checkrun("Clippy", "COMPLETED", "FAILURE", completed_at="2026-01-01T00:00:00Z"),
+                                _checkrun("Clippy", "COMPLETED", "SUCCESS", completed_at="2026-01-01T00:05:00Z"),
+                            ],
+                        },
+                    }
+                }
+            }
+        ]
+    }
+    assert graphql.review_state(pr(mergeStateStatus="BLOCKED", commits=rerun)) == "partially-approved"
+
+
+def test_head_approved_ignores_approvals_on_older_commits():
+    pr = {"headRefOid": "new", "latestReviews": {"nodes": [_latest("APPROVED", "old")]}}
+    assert graphql.head_approved(pr) is False
+    pr["latestReviews"]["nodes"].append(_latest("APPROVED", "new", "nate"))
+    assert graphql.head_approved(pr) is True

@@ -174,7 +174,7 @@ dashboard sidebar and other plugins (such as the Board) can filter sessions by
 | Facet id          | Label           | Values                                                                                                   |
 | ----------------- | --------------- | -------------------------------------------------------------------------------------------------------- |
 | `github_ci`       | GitHub CI       | `ci:passing`, `ci:failing`, `ci:running`, `ci:queued`, `ci:unknown` (only when the PR has a check rollup) |
-| `github_review`   | GitHub review   | `review:approved`, `review:changes-requested`, `review:changes-pushed`, `review:commented`, `review:waiting` |
+| `github_review`   | GitHub review   | `review:approved`, `review:partially-approved`, `review:changes-requested`, `review:changes-pushed`, `review:commented`, `review:waiting` |
 | `github_pr`       | GitHub PR       | `pr:open`, `pr:draft`                                                                                     |
 | `github_comments` | GitHub comments | `comments:unresolved` (at least one unresolved review thread)                                            |
 | `github_conflicts` | GitHub conflicts | `conflicts:yes` (the PR conflicts with its base)                                                        |
@@ -274,8 +274,11 @@ The pane is one-PR-focused, and reads top to bottom:
    rather than fetched: `mergeStateStatus` collapses conflicts, policy, CI and
    review into one enum and so cannot say which is blocking. The ladder is
    draft, merge queue state, conflicts, changes requested, awaiting re-review, failing checks, running
-   checks, unresolved comments, ready, awaiting review, ordered by who can clear
-   the block. "Awaiting re-review" (`pushed since review` in the row) is a
+   checks, unresolved comments, awaiting more approvals, ready, awaiting review,
+   ordered by who can clear the block. "Awaiting more approvals"
+   (`partially approved` in the row) is an approved PR that still has a requested
+   reviewer or team, or that GitHub blocks while every check is green; only a PR
+   nobody else is being asked to review reads "ready". "Awaiting re-review" (`pushed since review` in the row) is a
    changes-requested decision whose blocking reviews were all made on an older
    commit; it still blocks the merge on GitHub until the reviewer re-reviews or
    dismisses, but reads as info, not an alarm. A queued PR is never shown as
@@ -332,9 +335,18 @@ count either. Their unresolved threads still count toward unresolved comments.
 
 The advanced `approved_overrides_stale_block` setting (default off) makes a PR
 read "approved" when a reviewer requested changes on an older commit and another
-reviewer approved the current head. Off, it stays "pushed since review" and the
-reviewer summary notes the approval. GitHub still blocks the merge until the
+reviewer approved the current head, unless someone else is still requested, in
+which case it reads "partially approved". Off, it stays "pushed since review" and
+the reviewer summary notes the approval. GitHub still blocks the merge until the
 stale review is re-done or dismissed.
+
+"approved" means nobody else is still being asked to review. GitHub's
+`reviewDecision` can read `APPROVED` while a code-owner group or ruleset
+requirement is still unmet, so an approved PR with a requested reviewer or team,
+or one `mergeStateStatus` reports `BLOCKED` while every check is green (drafts
+excluded), reads "partially approved" (`review:partially-approved` facet). Merge
+blockers other than review, such as failing CI, are not inferred from
+`mergeStateStatus`.
 
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol

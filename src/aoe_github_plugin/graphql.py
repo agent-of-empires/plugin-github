@@ -11,6 +11,11 @@ Why infer ``review_state`` instead of mapping ``reviewDecision`` directly:
 GitHub's ``reviewDecision`` only yields ``APPROVED`` / ``CHANGES_REQUESTED`` /
 ``REVIEW_REQUIRED`` / null. It cannot express "commented", so that state is
 inferred from a COMMENTED review or any unresolved thread.
+
+``reviewDecision`` also reads ``APPROVED`` while a code-owner group or ruleset
+requirement is unmet, so ``approved`` additionally needs no outstanding review
+request and no review-shaped ``mergeStateStatus`` block (``partially-approved``
+otherwise).
 """
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ from datetime import timezone
 _PR_CONNECTION_FRAGMENT = """
 fragment PRConnection on PullRequestConnection {
   nodes {
-    id number title url state isDraft merged mergeable reviewDecision updatedAt headRefOid
+    id number title url state isDraft merged mergeable mergeStateStatus reviewDecision updatedAt headRefOid
     mergeQueueEntry { position state }
     mergeQueue { url }
     baseRefName additions deletions changedFiles
@@ -144,7 +149,7 @@ _DIGEST_ALIAS_FIELD = """    b{i}: pullRequests(
       headRefName: $b{i}, states: [OPEN, MERGED], first: 3,
       orderBy: {{field: UPDATED_AT, direction: DESC}}
     ) {{ nodes {{
-      number state isDraft merged mergeable reviewDecision updatedAt headRefOid
+      number state isDraft merged mergeable mergeStateStatus reviewDecision updatedAt headRefOid
       mergeQueueEntry {{ position state }}
       commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }}
       reviewThreads(first: 1) {{ totalCount }}
@@ -201,6 +206,7 @@ def digest_signature(conn: Any) -> str | None:
                 "draft": bool(pr.get("isDraft", False)),
                 "merged": bool(pr.get("merged", False)),
                 "decision": pr.get("reviewDecision"),
+                "merge_status": pr.get("mergeStateStatus"),
                 "updated": pr.get("updatedAt"),
                 "head": pr.get("headRefOid"),
                 # Canonicalized to the actionable conflict bool, NOT the raw
@@ -291,8 +297,28 @@ def _review_is_stale(pr: dict[str, Any], review: dict[str, Any]) -> bool:
     return isinstance(oid, str) and isinstance(head, str) and oid != head
 
 
+def _awaiting_approval(pr: dict[str, Any]) -> bool:
+    """True when an approval is not the whole story: a reviewer or team is still
+    requested (a code-owner group, a re-review), or GitHub blocks the merge while
+    every check is green, which only a missing review can explain. Drafts are
+    blocked by definition and never count."""
+    if _nodes(pr, "reviewRequests"):
+        return True
+    if pr.get("mergeStateStatus") != "BLOCKED" or pr.get("isDraft"):
+        return False
+    # The state the pane shows, not the raw rollup, which stays FAILURE after a
+    # failed run is re-run green (#98).
+    checks = check_summary(pr)
+    return checks is not None and checks["state"] == "succeeded"
+
+
 def review_state(pr: dict[str, Any]) -> str:
-    """``approved`` / ``changes-requested`` / ``changes-pushed`` / ``commented`` / ``waiting``.
+    """``approved`` / ``partially-approved`` / ``changes-requested`` / ``changes-pushed`` / ``commented`` / ``waiting``.
+
+    ``partially-approved`` is an ``APPROVED`` decision with approvals still
+    missing (see ``_awaiting_approval``): GitHub's ``reviewDecision`` ignores code
+    owner groups and ruleset requirements, so ``approved`` is reserved for a PR
+    nobody else is still being asked to review.
 
     ``changes-pushed`` is a ``CHANGES_REQUESTED`` decision whose blocking reviews
     were all made on an older commit: the author has pushed since, so the review
@@ -303,7 +329,7 @@ def review_state(pr: dict[str, Any]) -> str:
     """
     decision = pr.get("reviewDecision")
     if decision == "APPROVED":
-        return "approved"
+        return "partially-approved" if _awaiting_approval(pr) else "approved"
     if decision == "CHANGES_REQUESTED":
         blocking = _blocking_reviews(pr)
         if blocking and all(_review_is_stale(pr, r) for r in blocking):
@@ -361,16 +387,20 @@ def drop_ignored_commenters(pull: dict[str, Any], ignored: frozenset[str]) -> di
 
 
 def approve_over_stale_block(pull: dict[str, Any]) -> dict[str, Any]:
-    """``pull`` with ``changes-pushed`` upgraded to ``approved`` when another
-    reviewer approved the current head, for the ``approved_overrides_stale_block``
-    setting. GitHub still blocks the merge until the stale review is re-done or
-    dismissed. Returns a copy; a pull without ``reviewers`` is untouched."""
+    """``pull`` with ``changes-pushed`` upgraded for the
+    ``approved_overrides_stale_block`` setting when another reviewer approved the
+    current head: to ``approved`` if nobody else is still requested, else to
+    ``partially-approved``. GitHub still blocks the merge until the stale review
+    is re-done or dismissed. Returns a copy; a pull without ``reviewers`` is
+    untouched."""
     people = pull.get("reviewers")
     if pull.get("review_state") != "changes-pushed" or not isinstance(people, list):
         return pull
-    if any(isinstance(p, dict) and p.get("state") == "approved" for p in people):
-        return {**pull, "review_state": "approved"}
-    return pull
+    if not pull.get("head_approved"):
+        return pull
+    # Not the reviewers' ``pending`` entries: a re-requested reviewer keeps their
+    # ``changes-pushed`` state, so only the request itself is reliable.
+    return {**pull, "review_state": "partially-approved" if pull.get("review_requested") else "approved"}
 
 
 def merge_state(pr: dict[str, Any]) -> str | None:
@@ -748,6 +778,12 @@ def reviewers(pr: dict[str, Any]) -> list[dict[str, str]]:
     return out
 
 
+def head_approved(pr: dict[str, Any]) -> bool:
+    """True when some reviewer's standing approval was made on the current head.
+    An unknown commit counts as current, like ``_review_is_stale``."""
+    return any(n.get("state") == "APPROVED" and not _review_is_stale(pr, n) for n in _nodes(pr, "latestReviews"))
+
+
 def review_summary(people: list[dict[str, str]]) -> str:
     """The one-line headline over a reviewer list, matching how GitHub reads it:
     a blocking "changes requested" wins, then an approval count, then how many are
@@ -889,6 +925,8 @@ def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -
         "author": (pr.get("author") or {}).get("login") or "",
         "base": pr.get("baseRefName"),
         "reviewers": people,
+        "head_approved": head_approved(pr),
+        "review_requested": bool(_nodes(pr, "reviewRequests")),
         "review_summary": review_summary(people),
         "diff": diff_summary(pr),
         "issues": linked_issues(pr),
