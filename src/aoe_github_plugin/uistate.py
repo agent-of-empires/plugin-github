@@ -306,8 +306,12 @@ def _is_merged(pull: dict[str, Any]) -> bool:
     return bool(pull.get("merged")) or str(pull.get("state") or "").upper() == "MERGED"
 
 
+def _is_closed(pull: dict[str, Any]) -> bool:
+    return str(pull.get("state") or "").lower() == "closed" and not _is_merged(pull)
+
+
 def _open_pulls(repo: dict[str, Any]) -> list[dict[str, Any]]:
-    return [p for p in (repo.get("pulls") or []) if not _is_merged(p)]
+    return [p for p in (repo.get("pulls") or []) if not p.get("stack_only") and not _is_merged(p) and not _is_closed(p)]
 
 
 def _badge_tooltip(repo: dict[str, Any], chips: frozenset[str]) -> str:
@@ -488,6 +492,8 @@ def _pull_visual(pull: dict[str, Any]) -> tuple[str, str | None, str | None]:
     (purple) because no semantic tone names it; open/draft use a tone."""
     if _is_merged(pull):
         return _ICON_MERGED, None, MERGED_COLOR
+    if _is_closed(pull):
+        return "circle-x", "neutral", None
     if pull.get("draft"):
         return _ICON_DRAFT, "warn", None
     return _ICON_OPEN, "success", None
@@ -506,23 +512,43 @@ def _pull_key(repo: dict[str, Any], pull: dict[str, Any]) -> str:
 
 
 def _session_pulls(repos: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """Every PR in the session as ``(repo, pull)``, most-actionable first.
+    """Return one entry per PR, most-actionable first.
 
-    Ranked per PR rather than per repo (the pane's selector is a flat list across
-    the workspace), using the same attention ladder the session row uses so the
-    two orders agree. Merged PRs sink below every open one: they are history, not
-    work. Ties keep snapshot order, which keeps the list stable between refreshes.
+    Duplicate stack-only copies must not shadow a checked-out PR. Preserve a
+    usable stack from another copy when the preferred entry lacks one.
     """
-    ranked: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
-    order = 0
+    unique: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for repo in repos:
         for pull in repo.get("pulls") or []:
-            if _is_merged(pull):
-                rank = len(_ATTENTION_VISUAL)
-            else:
-                rank = _ATTENTION_VISUAL[_pull_attention(pull, _ALL_CHIPS)][0]
-            ranked.append((rank, order, repo, pull))
-            order += 1
+            key = _pull_key(repo, pull)
+            current = unique.get(key)
+            if current is None:
+                unique[key] = (repo, pull)
+                continue
+
+            preferred = current
+            other_pull = pull
+            if current[1].get("stack_only") and not pull.get("stack_only"):
+                preferred = (repo, pull)
+                other_pull = current[1]
+            preferred_pull = preferred[1]
+            preferred_stack = preferred_pull.get("stack")
+            other_stack = other_pull.get("stack")
+            if (
+                (not isinstance(preferred_stack, list) or len(preferred_stack) < 2)
+                and isinstance(other_stack, list)
+                and len(other_stack) >= 2
+            ):
+                preferred = (preferred[0], {**preferred_pull, "stack": other_stack})
+            unique[key] = preferred
+
+    ranked: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
+    for order, (repo, pull) in enumerate(unique.values()):
+        if _is_merged(pull) or _is_closed(pull):
+            rank = len(_ATTENTION_VISUAL)
+        else:
+            rank = _ATTENTION_VISUAL[_pull_attention(pull, _ALL_CHIPS)][0]
+        ranked.append((rank, order, repo, pull))
     ranked.sort(key=lambda item: (item[0], item[1]))
     return [(repo, pull) for _, _, repo, pull in ranked]
 
@@ -962,6 +988,10 @@ def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
             _verdict("Merged", f"This PR is merged into {base}.", (_ICON_MERGED, "neutral"), "merged"),
         ),
         (
+            _is_closed(pull),
+            _verdict("Closed", "This PR was closed without merging.", ("circle-x", "neutral"), "closed"),
+        ),
+        (
             bool(pull.get("draft")),
             _verdict("Draft", "Mark the PR ready for review to merge it.", (_ICON_DRAFT, "warn"), "draft"),
         ),
@@ -1099,12 +1129,102 @@ def _merge_callout(pull: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _stack_member_status(member: dict[str, Any]) -> tuple[str, str]:
+    if _is_merged(member):
+        return "merged", "success"
+    if member.get("state") == "closed":
+        return "closed", "danger"
+    if member.get("draft") is True:
+        return "draft", "danger"
+    status = member.get("mergeable_state")
+    if status == "clean":
+        return "clean", "success"
+    if status in ("dirty", "blocked", "behind", "unstable", "has_hooks"):
+        tone = "danger" if status in ("dirty", "blocked") else "warn"
+        return status, tone
+    return status if isinstance(status, str) else "unknown", "warn"
+
+
+def _stack_rows(repo: dict[str, Any], stack: list[Any], position: int) -> tuple[list[dict[str, Any]], list[str], bool]:
+    rows: list[dict[str, Any]] = []
+    blockers: list[str] = []
+    unknown = False
+    for index, member in enumerate(stack):
+        if not isinstance(member, dict):
+            if index <= position:
+                unknown = True
+            continue
+        member_number = member.get("number")
+        status, tone = _stack_member_status(member)
+        if index <= position and not _is_merged(member):
+            if tone == "danger":
+                blockers.append(f"#{member_number}")
+            elif tone == "warn":
+                unknown = True
+        row: dict[str, Any] = {
+            "kind": "row",
+            "prefix": f"#{member_number}",
+            "label": member.get("title") or "",
+            "value": status,
+            "value_tone": tone,
+            "method": SELECT_METHOD,
+            "params": {"pr": f"{repo.get('repo') or '?'}#{member_number}"},
+            "selected": index == position,
+        }
+        if member.get("url"):
+            row["href"] = member["url"]
+        if member.get("head"):
+            row["sublabel"] = str(member["head"])
+        rows.append(row)
+    return rows, blockers, unknown
+
+
+def _stack_section(repo: dict[str, Any], pull: dict[str, Any]) -> dict[str, Any] | None:
+    """Stack map and mergeability through the selected PR, from bottom upward."""
+    stack = pull.get("stack")
+    if not isinstance(stack, list) or len(stack) < 2:
+        return None
+    number = pull.get("number")
+    position = next(
+        (index for index, member in enumerate(stack) if isinstance(member, dict) and member.get("number") == number),
+        None,
+    )
+    if position is None:
+        return None
+
+    rows, blockers, unknown = _stack_rows(repo, stack, position)
+    prefix = [member for member in stack[: position + 1] if isinstance(member, dict)]
+    if prefix and all(_is_merged(member) for member in prefix):
+        summary, tone = "Already merged", "neutral"
+    elif blockers:
+        summary, tone = f"Blocked at {', '.join(blockers)}", "danger"
+    elif unknown:
+        summary, tone = "Mergeability unknown", "warn"
+    else:
+        summary, tone = "Mergeable through this PR", "success"
+    rows.insert(0, {"kind": "row", "label": "Stack readiness", "value": summary, "value_tone": tone})
+    return {
+        "kind": "section",
+        "title": f"Stack · PR {position + 1} of {len(stack)}",
+        "boxed": True,
+        "children": rows,
+    }
+
+
 def _pull_detail_blocks(pull: dict[str, Any]) -> list[dict[str, Any]]:
-    """The selected PR's detail stack: verdict, reviewers, checks, diff/linked, and
-    recent activity. A merged PR keeps only its verdict and activity: its review
-    decision and CI rollup are history, not something to act on."""
+    """Selected PR details; stack-only entries deliberately omit unqueried review verdicts."""
+    if pull.get("stack_only"):
+        return [
+            {
+                "kind": "note",
+                "tone": "warn",
+                "text": (
+                    "Review and CI details are not loaded for this stack member. Open the PR on GitHub for full status."
+                ),
+            }
+        ]
     blocks: list[dict[str, Any]] = [_merge_callout(pull)]
-    if not _is_merged(pull):
+    if not _is_merged(pull) and not _is_closed(pull):
         candidates = (
             _review_section(pull),
             _checks_section(pull.get("checks")),
@@ -1293,6 +1413,9 @@ def _pane_blocks(
                 ],
             }
         )
+        stack = _stack_section(*selection)
+        if stack is not None:
+            middle.append(stack)
         middle.extend(_pull_detail_blocks(selection[1]))
 
     status_rows = _repo_status_rows(repos)
@@ -1326,7 +1449,7 @@ def _pane_footer(freshness: Any, selection: tuple[dict[str, Any], dict[str, Any]
             stale = freshness.get("stale") is True
             footer["text"] = f"last good refresh {at}" if stale else f"refreshed {at}"
             footer["icon"] = "clock" if stale else "refresh-cw"
-    if selection is not None:
+    if selection is not None and not selection[1].get("stack_only"):
         verdict = _merge_verdict(selection[1])
         footer["value"] = verdict["short"]
         footer["tone"] = verdict["tone"]
