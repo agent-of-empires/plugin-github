@@ -1568,3 +1568,40 @@ def test_mixed_workspace_paths_keep_valid_worktrees_authoritative(tmp_path):
     assert [(r.url.path, r.url.params["head"]) for r in requests] == [
         ("/repos/o/attached/pulls", "o:session-branch"),
     ]
+
+
+def _worktree_session(tmp_path, *, stored="stale-branch", **extra):
+    source = tmp_path / "source"
+    _make_repo(source, branch="unrelated")
+    worktree = tmp_path / "worktree"
+    _git(source, "worktree", "add", "-b", "live-branch", str(worktree))
+    entry = {"source_path": str(source), "branch": stored, "worktree_path": str(worktree), **extra}
+    return worktree, {"id": "s1", "project_path": str(tmp_path / "unavailable"), "workspace_repos": [entry]}
+
+
+def test_worktree_path_reads_live_branch_not_stored_branch(tmp_path):
+    worktree, session = _worktree_session(tmp_path)
+    requests = []
+    snapshot = refresh.build_snapshot([session], env=_NoToken(), transport=_transport([_pull()], capture=requests))
+    repos = snapshot["sessions"][0]["repos"]
+    assert [(r["path"], r["repo"], r["branch"]) for r in repos] == [(str(worktree), "o/r", "live-branch")]
+    assert [r.url.params["head"] for r in requests] == ["o:live-branch"]
+
+
+def test_worktree_path_detached_head_queries_no_branch(tmp_path):
+    worktree, session = _worktree_session(tmp_path)
+    _git(worktree, "checkout", "-q", "--detach")
+    requests = []
+    snapshot = refresh.build_snapshot([session], env=_NoToken(), transport=_transport([_pull()], capture=requests))
+    repos = snapshot["sessions"][0]["repos"]
+    assert [(r["repo"], r["branch"]) for r in repos] == [("o/r", None)]
+    assert requests == []
+
+
+def test_invalid_worktree_path_never_falls_back_to_source_and_stored_branch(tmp_path):
+    _, session = _worktree_session(tmp_path)
+    session["workspace_repos"][0]["worktree_path"] = str(tmp_path / "missing")
+    requests = []
+    snapshot = refresh.build_snapshot([session], env=_NoToken(), transport=_transport([_pull()], capture=requests))
+    assert snapshot["sessions"][0]["repos"] == []
+    assert requests == []

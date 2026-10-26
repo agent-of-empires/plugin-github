@@ -494,7 +494,11 @@ class Runtime:
                 continue
             repos = session.get("workspace_repos")
             attached = (
-                tuple((repo.get("source_path"), repo.get("branch")) for repo in repos if isinstance(repo, dict))
+                tuple(
+                    (repo.get("source_path"), repo.get("branch"), repo.get("worktree_path"))
+                    for repo in repos
+                    if isinstance(repo, dict)
+                )
                 if isinstance(repos, list)
                 else ()
             )
