@@ -564,3 +564,11 @@ def test_fast_poll_refreshes_changed_workspace_repos_without_new_session(tmp_pat
     rt._next_poll = 0
     rt._service_ticks()
     assert refreshed == [True]
+
+
+def test_session_topology_changes_with_worktree_path():
+    def topology(worktree):
+        repo = {"source_path": "/src/a", "branch": "b", "worktree_path": worktree}
+        return main.Runtime._session_topology([{"id": "s1", "project_path": "/ws", "workspace_repos": [repo]}])
+
+    assert topology("/ws/a") != topology("/ws/other")

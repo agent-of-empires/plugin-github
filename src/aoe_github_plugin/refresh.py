@@ -309,7 +309,7 @@ def _identify(path: str, branch_override: str | None = None) -> tuple[str | None
 
 
 def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> list[tuple[str, str | None]]:
-    """Return checkout/branch pairs, preferring usable host metadata."""
+    """Return checkout/branch pairs, preferring usable host metadata. A ``None`` branch means "read live HEAD"."""
     workspace_repos = session.get("workspace_repos")
     if isinstance(workspace_repos, list) and workspace_repos:
         checkouts: list[tuple[str, str | None]] = []
@@ -317,12 +317,17 @@ def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> l
         for repo in workspace_repos:
             if not isinstance(repo, dict) or not isinstance(repo.get("source_path"), str) or not repo["source_path"]:
                 continue
-            checkout = repo["source_path"]
+            # A host that sends ``worktree_path`` names the checkout the session works in: read its live
+            # branch (the stored one is the branch at workspace creation). Older hosts keep the stored branch.
+            worktree = repo.get("worktree_path")
+            if isinstance(worktree, str) and worktree:
+                checkout, branch = worktree, None
+            else:
+                checkout, branch = repo["source_path"], repo.get("branch")
+                if not isinstance(branch, str) or not branch:
+                    continue
             top = _git(checkout, "rev-parse", "--show-toplevel")
             if not top or os.path.realpath(top) != os.path.realpath(checkout):
-                continue
-            branch = repo.get("branch")
-            if not isinstance(branch, str) or not branch:
                 continue
             key = (os.path.realpath(checkout), branch)
             if key not in seen:
