@@ -67,8 +67,12 @@ def _make_submodule(parent, name):
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache():
+def _clear_cache(monkeypatch):
+    # Polling fixtures isolate metadata; test_lookup exercises the real resolver.
+    monkeypatch.setattr(refresh.lookup, "repositories", lambda _client, origin, *_args, **_kwargs: [origin])
+
     def _reset():
+        refresh.lookup._parent_cache.clear()
         refresh._etag_cache.clear()
         refresh._graphql_cache.clear()
         refresh._stack_cache.clear()
@@ -143,13 +147,14 @@ def _transport(pulls, etag='W/"v1"', capture=None):
     return httpx.MockTransport(handler)
 
 
-def _pull(number=12, draft=False):
+def _pull(number=12, draft=False, branch="feature", repo="r"):
     return {
         "number": number,
         "html_url": f"https://github.com/o/r/pull/{number}",
         "title": "t",
         "state": "open",
         "draft": draft,
+        "head": {"ref": branch, "repo": {"name": repo, "owner": {"login": "o"}}},
     }
 
 
@@ -304,6 +309,8 @@ def _gql_node(number=7, state="OPEN", merged=False, draft=False, decision="APPRO
         "isDraft": draft,
         "merged": merged,
         "reviewDecision": decision,
+        "headRefName": "feature",
+        "headRepository": {"name": "r", "owner": {"login": "o"}},
         "commits": {
             "nodes": [
                 {
@@ -994,6 +1001,7 @@ def _batched_handler(by_branch, *, gql=None, etag='W/"v1"'):
     """Token-path transport whose GraphQL response aliases per-branch nodes from
     ``by_branch`` (keyed by branch name), so several same-repo branches resolve
     from one batched query."""
+    by_branch = {branch: [{**node, "headRefName": branch} for node in nodes] for branch, nodes in by_branch.items()}
 
     def handler(request):
         if str(request.url).endswith("/graphql"):
@@ -1050,7 +1058,7 @@ def test_partial_alias_failure_isolates_to_its_key(tmp_path):
             body = {
                 "data": {
                     "rateLimit": {"remaining": 5000, "resetAt": "x"},
-                    "repository": {"b0": {"nodes": [_gql_node(number=11)]}, "b1": None},
+                    "repository": {"b0": {"nodes": [{**_gql_node(number=11), "headRefName": "b1"}]}, "b1": None},
                 },
                 "errors": [{"type": "SERVICE", "message": "boom", "path": ["repository", "b1"]}],
             }
@@ -1614,7 +1622,8 @@ def test_rest_probes_run_parallel_within_bound(tmp_path):
         time.sleep(0.05)
         with lock:
             state["inflight"] -= 1
-        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+        repo = request.url.path.split("/")[3]
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(repo=repo)])
 
     snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=httpx.MockTransport(handler))
     assert state["max"] > 1
@@ -1661,7 +1670,7 @@ def test_workspace_metadata_uses_session_branches_not_source_head(tmp_path):
             return httpx.Response(404, json={"message": "Not Found"})
         branch = request.url.params["head"].split(":", 1)[1]
         requests.append(branch)
-        return httpx.Response(200, json=[_pull(number=1 if branch == "session-a" else 2)])
+        return httpx.Response(200, json=[_pull(number=1 if branch == "session-a" else 2, branch=branch)])
 
     snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=httpx.MockTransport(handler))
     assert sorted(requests) == ["session-a", "session-b"]
@@ -1691,7 +1700,7 @@ def test_workspace_metadata_is_authoritative_and_isolates_repo_errors(tmp_path):
         if "/second/" in request.url.path:
             return httpx.Response(404, json={"message": "Not Found"})
         assert "/first/" in request.url.path
-        return httpx.Response(200, json=[_pull()])
+        return httpx.Response(200, json=[_pull(branch="session", repo="first")])
 
     snap = refresh.build_snapshot([session], env=_NoToken(), transport=httpx.MockTransport(handler))
     repos = snap["sessions"][0]["repos"]
@@ -1761,7 +1770,7 @@ def test_stale_workspace_paths_fall_back_to_checkout_discovery(tmp_path, stale_k
             }
         ],
         env=_NoToken(),
-        transport=_transport([_pull()]),
+        transport=_transport([_pull(branch="workspace-branch")]),
     )
     repos = snapshot["sessions"][0]["repos"]
     assert [(r["path"], r["repo"], r["branch"]) for r in repos] == [
@@ -1794,7 +1803,7 @@ def test_mixed_workspace_paths_keep_valid_worktrees_authoritative(tmp_path):
             }
         ],
         env=_NoToken(),
-        transport=_transport([_pull()], capture=requests),
+        transport=_transport([_pull(branch="session-branch", repo="attached")], capture=requests),
     )
     repos = snapshot["sessions"][0]["repos"]
     assert [(r["path"], r["repo"], r["branch"]) for r in repos] == [

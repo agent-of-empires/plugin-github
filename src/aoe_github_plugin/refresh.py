@@ -10,8 +10,8 @@ error degrades that one repo's entry, never the whole refresh.
 
 Efficiency, against the user token's shared budget (REST 5000 req/hr, GraphQL
 5000 points/hr):
-- repos are deduplicated by ``(owner, repo, branch)`` so a branch shared across
-  sessions/workspaces is fetched once per refresh;
+- lookups are deduplicated by destination, branch, and head owner/repository,
+  keeping shared workspaces cheap without mixing contributors' same-name branches;
 - a cheap REST conditional request (ETag / ``If-None-Match``) is the PRIMARY
   open-PR poll; a ``304`` is free, so that path costs ~0 when unchanged (native
   stack enrichment is separate and can add calls as its cache expires);
@@ -51,6 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
+from aoe_github_plugin import lookup
 from aoe_github_plugin import graphql
 from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.client import GitHubClient
@@ -126,8 +127,9 @@ BACKOFF_SECS = 60.0
 # worker for an unreasonable stretch.
 MAX_BACKOFF_SECS = 3600.0
 
-RepoKey = tuple[str, str, str]  # (owner, repo, branch)
-RichCacheKey = tuple[str, str, str, bool]
+RepoKey = lookup.PullKey
+CheckoutKey = tuple[str, str, str, str, str]  # origin owner/repo, branch, optional upstream owner/repo
+RichCacheKey = tuple[str, str, str, str, str, bool]
 StackCacheKey = tuple[str, str, int]
 StackRepoKey = tuple[str, str]
 
@@ -311,7 +313,7 @@ def discover_checkouts(workspace: str, *, ignore_submodules: bool = True) -> lis
     return out
 
 
-def _identify(path: str, branch_override: str | None = None) -> tuple[str | None, RepoKey | None]:
+def _identify(path: str, branch_override: str | None = None) -> tuple[str | None, CheckoutKey | None]:
     """Resolve the origin repo and branch, preferring the host's session branch.
 
     A non-GitHub origin is a benign skip; a known repo on detached HEAD has no
@@ -325,7 +327,10 @@ def _identify(path: str, branch_override: str | None = None) -> tuple[str | None
     branch = branch_override or _git(path, "rev-parse", "--abbrev-ref", "HEAD")
     if not branch or branch == "HEAD":
         return f"{owner}/{repo}", None
-    return f"{owner}/{repo}", (owner, repo, branch)
+    upstream = _git(path, "remote", "get-url", "upstream")
+    upstream_repo = parse_owner_repo(upstream) if upstream else None
+    upstream_owner, upstream_name = upstream_repo or ("", "")
+    return f"{owner}/{repo}", (owner, repo, branch, upstream_owner, upstream_name)
 
 
 def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> list[tuple[str, str | None]]:
@@ -362,19 +367,8 @@ def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> l
 
 
 def _trim(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Open PRs trimmed to the fields the UI renders. Defensive: a malformed
-    entry from a drifting API shape is skipped/defaulted, never raised."""
-    return [
-        {
-            "number": pr.get("number"),
-            "url": pr.get("html_url"),
-            "title": pr.get("title") or "",
-            "state": pr.get("state"),
-            "draft": bool(pr.get("draft", False)),
-        }
-        for pr in raw
-        if isinstance(pr, dict)
-    ]
+    """Basic REST pulls, retaining their actual head identity."""
+    return [lookup.trim_pull(pr) for pr in raw if isinstance(pr, dict)]
 
 
 def _stack_pull(raw: dict[str, Any], owner: str, repo: str) -> dict[str, Any] | None:
@@ -784,7 +778,7 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
     ETag cache and honors the backoff gate; a blocked or rate-limited probe with
     a cached value reports ``fresh=False`` because it serves stale fallback, and
     only raises ``GitHubError`` when there is nothing to fall back on."""
-    owner, repo, branch = key
+    owner, repo, branch, head_owner, _ = key
     with _cache_lock:
         cached = _etag_cache.get(key)
         blocked = time.monotonic() < _backoff["rest"]["until"]
@@ -793,7 +787,7 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
             return False, cached["pulls"], False
         raise RateLimitedError
     etag = cached["etag"] if cached else None
-    params = {"state": "open", "head": f"{owner}:{branch}", "per_page": "10"}
+    params = {"state": "open", "head": f"{head_owner}:{branch}", "per_page": "100"}
     try:
         status, new_etag, raw = client.get_json_conditional(f"/repos/{owner}/{repo}/pulls", params, etag)
     except RateLimitedError:
@@ -803,7 +797,7 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
         raise
     if status == 304 and cached is not None:
         return False, cached["pulls"], True
-    pulls = _trim(raw or [])
+    pulls = _trim([pr for pr in raw or [] if isinstance(pr, dict) and lookup.matches_head(pr.get("head"), key)])
     with _cache_lock:
         _etag_cache[key] = {"etag": new_etag, "pulls": pulls}
     return True, pulls, True
@@ -862,8 +856,7 @@ def _error_entry(exc: GitHubError) -> dict[str, Any]:
 
 
 def _rich_cache_key(key: RepoKey, *, required_checks_only: bool) -> RichCacheKey:
-    owner, repo, branch = key
-    return owner, repo, branch, required_checks_only
+    return (*key, required_checks_only)
 
 
 def _is_active(pulls: list[dict[str, Any]]) -> bool:
@@ -1051,6 +1044,50 @@ def _resolve_null_repository(
             out[key] = _pulls_result([], fresh=True)
 
 
+def _owned_connection(
+    client: GitHubClient, key: RepoKey, conn: dict[str, Any], *, digest: bool = False
+) -> dict[str, Any]:
+    """Find the latest three owned PRs, paging past other contributors' branches.
+
+    A bounded or broken pagination path fails soft to REST/last-good data, never
+    caching a partial page as a confirmed absence. Full and digest select alike.
+    """
+    nodes: list[dict[str, Any]] = []
+    cursors: set[str] = set()
+    query = graphql.build_digest_query(1) if digest else graphql.build_query(1)
+    for page in range(10):
+        nodes.extend(lookup.filter_connection(conn, key)["nodes"])
+        info = conn.get("pageInfo") or {}
+        if len(nodes) >= 3 or not info.get("hasNextPage"):
+            return {"nodes": nodes[:3]}
+        if page == 9:
+            break
+        cursor = info.get("endCursor")
+        if not isinstance(cursor, str) or not cursor or cursor in cursors:
+            raise GitHubError("PR discovery pagination did not advance")
+        cursors.add(cursor)
+        with _cache_lock:
+            blocked = time.monotonic() < _backoff["graphql"]["until"]
+        if blocked:
+            raise RateLimitedError
+        try:
+            data = client.post_graphql(query, {"owner": key[0], "repo": key[1], "b0": key[2], "c0": cursor})
+        except RateLimitedError:
+            _set_backoff("graphql")
+            raise
+        payload = data.get("data") or {}
+        rate = payload.get("rateLimit") or {}
+        _observe_rate_limit(rate, kind="digest" if digest else "full", repo=f"{key[0]}/{key[1]}", aliases=1)
+        remaining = rate.get("remaining")
+        if _graphql_rate_limited(data) or (isinstance(remaining, int) and remaining < RATELIMIT_FLOOR):
+            _set_backoff("graphql", rate.get("resetAt"))
+        next_conn = (payload.get("repository") or {}).get("b0")
+        if data.get("errors") or not isinstance(next_conn, dict):
+            raise GitHubError("PR discovery pagination failed")
+        conn = next_conn
+    raise GitHubError("PR discovery pagination limit reached")
+
+
 def _apply_aliases(
     client: GitHubClient,
     chunk: list[RepoKey],
@@ -1074,9 +1111,13 @@ def _apply_aliases(
             _arm_retry_cooldown([key], pending, now)
             out[key] = _fallback_pulls(pending[key])
             continue
-        # The signature must come from the raw connection BEFORE thread
-        # pagination mutates it, so it compares equal to a later digest response
-        # (which never paginates).
+        try:
+            conn = _owned_connection(client, key, conn)
+        except GitHubError:
+            _arm_retry_cooldown([key], pending, now)
+            out[key] = _fallback_pulls(pending[key])
+            continue
+        # Compute the ownership-filtered signature before thread pagination.
         digest = graphql.digest_signature(conn)
         for node in conn.get("nodes") or []:
             if isinstance(node, dict):
@@ -1109,7 +1150,7 @@ def _fetch_chunk(
     key in ``chunk``, isolating failures: a blocked/rate-limited query or a single
     failed alias falls back per key (rich cache, then basic REST), never
     group-wide."""
-    owner, repo, _ = chunk[0]
+    owner, repo = chunk[0][:2]
     with _cache_lock:
         blocked = time.monotonic() < _backoff["graphql"]["until"]
     if blocked:
@@ -1150,6 +1191,7 @@ def _fetch_chunk(
 
 
 def _apply_digest_aliases(
+    client: GitHubClient,
     chunk: list[RepoKey],
     pending: dict[RepoKey, dict[str, Any]],
     data: dict[str, Any],
@@ -1164,7 +1206,11 @@ def _apply_digest_aliases(
     now = time.monotonic()
     promoted: list[RepoKey] = []
     for i, key in enumerate(chunk):
-        signature = None if f"b{i}" in failed else graphql.digest_signature(repository.get(f"b{i}"))
+        conn = repository.get(f"b{i}")
+        signature = None
+        if f"b{i}" not in failed and isinstance(conn, dict):
+            with contextlib.suppress(GitHubError):
+                signature = graphql.digest_signature(_owned_connection(client, key, conn, digest=True))
         rich = pending[key]["rich"]  # never None on the digest path (classification requires a cache)
         if signature is None:
             # A failed or malformed digest alias arms the cooldown so it does not
@@ -1192,7 +1238,7 @@ def _fetch_digest_chunk(
     mismatch promotes the key into ``full_pending`` for the rich query. Failures
     (blocked gate, rate limit, malformed alias) serve the stale cache; they
     never promote to full, so a flaky digest cannot burn full-query points."""
-    owner, repo, _ = chunk[0]
+    owner, repo = chunk[0][:2]
     with _cache_lock:
         blocked = time.monotonic() < _backoff["graphql"]["until"]
     if blocked:
@@ -1229,7 +1275,7 @@ def _fetch_digest_chunk(
         _chunk_fallback(chunk, pending, out)
         return
 
-    for key in _apply_digest_aliases(chunk, pending, data, out):
+    for key in _apply_digest_aliases(client, chunk, pending, data, out):
         full_pending[key] = pending[key]
 
 
@@ -1245,7 +1291,7 @@ def _run_chunked(
     for key in pending:
         groups[(key[0], key[1])].append(key)
     for gkeys in groups.values():
-        gkeys.sort(key=lambda k: k[2])
+        gkeys.sort()
         for start in range(0, len(gkeys), MAX_GRAPHQL_ALIASES):
             chunk = gkeys[start : start + MAX_GRAPHQL_ALIASES]
             try:
@@ -1363,13 +1409,13 @@ def _session_freshness(
 
 
 def _fetch_all(
-    keys: set[RepoKey],
+    keys: set[CheckoutKey],
     env: TokenEnvironment | None,
     transport: httpx.BaseTransport | None,
     *,
     force: bool = False,
     required_checks_only: bool = False,
-) -> tuple[dict[RepoKey, dict[str, Any]], bool]:
+) -> tuple[dict[CheckoutKey, dict[str, Any]], bool]:
     """Fetch every unique key. Returns ``(results, token_present)`` where results
     is ``key -> {"pulls": [...]}`` or ``key -> {"error": {...}}``. With a token,
     keys go through the REST-conditional-gated rich path and same-repo branches
@@ -1384,15 +1430,32 @@ def _fetch_all(
         return {}, True
     token = _resolve_optional_token(env)
     present = token is not None
-    ordered = sorted(keys)
+    by_checkout: dict[CheckoutKey, list[RepoKey]] = {}
     with GitHubClient(token=token, transport=transport) as client:
+        for key in sorted(keys):
+            with _cache_lock:
+                metadata_allowed = time.monotonic() >= _backoff["rest"]["until"]
+            upstream = (key[3], key[4]) if key[3] else None
+            repos = lookup.repositories(client, (key[0], key[1]), upstream, metadata_allowed=metadata_allowed)
+            by_checkout[key] = lookup.pull_keys(repos, key[2])
+        ordered = sorted({candidate for candidates in by_checkout.values() for candidate in candidates})
         if present:
-            results = _fetch_rich(client, ordered, force=force, required_checks_only=required_checks_only)
+            fetched = _fetch_rich(client, ordered, force=force, required_checks_only=required_checks_only)
+            _attach_stacks(client, ordered, fetched, force=force)
         else:
             with ThreadPoolExecutor(max_workers=REST_PROBE_WORKERS) as pool:
-                results = dict(zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True))
-        if present:
-            _attach_stacks(client, ordered, results, force=force)
+                fetched = dict(zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True))
+    results: dict[CheckoutKey, dict[str, Any]] = {}
+    for key, candidates in by_checkout.items():
+        entries = [fetched[candidate] for candidate in candidates]
+        pulls = {pull["url"]: pull for entry in entries for pull in entry.get("pulls", [])}
+        stale = any(entry.get("_stale") or entry.get("error") for entry in entries)
+        result = _pulls_result(list(pulls.values()), fresh=not stale, stale=bool(stale))
+        if not pulls:
+            error = next((entry["error"] for entry in entries if entry.get("error")), None)
+            if error:
+                result["error"] = error
+        results[key] = result
     return results, present
 
 
@@ -1433,10 +1496,10 @@ def build_snapshot(
         for _, checkouts in per_session:
             for checkout, branch in checkouts:
                 reps.setdefault((os.path.realpath(checkout), branch), checkout)
-        ident: dict[tuple[str, str | None], tuple[str | None, RepoKey | None]] = dict(
+        ident: dict[tuple[str, str | None], tuple[str | None, CheckoutKey | None]] = dict(
             zip(reps.keys(), pool.map(lambda item: _identify(item[1], item[0][1]), reps.items()), strict=True)
         )
-    keys: set[RepoKey] = {key for _, key in ident.values() if key is not None}
+    keys: set[CheckoutKey] = {key for _, key in ident.values() if key is not None}
     fetched, auth_present = _fetch_all(
         keys,
         env,

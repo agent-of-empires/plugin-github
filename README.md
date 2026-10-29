@@ -122,11 +122,21 @@ session-less `github.refresh` cover every session and prune vanished ones:
    `project_path`: the workspace root and immediate child checkouts. Immediate
    child submodules are skipped by default; turn off `ignore_submodules` to
    include them.
-3. Resolve each checkout to `(owner, repo, branch)`, deduplicate (a branch shared
-   across workspaces is fetched once), and look up its PRs. Local git identity
-   and the REST lookups fan out on small bounded thread pools so a big workspace
-   set refreshes in seconds; GraphQL queries stay serial to stay clear of
-   GitHub's secondary/concurrency limits.
+3. Resolve each checkout's origin and branch, then look for PRs targeting origin
+   or its configured GitHub `upstream`. Without an `upstream` remote, use
+   GitHub's direct-parent metadata for forks (cached for one hour; failed
+   metadata requests retry after one minute). No arbitrary remote or fork-network
+   search is performed. Match the exact branch **and actual head repository**:
+   only origin and upstream/direct parent are eligible heads, never another
+   contributor's identically named branch. Keep the checkout's origin identity
+   and each PR's real head owner/repository; PR links, selection, and stack
+   navigation use the destination repository. This applies to web snapshots and
+   the direct-worker `github.status` / `github.open` handlers.
+   Deduplicate lookups by destination, branch, and head owner/repository, so
+   shared workspaces fetch once without mixing contributors' results.
+   Same-repository PRs, fork-local PRs, and multi-repository sessions remain
+   supported. Local git identity and REST lookups use bounded thread pools;
+   GraphQL queries stay serial to respect GitHub's concurrency limits.
    With a token the per-branch lookup is a cheap REST conditional check
    first (see "Rate limits" below); only when that reports a change (or on a
    forced refresh, a cold cache, or a cheap digest query detecting a change past
@@ -139,6 +149,10 @@ session-less `github.refresh` cover every session and prune vanished ones:
    a workspace of many worktrees of one repo costs a single query (split into a
    few once it exceeds the per-query alias cap). Without a token it is the basic
    REST open-PR lookup only.
+   Rich and digest queries page past branch-name collisions to find up to three
+   matching PRs per head repository. Pagination is bounded to ten pages and
+   rejects repeated cursors; incomplete discovery serves REST or last-good data
+   rather than caching a false empty result.
 4. Push one global `sort-key`, six global `filter-facet`s (below), and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
    chip sequence per open PR: a clickable PR icon, a merge-conflict chip when the
    PR conflicts with its base, a merge-queue status/position chip when queued, then
