@@ -54,8 +54,14 @@ def repositories(
 
 
 def pull_keys(repos: list[Repository], branch: str) -> list[PullKey]:
-    """Keep destination and permitted head identities separate in every cache key."""
-    return [(owner, repo, branch, head_owner, head_repo) for owner, repo in repos for head_owner, head_repo in repos]
+    """Destinations may be origin or its upstream, but the head is always origin.
+
+    Only the checkout's own repository is a permitted head, so a contributor's
+    PR against upstream matches while an unrelated upstream-owned or third-party
+    same-name branch never does.
+    """
+    origin = repos[0]
+    return [(owner, repo, branch, *origin) for owner, repo in repos]
 
 
 def matches_head(head: Any, key: PullKey) -> bool:
@@ -100,8 +106,8 @@ def trim_pull(pr: dict[str, Any]) -> dict[str, Any]:
 
 def open_pulls(client: GitHubClient, keys: list[PullKey]) -> list[dict[str, Any]]:
     pulls: dict[str, dict[str, Any]] = {}
-    first_error: GitHubError | None = None
-    for key in keys:
+    origin_error: GitHubError | None = None
+    for index, key in enumerate(keys):
         owner, repo, branch, head_owner, _ = key
         try:
             raw = client.get_json(
@@ -109,12 +115,16 @@ def open_pulls(client: GitHubClient, keys: list[PullKey]) -> list[dict[str, Any]
                 params={"state": "open", "head": f"{head_owner}:{branch}", "per_page": "100"},
             )
         except GitHubError as exc:
-            first_error = first_error or exc
+            # Origin is authoritative: an optional upstream that fails must never
+            # hide a healthy origin result. Only the origin's own failure surfaces
+            # as an error.
+            if index == 0:
+                origin_error = exc
             continue
         for pr in raw:
             if isinstance(pr, dict) and matches_head(pr.get("head"), key):
                 pull = trim_pull(pr)
                 pulls[pull["url"]] = pull
-    if not pulls and first_error is not None:
-        raise first_error
+    if origin_error is not None:
+        raise origin_error
     return list(pulls.values())

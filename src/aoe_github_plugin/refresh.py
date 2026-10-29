@@ -1044,48 +1044,20 @@ def _resolve_null_repository(
             out[key] = _pulls_result([], fresh=True)
 
 
-def _owned_connection(
-    client: GitHubClient, key: RepoKey, conn: dict[str, Any], *, digest: bool = False
-) -> dict[str, Any]:
-    """Find the latest three owned PRs, paging past other contributors' branches.
+def _owned_connection(key: RepoKey, conn: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """Filter one queried page down to the checkout's own PRs.
 
-    A bounded or broken pagination path fails soft to REST/last-good data, never
-    caching a partial page as a confirmed absence. Full and digest select alike.
+    Returns ``(truncated, owned_conn)``. ``truncated`` is True when the source
+    connection still has more same-name PRs than the single page fetched, so the
+    page cannot prove the checkout's PR is absent. The caller then serves the
+    owner-scoped REST list instead of caching a false empty, and never arms the
+    per-key cooldown (a collision is not a failure to retry later). No follow-up
+    GraphQL paging: full queries per page would burn the shared point budget on
+    busy branch names, including same-repo ``main``.
     """
-    nodes: list[dict[str, Any]] = []
-    cursors: set[str] = set()
-    query = graphql.build_digest_query(1) if digest else graphql.build_query(1)
-    for page in range(10):
-        nodes.extend(lookup.filter_connection(conn, key)["nodes"])
-        info = conn.get("pageInfo") or {}
-        if len(nodes) >= 3 or not info.get("hasNextPage"):
-            return {"nodes": nodes[:3]}
-        if page == 9:
-            break
-        cursor = info.get("endCursor")
-        if not isinstance(cursor, str) or not cursor or cursor in cursors:
-            raise GitHubError("PR discovery pagination did not advance")
-        cursors.add(cursor)
-        with _cache_lock:
-            blocked = time.monotonic() < _backoff["graphql"]["until"]
-        if blocked:
-            raise RateLimitedError
-        try:
-            data = client.post_graphql(query, {"owner": key[0], "repo": key[1], "b0": key[2], "c0": cursor})
-        except RateLimitedError:
-            _set_backoff("graphql")
-            raise
-        payload = data.get("data") or {}
-        rate = payload.get("rateLimit") or {}
-        _observe_rate_limit(rate, kind="digest" if digest else "full", repo=f"{key[0]}/{key[1]}", aliases=1)
-        remaining = rate.get("remaining")
-        if _graphql_rate_limited(data) or (isinstance(remaining, int) and remaining < RATELIMIT_FLOOR):
-            _set_backoff("graphql", rate.get("resetAt"))
-        next_conn = (payload.get("repository") or {}).get("b0")
-        if data.get("errors") or not isinstance(next_conn, dict):
-            raise GitHubError("PR discovery pagination failed")
-        conn = next_conn
-    raise GitHubError("PR discovery pagination limit reached")
+    owned = lookup.filter_connection(conn, key)
+    truncated = bool((conn.get("pageInfo") or {}).get("hasNextPage"))
+    return truncated, owned
 
 
 def _apply_aliases(
@@ -1111,11 +1083,13 @@ def _apply_aliases(
             _arm_retry_cooldown([key], pending, now)
             out[key] = _fallback_pulls(pending[key])
             continue
-        try:
-            conn = _owned_connection(client, key, conn)
-        except GitHubError:
-            _arm_retry_cooldown([key], pending, now)
-            out[key] = _fallback_pulls(pending[key])
+        truncated, conn = _owned_connection(key, conn)
+        if truncated:
+            # The single page was exhausted by foreign same-name PRs, so it
+            # cannot prove the checkout's own PR is absent. The owner-scoped
+            # REST probe already lists it; serve that fresh rather than caching
+            # a false empty, and do not arm the cooldown (this is not a failure).
+            out[key] = _pulls_result(pending[key]["basic"], fresh=True)
             continue
         # Compute the ownership-filtered signature before thread pagination.
         digest = graphql.digest_signature(conn)
@@ -1191,7 +1165,6 @@ def _fetch_chunk(
 
 
 def _apply_digest_aliases(
-    client: GitHubClient,
     chunk: list[RepoKey],
     pending: dict[RepoKey, dict[str, Any]],
     data: dict[str, Any],
@@ -1209,8 +1182,14 @@ def _apply_digest_aliases(
         conn = repository.get(f"b{i}")
         signature = None
         if f"b{i}" not in failed and isinstance(conn, dict):
-            with contextlib.suppress(GitHubError):
-                signature = graphql.digest_signature(_owned_connection(client, key, conn, digest=True))
+            truncated, owned = _owned_connection(key, conn)
+            if truncated:
+                # Cannot verify the owned set from a truncated page: promote to
+                # the full query (which will itself fall back to REST if also
+                # truncated). A collision is not a failure, so no cooldown.
+                promoted.append(key)
+                continue
+            signature = graphql.digest_signature(owned)
         rich = pending[key]["rich"]  # never None on the digest path (classification requires a cache)
         if signature is None:
             # A failed or malformed digest alias arms the cooldown so it does not
@@ -1275,7 +1254,7 @@ def _fetch_digest_chunk(
         _chunk_fallback(chunk, pending, out)
         return
 
-    for key in _apply_digest_aliases(client, chunk, pending, data, out):
+    for key in _apply_digest_aliases(chunk, pending, data, out):
         full_pending[key] = pending[key]
 
 
@@ -1447,14 +1426,22 @@ def _fetch_all(
                 fetched = dict(zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True))
     results: dict[CheckoutKey, dict[str, Any]] = {}
     for key, candidates in by_checkout.items():
-        entries = [fetched[candidate] for candidate in candidates]
-        pulls = {pull["url"]: pull for entry in entries for pull in entry.get("pulls", [])}
-        stale = any(entry.get("_stale") or entry.get("error") for entry in entries)
-        result = _pulls_result(list(pulls.values()), fresh=not stale, stale=bool(stale))
-        if not pulls:
-            error = next((entry["error"] for entry in entries if entry.get("error")), None)
-            if error:
-                result["error"] = error
+        # The origin candidate (destination == head == checkout origin) is
+        # authoritative for freshness and error. An optional upstream that
+        # fails must never degrade a healthy origin result; it only adds
+        # visibility on top of what origin confirms.
+        origin = fetched[candidates[0]]
+        pulls = {}
+        for candidate in candidates:
+            for pull in fetched[candidate].get("pulls", []):
+                pulls[pull["url"]] = pull
+        result = _pulls_result(
+            list(pulls.values()),
+            fresh=not origin.get("_stale"),
+            stale=bool(origin.get("_stale")),
+        )
+        if origin.get("error"):
+            result["error"] = origin["error"]
         results[key] = result
     return results, present
 

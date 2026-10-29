@@ -12,7 +12,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Bug Fixes
 
-- **discovery:** Find upstream-targeting PRs from fork checkouts in web snapshots and direct-worker status/open handlers, using a configured upstream or cached GitHub parent metadata. Preserve actual head identity, reject unrelated same-branch contributors, and keep destination-aware caches, PR selection, and stack navigation distinct (#129).
+- **discovery:** Find upstream-targeting PRs from fork checkouts in web snapshots and direct-worker status/open handlers, using a configured upstream or cached GitHub parent metadata. The permitted head is always the checkout's own repo (upstream is only a destination), so unrelated same-name branches are rejected; caches, PR selection, and stack navigation stay destination-aware, and destination GraphQL pages are bounded to a single page with owner-scoped REST fallback (#129).
 - **refresh:** Cool down failed cold stack lookups, isolate stack retry cooldowns from primary REST backoff, evict departed members, mark fallback data stale, and exclude stack-only PRs from session status.
 - **pane:** Keep advisory stack states out of hard readiness blocks and omit footer verdicts for stack-only PRs.
 

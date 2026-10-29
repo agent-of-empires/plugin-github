@@ -117,7 +117,7 @@ fragment PRConnection on PullRequestConnection {
 # GraphQL literals that survive ``str.format``. rateLimit.cost (one per batched
 # query) lets the per-query budget be verified (#23).
 _ALIAS_FIELD = """    b{i}: pullRequests(
-      headRefName: $b{i}, states: [OPEN, MERGED], first: 3, after: $c{i},
+      headRefName: $b{i}, states: [OPEN, MERGED], first: 100,
       orderBy: {{field: UPDATED_AT, direction: DESC}}
     ) {{ ...PRConnection }}"""
 
@@ -129,7 +129,7 @@ def build_query(alias_count: int) -> str:
     valid identifiers and there is no injection or quoting risk. A count of 1 is
     just one alias, so this is the only rich-query path."""
     n = max(alias_count, 1)
-    params = ", ".join(["$owner: String!", "$repo: String!", *[f"$b{i}: String!, $c{i}: String" for i in range(n)]])
+    params = ", ".join(["$owner: String!", "$repo: String!", *[f"$b{i}: String!" for i in range(n)]])
     fields = "\n".join(_ALIAS_FIELD.format(i=i) for i in range(n))
     return f"""
 query({params}) {{
@@ -148,7 +148,7 @@ query({params}) {{
 # selected both here and in ``_PR_CONNECTION_FRAGMENT`` so a signature computed
 # from a full response compares equal to one computed from a digest response.
 _DIGEST_ALIAS_FIELD = """    b{i}: pullRequests(
-      headRefName: $b{i}, states: [OPEN, MERGED], first: 3, after: $c{i},
+      headRefName: $b{i}, states: [OPEN, MERGED], first: 100,
       orderBy: {{field: UPDATED_AT, direction: DESC}}
     ) {{ pageInfo {{ hasNextPage endCursor }} nodes {{
       number state isDraft merged mergeable mergeStateStatus reviewDecision updatedAt headRefOid
@@ -163,7 +163,7 @@ def build_digest_query(alias_count: int) -> str:
     """The digest counterpart of ``build_query``: same aliasing and variable
     scheme, minimal per-PR selection (#69)."""
     n = max(alias_count, 1)
-    params = ", ".join(["$owner: String!", "$repo: String!", *[f"$b{i}: String!, $c{i}: String" for i in range(n)]])
+    params = ", ".join(["$owner: String!", "$repo: String!", *[f"$b{i}: String!" for i in range(n)]])
     fields = "\n".join(_DIGEST_ALIAS_FIELD.format(i=i) for i in range(n))
     return f"""
 query({params}) {{

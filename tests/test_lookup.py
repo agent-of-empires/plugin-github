@@ -97,11 +97,12 @@ class _API:
                 if not alias.startswith("b"):
                     continue
                 nodes = [n for n in self.nodes.get(destination, []) if n["headRefName"] == branch]
-                start = int(variables.get(f"c{alias[1:]}") or 0)
-                end = start + 3
+                # Rich/digest queries fetch a single page; flag truncation only
+                # beyond the query's first:100 cap so tests with fewer nodes see
+                # a clean page.
                 aliases[alias] = {
-                    "nodes": nodes[start:end],
-                    "pageInfo": {"hasNextPage": end < len(nodes), "endCursor": str(end)},
+                    "nodes": nodes,
+                    "pageInfo": {"hasNextPage": len(nodes) > 100, "endCursor": "101"},
                 }
             return httpx.Response(200, json={"data": {"rateLimit": {"remaining": 5000}, "repository": aliases}})
         destination = "/".join(parts[1:3])
@@ -167,7 +168,7 @@ def test_fork_upstream_status_open_and_web(tmp_path, token, explicit_upstream):
     assert status["repo"] == "alice/r"
     assert status["branch"] == "feature"
     assert status["error"] is None
-    assert {p["number"] for p in status["pulls"]} == {8, 9}
+    assert {p["number"] for p in status["pulls"]} == {8}
     assert handlers.github_open(str(path), env=_Env(token), transport=transport) == {
         "url": "https://github.com/upstream/r/pull/8",
         "kind": "pull",
@@ -175,12 +176,15 @@ def test_fork_upstream_status_open_and_web(tmp_path, token, explicit_upstream):
     snapshot = _snapshot([path], api, token)
     repo = snapshot["sessions"][0]["repos"][0]
     assert repo["repo"] == "alice/r"
-    assert {p["number"]: p["head"]["repo"]["owner"]["login"] for p in repo["pulls"]} == {8: "alice", 9: "upstream"}
+    assert {p["number"]: p["head"]["repo"]["owner"]["login"] for p in repo["pulls"]} == {8: "alice"}
+    # Upstream-owned #9 and any third-party same-name branch are rejected: the
+    # permitted head is always the checkout's own origin repository.
+    assert 9 not in {p["number"] for p in repo["pulls"]}
     assert all(p["url"].startswith("https://github.com/upstream/r/pull/") for p in repo["pulls"])
     metadata = [r for r in api.requests if r.url.path == "/repos/alice/r"]
     assert len(metadata) == (0 if explicit_upstream else 1)
     if token:
-        assert any(r.url.path == "/graphql" and json.loads(r.content)["variables"].get("c0") for r in api.requests)
+        assert any(r.url.path == "/graphql" for r in api.requests)
         assert {r.url.path for r in api.requests if r.url.path.endswith("/stacks")} == {"/repos/upstream/r/stacks"}
 
 
@@ -314,36 +318,65 @@ def test_unavailable_upstream_does_not_hide_existing_origin_pull(tmp_path):
     assert [p["number"] for p in repo["pulls"]] == [1]
 
 
-@pytest.mark.parametrize("repeated_cursor", [False, True])
-def test_collision_pagination_failure_retains_rest_pull(tmp_path, repeated_cursor):
+def test_truncated_page_serves_rest_without_cooldown_on_busy_branch(tmp_path):
+    # A popular branch (e.g. same-repo main) with more foreign same-name PRs
+    # than one page can prove an absence; the owner-scoped REST probe is the
+    # trusted source, and a collision must not arm the per-key cooldown or
+    # re-query in a loop.
     path = _checkout(tmp_path / "repo", "team/r")
-    api = _API({"team/r": [_node("team/r", "team/r", 2)]})
-    pages = []
+    team_pull = _node("team/r", "team/r", 2)
+    foreign = [_node("team/r", f"stranger{i}/r", i + 10) for i in range(35)]
+    api = _API({"team/r": [*foreign, team_pull]})
+    graphql_queries = []
 
     def handler(request):
-        if request.url.path != "/graphql":
-            return api(request)
-        variables = json.loads(request.content)["variables"]
-        pages.append(variables)
-        cursor = "repeat" if repeated_cursor else str(len(pages))
-        return httpx.Response(
-            200,
-            json={
-                "data": {
-                    "repository": {
-                        "b0": {
-                            "nodes": [_node("team/r", "stranger/r", 1)],
-                            "pageInfo": {"hasNextPage": True, "endCursor": cursor},
-                        }
-                    },
-                    "rateLimit": {"remaining": 5000},
-                }
-            },
-        )
+        if request.url.path == "/graphql":
+            variables = json.loads(request.content)["variables"]
+            graphql_queries.append(variables)
+            destination = f"{variables['owner']}/{variables['repo']}"
+            nodes = [n for n in api.nodes.get(destination, []) if n["headRefName"] == variables["b0"]]
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                        # Simulate the server truncating at 100 even though the
+                        # branch is crowded with foreign same-name PRs.
+                        "repository": {"b0": {"nodes": nodes, "pageInfo": {"hasNextPage": True}}},
+                    }
+                },
+            )
+        return api(request)
 
     snapshot = refresh.build_snapshot(
         [{"id": "s", "project_path": str(path)}], env=_Env(token=True), transport=httpx.MockTransport(handler)
     )
-    assert [p["number"] for p in snapshot["sessions"][0]["repos"][0]["pulls"]] == [2]
-    assert len(pages) == (2 if repeated_cursor else 10)
-    assert refresh._graphql_cache == {}
+    repo = snapshot["sessions"][0]["repos"][0]
+    # The owned PR survives through the owner-scoped REST fallback, not an empty
+    # rich page, and only one GraphQL query is spent.
+    assert [p["number"] for p in repo["pulls"]] == [2]
+    assert len(graphql_queries) == 1
+    assert refresh._graphql_cache == {}  # nothing cached as a confirmed result
+    assert refresh._retry_cooldown == {}  # a collision is not a failure
+
+
+def test_origin_empty_upstream_error_keeps_status_failsoft(tmp_path):
+    path = _checkout(tmp_path / "fork", "alice/r", "upstream/r")
+    api = _API({})  # no open origin PRs for feature
+
+    def handler(request):
+        if request.url.path.startswith("/repos/upstream/"):
+            return httpx.Response(403, json={"message": "Forbidden"})
+        return api(request)
+
+    transport = httpx.MockTransport(handler)
+    status = handlers.github_status(str(path), env=_Env(), transport=transport)
+    assert status["pulls"] == []
+    assert status["error"] is None  # fail-soft contract preserved
+    assert "no open PR" in status["summary"]
+    repo = refresh.build_snapshot([{"id": "s", "project_path": str(path)}], env=_Env(), transport=transport)[
+        "sessions"
+    ][0]["repos"][0]
+    assert repo["pulls"] == []
+    assert repo["error"] is None
+    assert repo.get("freshness") is None or repo["freshness"]["stale"] is False
