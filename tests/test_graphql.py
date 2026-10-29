@@ -85,6 +85,14 @@ def _latest(state, oid, login="jules"):
     return {"state": state, "author": {"login": login}, "commit": {"oid": oid}}
 
 
+def _approval_recommendation():
+    return {
+        "state": "COMMENTED",
+        "body": "Recommendation: Approve",
+        "author": {"login": "reviewbot", "__typename": "Bot"},
+    }
+
+
 def test_review_state_changes_pushed_only_when_every_blocking_review_is_stale():
     def pr(*latest):
         out = _pr(decision="CHANGES_REQUESTED")
@@ -138,6 +146,43 @@ def test_review_state_infers_commented_from_review_or_thread():
     assert graphql.review_state(_pr(threads=[_thread(resolved=False)])) == "commented"
     # Resolved-only thread, no comment review, no decision -> waiting.
     assert graphql.review_state(_pr(threads=[_thread(resolved=True)])) == "waiting"
+
+
+def test_bot_approval_recommendation_does_not_count_as_commented():
+    bot_recommendation = _approval_recommendation()
+    pr = _pr(reviews=[bot_recommendation])
+    pr["latestReviews"] = {"nodes": [bot_recommendation]}
+    assert graphql.review_state(pr) == "waiting"
+    assert graphql.commenters(pr) == []
+    assert graphql.reviewers(pr) == []
+
+    bot_comment = {**bot_recommendation, "body": "Please update this section."}
+    bot = _pr(reviews=[bot_comment])
+    bot["latestReviews"] = {"nodes": [bot_comment]}
+    assert graphql.review_state(bot) == "commented"
+    assert graphql.commenters(bot) == ["reviewbot"]
+    assert graphql.reviewers(bot) == [{"name": "reviewbot", "state": "commented"}]
+
+    human_recommendation = {
+        **bot_recommendation,
+        "author": {"login": "reviewer", "__typename": "User"},
+    }
+    human = _pr(reviews=[human_recommendation])
+    human["latestReviews"] = {"nodes": [human_recommendation]}
+    assert graphql.review_state(human) == "commented"
+    assert graphql.commenters(human) == ["reviewer"]
+    assert graphql.reviewers(human) == [{"name": "reviewer", "state": "commented"}]
+
+    threaded = _pr(reviews=[bot_recommendation], threads=[_thread(resolved=False, author="reviewbot")])
+    threaded["latestReviews"] = {"nodes": [bot_recommendation]}
+    assert graphql.review_state(threaded) == "commented"
+    assert graphql.commenters(threaded) == ["reviewbot"]
+
+    formal_approval = {**bot_recommendation, "state": "APPROVED"}
+    approved = _pr(decision="APPROVED")
+    approved["latestReviews"] = {"nodes": [formal_approval]}
+    assert graphql.review_state(approved) == "approved"
+    assert graphql.reviewers(approved) == [{"name": "reviewbot", "state": "approved"}]
 
 
 def test_ignored_commenters_only_downgrade_bot_only_commented():

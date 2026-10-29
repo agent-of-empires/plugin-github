@@ -10,7 +10,8 @@ shape degrades a field rather than raising (the worker stays fail-soft).
 Why infer ``review_state`` instead of mapping ``reviewDecision`` directly:
 GitHub's ``reviewDecision`` only yields ``APPROVED`` / ``CHANGES_REQUESTED`` /
 ``REVIEW_REQUIRED`` / null. It cannot express "commented", so that state is
-inferred from a COMMENTED review or any unresolved thread.
+inferred from a COMMENTED review (except bot approval recommendations) or any
+unresolved thread.
 
 ``reviewDecision`` also reads ``APPROVED`` while a code-owner group or ruleset
 requirement is unmet, so ``approved`` additionally needs no outstanding review
@@ -35,8 +36,8 @@ from datetime import timezone
 # Counts are sized to what the pane renders, to keep the GraphQL point cost low
 # now that this query fires only on a detected change (#21):
 # - pullRequests first:3 (a branch rarely has more than one open + one merged PR);
-# - reviews last:20, states:[COMMENTED] (review_state only needs to know who left
-#   a COMMENTED review, so bot-only comments can be ignored; APPROVED /
+# - reviews last:20, states:[COMMENTED] (body and author type distinguish bot
+#   approval recommendations from actual review comments); APPROVED /
 #   CHANGES_REQUESTED come from reviewDecision);
 # - reviewThreads first:100 with pageInfo, so a big review (e.g. a CodeRabbit
 #   pass) surfaces every unresolved comment; refresh paginates by the node ``id``
@@ -74,8 +75,8 @@ fragment PRConnection on PullRequestConnection {
       }
       ... on StatusContext { context state targetUrl createdAt }
     } } } } } }
-    reviews(last: 20, states: [COMMENTED]) { nodes { state author { login } } }
-    latestReviews(first: 20) { nodes { state author { login } commit { oid } } }
+    reviews(last: 20, states: [COMMENTED]) { nodes { state body author { login __typename } } }
+    latestReviews(first: 20) { nodes { state body author { login __typename } commit { oid } } }
     decidedReviews: reviews(last: 30, states: [CHANGES_REQUESTED, APPROVED, DISMISSED]) {
       nodes { state author { login } commit { oid } }
     }
@@ -312,6 +313,20 @@ def _awaiting_approval(pr: dict[str, Any]) -> bool:
     return checks is not None and checks["state"] == "succeeded"
 
 
+def _is_bot_approval_recommendation(review: dict[str, Any]) -> bool:
+    """Whether a bot's COMMENTED review explicitly recommends approval."""
+    if review.get("state") != "COMMENTED":
+        return False
+    author = review.get("author")
+    body = review.get("body")
+    return (
+        isinstance(author, dict)
+        and author.get("__typename") == "Bot"
+        and isinstance(body, str)
+        and any(line.strip().casefold() == "recommendation: approve" for line in body.splitlines())
+    )
+
+
 def review_state(pr: dict[str, Any]) -> str:
     """``approved`` / ``partially-approved`` / ``changes-requested`` / ``changes-pushed`` / ``commented`` / ``waiting``.
 
@@ -324,8 +339,8 @@ def review_state(pr: dict[str, Any]) -> str:
     were all made on an older commit: the author has pushed since, so the review
     still blocks the merge on GitHub but is likely addressed and awaits a re-review.
 
-    ``commented`` is inferred (see module docstring): a COMMENTED review or any
-    unresolved thread, when the decision is neither approved nor changes-needed.
+    ``commented`` is inferred (see module docstring): a non-recommendation COMMENTED
+    review or any unresolved thread, when the decision is neither approved nor changes-needed.
     """
     decision = pr.get("reviewDecision")
     if decision == "APPROVED":
@@ -337,7 +352,9 @@ def review_state(pr: dict[str, Any]) -> str:
         return "changes-requested"
     reviews = _nodes(pr, "reviews")
     threads = _nodes(pr, "reviewThreads")
-    if any(r.get("state") == "COMMENTED" for r in reviews) or any(not t.get("isResolved") for t in threads):
+    if any(r.get("state") == "COMMENTED" and not _is_bot_approval_recommendation(r) for r in reviews) or any(
+        not t.get("isResolved") for t in threads
+    ):
         return "commented"
     return "waiting"
 
@@ -346,7 +363,11 @@ def commenters(pr: dict[str, Any]) -> list[str]:
     """Logins behind an inferred ``commented`` state: COMMENTED-review authors plus
     each unresolved thread's opener. An unknown author is ``""`` (counts as a
     person, so a deleted account never hides a comment)."""
-    logins = {_actor_login(r, "author") for r in _nodes(pr, "reviews") if r.get("state") == "COMMENTED"}
+    logins = {
+        _actor_login(r, "author")
+        for r in _nodes(pr, "reviews")
+        if r.get("state") == "COMMENTED" and not _is_bot_approval_recommendation(r)
+    }
     for thread in _nodes(pr, "reviewThreads"):
         if not thread.get("isResolved"):
             first = _nodes(thread, "comments")
@@ -753,6 +774,8 @@ def reviewers(pr: dict[str, Any]) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     seen: set[str] = set()
     for node in _nodes(pr, "latestReviews"):
+        if _is_bot_approval_recommendation(node):
+            continue
         name = _reviewer_name(node.get("author"))
         if name is None or name in seen:
             continue
