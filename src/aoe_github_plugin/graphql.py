@@ -327,7 +327,7 @@ def _is_bot_approval_recommendation(review: dict[str, Any]) -> bool:
     )
 
 
-def review_state(pr: dict[str, Any]) -> str:
+def review_state(pr: dict[str, Any], *, ignore_bot_approval_recommendations: bool = False) -> str:
     """``approved`` / ``partially-approved`` / ``changes-requested`` / ``changes-pushed`` / ``commented`` / ``waiting``.
 
     ``partially-approved`` is an ``APPROVED`` decision with approvals still
@@ -352,21 +352,24 @@ def review_state(pr: dict[str, Any]) -> str:
         return "changes-requested"
     reviews = _nodes(pr, "reviews")
     threads = _nodes(pr, "reviewThreads")
-    if any(r.get("state") == "COMMENTED" and not _is_bot_approval_recommendation(r) for r in reviews) or any(
-        not t.get("isResolved") for t in threads
-    ):
+    if any(
+        r.get("state") == "COMMENTED"
+        and (not ignore_bot_approval_recommendations or not _is_bot_approval_recommendation(r))
+        for r in reviews
+    ) or any(not t.get("isResolved") for t in threads):
         return "commented"
     return "waiting"
 
 
-def commenters(pr: dict[str, Any]) -> list[str]:
+def commenters(pr: dict[str, Any], *, ignore_bot_approval_recommendations: bool = False) -> list[str]:
     """Logins behind an inferred ``commented`` state: COMMENTED-review authors plus
     each unresolved thread's opener. An unknown author is ``""`` (counts as a
     person, so a deleted account never hides a comment)."""
     logins = {
         _actor_login(r, "author")
         for r in _nodes(pr, "reviews")
-        if r.get("state") == "COMMENTED" and not _is_bot_approval_recommendation(r)
+        if r.get("state") == "COMMENTED"
+        and (not ignore_bot_approval_recommendations or not _is_bot_approval_recommendation(r))
     }
     for thread in _nodes(pr, "reviewThreads"):
         if not thread.get("isResolved"):
@@ -759,7 +762,7 @@ def _reviewer_name(reviewer: Any) -> str | None:
     return None
 
 
-def reviewers(pr: dict[str, Any]) -> list[dict[str, str]]:
+def reviewers(pr: dict[str, Any], *, ignore_bot_approval_recommendations: bool = False) -> list[dict[str, str]]:
     """One entry per person whose opinion this PR is waiting on or has:
     ``[{"name", "state"}]`` where state is ``approved`` / ``changes-requested`` /
     ``changes-pushed`` / ``commented`` / ``pending``.
@@ -769,12 +772,13 @@ def reviewers(pr: dict[str, Any]) -> list[dict[str, str]]:
     ``latestReviews`` dropped (re-requested reviewer) is restored; outstanding
     ``reviewRequests`` are appended as ``pending``. A reviewer who has both (a
     re-request after a review) keeps their submitted state, since that is the
-    position still on record. Total: malformed nodes are skipped, never raised.
+    position still on record. Totals: malformed nodes are skipped, never raised;
+    a bot approval recommendation is dropped only when that exclusion is on.
     """
     out: list[dict[str, str]] = []
     seen: set[str] = set()
     for node in _nodes(pr, "latestReviews"):
-        if _is_bot_approval_recommendation(node):
+        if ignore_bot_approval_recommendations and _is_bot_approval_recommendation(node):
             continue
         name = _reviewer_name(node.get("author"))
         if name is None or name in seen:
@@ -930,8 +934,10 @@ def timeline(pr: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -> dict[str, Any]:
-    people = reviewers(pr)
+def _normalize_pull(
+    pr: dict[str, Any], *, required_checks_only: bool = False, ignore_bot_approval_recommendations: bool = False
+) -> dict[str, Any]:
+    people = reviewers(pr, ignore_bot_approval_recommendations=ignore_bot_approval_recommendations)
     return {
         "number": pr.get("number"),
         "url": pr.get("url"),
@@ -941,8 +947,8 @@ def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -
         "merged": bool(pr.get("merged", False)),
         "merge_state": merge_state(pr),
         "merge_queue": _merge_queue(pr),
-        "review_state": review_state(pr),
-        "commenters": commenters(pr),
+        "review_state": review_state(pr, ignore_bot_approval_recommendations=ignore_bot_approval_recommendations),
+        "commenters": commenters(pr, ignore_bot_approval_recommendations=ignore_bot_approval_recommendations),
         "checks": check_summary(pr, required_checks_only=required_checks_only),
         "comments": comment_summary(pr),
         "author": (pr.get("author") or {}).get("login") or "",
@@ -957,17 +963,28 @@ def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -
     }
 
 
-def normalize_connection(conn: Any, *, required_checks_only: bool = False) -> list[dict[str, Any]]:
+def normalize_connection(
+    conn: Any, *, required_checks_only: bool = False, ignore_bot_approval_recommendations: bool = False
+) -> list[dict[str, Any]]:
     """A ``pullRequests`` connection (the value of one alias in a batched
     response, or any ``{"nodes": [...]}``) -> trimmed, UI-ready pull dicts.
 
     Shape stays a superset of the REST ``_trim`` output (``number``/``url``/
     ``title``/``state``/``draft``) so ``uistate`` renders either source, plus
     the rich fields ``merged``/``review_state``/``checks``/``comments``. Total:
-    a missing/malformed connection degrades to ``[]`` rather than raising.
+    a missing/malformed connection degrades to ``[]`` rather than raising. Both
+    flags are part of the caller's rich-cache key, so toggling either invalidates
+    a cached normalized pull.
     """
     if not isinstance(conn, dict):
         return []
     nodes = conn.get("nodes")
     pulls = [n for n in nodes if isinstance(n, dict)] if isinstance(nodes, list) else []
-    return [_normalize_pull(pr, required_checks_only=required_checks_only) for pr in pulls]
+    return [
+        _normalize_pull(
+            pr,
+            required_checks_only=required_checks_only,
+            ignore_bot_approval_recommendations=ignore_bot_approval_recommendations,
+        )
+        for pr in pulls
+    ]

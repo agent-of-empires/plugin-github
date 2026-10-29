@@ -166,6 +166,21 @@ def test_required_checks_setting_reaches_refresh(monkeypatch):
     assert seen == [True]
 
 
+def test_ignore_bot_approval_recommendations_setting_reaches_refresh(monkeypatch):
+    seen = []
+
+    def spy_build_snapshot(sessions, **kwargs):
+        seen.append(kwargs["settings"].ignore_bot_approval_recommendations)
+        return {"sessions": [], "auth": {"present": True}}
+
+    monkeypatch.setattr(main.refresh, "build_snapshot", spy_build_snapshot)
+    rt = main.Runtime(send=lambda _m: None)
+    # Opt-in: enabling the setting (config returns True) must reach SnapshotSettings.
+    rt.call_host = lambda *_a, **_kw: {"value": True}
+    rt.run_refresh(sessions=[])
+    assert seen == [True]
+
+
 # --- archived/snoozed sessions are skipped (issue #41) ---
 
 

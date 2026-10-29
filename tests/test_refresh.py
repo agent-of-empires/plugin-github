@@ -630,6 +630,37 @@ def test_required_check_mode_uses_separate_rich_cache(tmp_path):
     assert required_snap["sessions"][0]["repos"][0]["pulls"][0]["checks"]["state"] == "succeeded"
 
 
+def test_ignore_bot_approval_recommendations_uses_separate_rich_cache(tmp_path):
+    # Toggling the opt-in setting (off default -> on) changes the rich-cache key's
+    # fifth component, so the second refresh must re-query and re-normalize rather
+    # than serving a cached pull stuck with the previous setting's review state.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    node = _gql_node(number=7, decision=None)
+    rec = {
+        "state": "COMMENTED",
+        "body": "Recommendation: Approve",
+        "author": {"login": "reviewbot", "__typename": "Bot"},
+    }
+    node["reviews"] = {"nodes": [rec]}
+    node["reviewThreads"] = {"nodes": []}
+    gql = []
+    transport = _rich_transport([node], gql=gql)
+    off = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert len(gql) == 1
+    assert off["sessions"][0]["repos"][0]["pulls"][0]["review_state"] == "commented"
+    on = refresh.build_snapshot(
+        sessions,
+        env=_Env(),
+        transport=transport,
+        settings=refresh.SnapshotSettings(ignore_bot_approval_recommendations=True),
+    )
+    assert len(gql) == 2  # setting toggle = fresh full query, not a cached pull
+    assert on["sessions"][0]["repos"][0]["pulls"][0]["review_state"] == "waiting"
+
+
 def test_stack_attachment_preserves_native_order_and_mergeability():
     stack = {"pull_requests": [{"number": 11}, {"number": 12}, {"number": 13}]}
     details = {

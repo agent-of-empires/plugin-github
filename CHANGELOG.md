@@ -14,7 +14,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 - **refresh:** Cool down failed cold stack lookups, isolate stack retry cooldowns from primary REST backoff, evict departed members, mark fallback data stale, and exclude stack-only PRs from session status.
 - **pane:** Keep advisory stack states out of hard readiness blocks and omit footer verdicts for stack-only PRs.
-- **graphql:** Exclude bot approval recommendations from commented state.
+- **graphql:** Opt-in `ignore_bot_approval_recommendations` setting (default off) to exclude bot approval recommendations from commented state.
 
 ## [2.3.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.3.0) - 2026-10-21
 

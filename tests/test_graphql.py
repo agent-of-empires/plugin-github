@@ -148,20 +148,36 @@ def test_review_state_infers_commented_from_review_or_thread():
     assert graphql.review_state(_pr(threads=[_thread(resolved=True)])) == "waiting"
 
 
-def test_bot_approval_recommendation_does_not_count_as_commented():
+def test_bot_approval_recommendation_is_opt_in():
     bot_recommendation = _approval_recommendation()
     pr = _pr(reviews=[bot_recommendation])
     pr["latestReviews"] = {"nodes": [bot_recommendation]}
-    assert graphql.review_state(pr) == "waiting"
-    assert graphql.commenters(pr) == []
-    assert graphql.reviewers(pr) == []
+    # Default (off): the recommendation counts like any other comment.
+    assert graphql.review_state(pr) == "commented"
+    assert graphql.commenters(pr) == ["reviewbot"]
+    assert graphql.reviewers(pr) == [{"name": "reviewbot", "state": "commented"}]
+    pulled = graphql.normalize_connection(_conn(pr))[0]
+    assert pulled["review_state"] == "commented"
+    assert pulled["commenters"] == ["reviewbot"]
+    assert pulled["reviewers"] == [{"name": "reviewbot", "state": "commented"}]
+
+    # Opting in excludes the bot approval recommendation from all three outputs.
+    assert graphql.review_state(pr, ignore_bot_approval_recommendations=True) == "waiting"
+    assert graphql.commenters(pr, ignore_bot_approval_recommendations=True) == []
+    assert graphql.reviewers(pr, ignore_bot_approval_recommendations=True) == []
+    opted = graphql.normalize_connection(_conn(pr), ignore_bot_approval_recommendations=True)[0]
+    assert opted["review_state"] == "waiting"
+    assert opted["commenters"] == []
+    assert opted["reviewers"] == []
 
     bot_comment = {**bot_recommendation, "body": "Please update this section."}
     bot = _pr(reviews=[bot_comment])
     bot["latestReviews"] = {"nodes": [bot_comment]}
-    assert graphql.review_state(bot) == "commented"
-    assert graphql.commenters(bot) == ["reviewbot"]
-    assert graphql.reviewers(bot) == [{"name": "reviewbot", "state": "commented"}]
+    assert graphql.review_state(bot, ignore_bot_approval_recommendations=True) == "commented"
+    assert graphql.commenters(bot, ignore_bot_approval_recommendations=True) == ["reviewbot"]
+    assert graphql.reviewers(bot, ignore_bot_approval_recommendations=True) == [
+        {"name": "reviewbot", "state": "commented"}
+    ]
 
     human_recommendation = {
         **bot_recommendation,
@@ -169,20 +185,24 @@ def test_bot_approval_recommendation_does_not_count_as_commented():
     }
     human = _pr(reviews=[human_recommendation])
     human["latestReviews"] = {"nodes": [human_recommendation]}
-    assert graphql.review_state(human) == "commented"
-    assert graphql.commenters(human) == ["reviewer"]
-    assert graphql.reviewers(human) == [{"name": "reviewer", "state": "commented"}]
+    assert graphql.review_state(human, ignore_bot_approval_recommendations=True) == "commented"
+    assert graphql.commenters(human, ignore_bot_approval_recommendations=True) == ["reviewer"]
+    assert graphql.reviewers(human, ignore_bot_approval_recommendations=True) == [
+        {"name": "reviewer", "state": "commented"}
+    ]
 
     threaded = _pr(reviews=[bot_recommendation], threads=[_thread(resolved=False, author="reviewbot")])
     threaded["latestReviews"] = {"nodes": [bot_recommendation]}
-    assert graphql.review_state(threaded) == "commented"
-    assert graphql.commenters(threaded) == ["reviewbot"]
+    assert graphql.review_state(threaded, ignore_bot_approval_recommendations=True) == "commented"
+    assert graphql.commenters(threaded, ignore_bot_approval_recommendations=True) == ["reviewbot"]
 
     formal_approval = {**bot_recommendation, "state": "APPROVED"}
     approved = _pr(decision="APPROVED")
     approved["latestReviews"] = {"nodes": [formal_approval]}
-    assert graphql.review_state(approved) == "approved"
-    assert graphql.reviewers(approved) == [{"name": "reviewbot", "state": "approved"}]
+    assert graphql.review_state(approved, ignore_bot_approval_recommendations=True) == "approved"
+    assert graphql.reviewers(approved, ignore_bot_approval_recommendations=True) == [
+        {"name": "reviewbot", "state": "approved"}
+    ]
 
 
 def test_ignored_commenters_only_downgrade_bot_only_commented():

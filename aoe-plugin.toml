@@ -185,6 +185,13 @@ label = "Approval overrides a stale changes-requested review"
 description = "When a reviewer requested changes on an older commit and someone else approved the current head, show the PR as approved (or \"partially approved\" if another reviewer is still requested) instead of \"pushed since review\". GitHub still blocks the merge until the stale review is re-done or dismissed. Off keeps \"pushed since review\" and notes the approval."
 type = "boolean"
 default = false
+
+[[settings]]
+key = "ignore_bot_approval_recommendations"
+label = "Ignore bot approval recommendations"
+description = "Off (default): a bot's COMMENTED review whose body literally recommends approval (a \"Recommendation: Approve\" line) counts like any other comment. On: such a review does not make the PR read \"commented\"."
+type = "boolean"
+default = false
 advanced = true
 
 [[settings]]
