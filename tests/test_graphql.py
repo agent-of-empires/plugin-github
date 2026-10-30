@@ -200,6 +200,17 @@ def test_bot_approval_recommendation_is_opt_in():
         {"name": "reviewbot", "state": "commented"}
     ]
 
+    # An earlier genuine COMMENTED review also keeps the bot a reviewer even
+    # though its latest review is the excluded recommendation.
+    prior_comment = {**bot_recommendation, "body": "Please update this section."}
+    both = _pr(reviews=[prior_comment, bot_recommendation])
+    both["latestReviews"] = {"nodes": [bot_recommendation]}
+    assert graphql.review_state(both, ignore_bot_approval_recommendations=True) == "commented"
+    assert graphql.commenters(both, ignore_bot_approval_recommendations=True) == ["reviewbot"]
+    assert graphql.reviewers(both, ignore_bot_approval_recommendations=True) == [
+        {"name": "reviewbot", "state": "commented"}
+    ]
+
     formal_approval = {**bot_recommendation, "state": "APPROVED"}
     approved = _pr(decision="APPROVED")
     approved["latestReviews"] = {"nodes": [formal_approval]}

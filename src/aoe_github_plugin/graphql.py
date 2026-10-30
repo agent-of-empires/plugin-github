@@ -787,21 +787,28 @@ def reviewers(pr: dict[str, Any], *, ignore_bot_approval_recommendations: bool =
     re-request after a review) keeps their submitted state, since that is the
     position still on record. Totals: malformed nodes are skipped, never raised.
     A bot approval recommendation is dropped only when that exclusion is on and
-    the bot opens no unresolved thread (a thread keeps it a ``commented``
-    reviewer, matching ``commenters``/``review_state``).
+    the bot otherwise drives no ``commented`` signal — an unresolved thread or a
+    genuine (non-recommendation) COMMENTED review keeps it a ``commented``
+    reviewer, matching ``commenters``/``review_state``.
     """
     out: list[dict[str, str]] = []
     seen: set[str] = set()
-    # A bot whose review is an excluded approval recommendation still drives
-    # ``commented`` through an unresolved thread (see ``commenters``), so it must
-    # stay visible as a reviewer rather than vanishing from the pane.
-    thread_openers = _thread_openers(pr)
+    # A bot whose latest review is an excluded approval recommendation can still
+    # drive ``commented`` through an unresolved thread or an earlier genuine
+    # COMMENTED review (see ``commenters``), so it must stay visible as a
+    # reviewer rather than vanishing from the pane.
+    genuine_commenters = {
+        _reviewer_name(r.get("author"))
+        for r in _nodes(pr, "reviews")
+        if r.get("state") == "COMMENTED" and not _is_bot_approval_recommendation(r)
+    }
+    genuine_commenters |= _thread_openers(pr)
     for node in _nodes(pr, "latestReviews"):
         name = _reviewer_name(node.get("author"))
         is_excluded_recommendation = (
             ignore_bot_approval_recommendations
             and name is not None
-            and name not in thread_openers
+            and name not in genuine_commenters
             and _is_bot_approval_recommendation(node)
         )
         if is_excluded_recommendation:
