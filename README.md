@@ -99,6 +99,16 @@ affected budget (GraphQL searches or REST notifications), so the next refresh
 waits for it to reset. Dismissing a `mentioned` item in AoE does not mark the
 GitHub notification read.
 
+Setup checks: at startup and on the host's `suggestions.checks.run`, the
+worker reports four checks with `suggestions.checks.set`: `gh` installed (only
+a warning when `GITHUB_TOKEN` or `GH_TOKEN` is set), signed in, the configured
+repositories and organizations readable, and the token able to read
+notifications (skipped, as ok, while the `mentioned` source is off). One
+batched GraphQL request covers the sign-in check and every scope entry; the
+notifications probe is `GET /notifications?per_page=1`. With no token nothing
+is sent to GitHub, and a probe skipped by the rate-limit backoff reports
+`warn`. The checks are not repeated on the `ui_refresh_secs` tick.
+
 Suggestion text from GitHub is source material, not trusted instructions. The
 provider proposes a task prompt but never creates sessions.
 

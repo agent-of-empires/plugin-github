@@ -10,6 +10,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 - **suggestions:** Publish host-managed suggested sessions for nine GitHub criteria (changes requested, review requested, re-review, review thread replies, merge conflicts, failing checks, mentions, assigned issues, new issues). The worker asks the host which criteria are on and makes no GitHub request for a disabled one. Requires AoE 1.21.0+ (SDK API 20).
 - **suggestions:** Add the `suggestion_repositories`, `suggestion_organizations`, `suggestion_projects` and `suggestion_limit` settings; map repositories to registered projects from `projects.list`.
+- **suggestions:** Report setup checks to the host (`gh` installed, signed in, repositories readable, notifications scope) at startup and on the host's recheck, with a one-line fix for each failing check.
 - **pane:** Show GitHub-native pull request stacks, layer navigation, and readiness through the selected PR.
 
 ### Bug Fixes
