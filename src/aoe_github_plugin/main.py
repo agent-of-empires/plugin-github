@@ -45,8 +45,21 @@ from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
 from aoe_github_plugin import uistate
 from aoe_github_plugin import handlers
+from aoe_github_plugin import suggestions
 from aoe_github_plugin.utils.rpc import error_response
 from aoe_github_plugin.utils.rpc import result_response
+
+SUGGESTIONS_SET = "suggestions.set"
+SUGGESTIONS_ERROR = "suggestions.error"
+SUGGESTIONS_REFRESH = "suggestions.refresh"
+SUGGESTIONS_SOURCES = "suggestions.sources"
+PROJECTS_LIST = "projects.list"
+SUGGESTION_SETTING_KEYS = (
+    "suggestion_repositories",
+    "suggestion_organizations",
+    "suggestion_projects",
+    "suggestion_limit",
+)
 
 Sink = Callable[[dict[str, Any]], None]
 
@@ -225,6 +238,7 @@ class Runtime:
         self._ignored_commenters = graphql.parse_ignored_commenters(DEFAULT_IGNORED_COMMENTERS)
         self._next_network: float | None = None
         self._next_poll: float | None = None
+        self._suggestions_refresh_due = False
 
     def _read_stdin(self) -> None:
         """Reader thread: drain stdin into the queue, then post ``_EOF``."""
@@ -273,6 +287,10 @@ class Runtime:
         method = msg.get("method", "")
         params = msg.get("params") or {}
         msg_id = msg.get("id")
+        if method == SUGGESTIONS_REFRESH:
+            # A host notification: flag a rediscovery for the loop, nothing to answer.
+            self._suggestions_refresh_due = True
+            return
         try:
             result = dispatch(method, params)
         except Exception as exc:  # noqa: BLE001 - any failure becomes a JSON-RPC error
@@ -567,12 +585,95 @@ class Runtime:
         A scoped refresh leaves other sessions in ``pushed_session_ids``, so
         tracking for other sessions and their UI slots remains intact."""
         self.run_refresh(sessions, force=force, only_session=only_session)
+        self._rearm_network()
+
+    def _rearm_network(self) -> None:
         if self._next_network is not None:
             self._next_network = time.monotonic() + self._interval + _network_jitter(self._interval)
+
+    def _enabled_criteria(self) -> set[str] | None:
+        """Criteria the host left on, or ``None`` when it did not answer. Silence
+        must never read as "all on": a disabled criterion may not cost a request."""
+        result = self.call_host(SUGGESTIONS_SOURCES, {})
+        sources = result.get("sources") if isinstance(result, dict) else None
+        if not isinstance(sources, list):
+            return None
+        return {
+            source["criterion"]
+            for source in sources
+            if isinstance(source, dict) and source.get("enabled") is True and isinstance(source.get("criterion"), str)
+        }
+
+    def _project_repos(self) -> dict[str, str]:
+        """``owner/repo`` -> registered project path, from the host's project
+        list and each checkout's origin. Fail-soft: no host answer, no mapping."""
+        result = self.call_host(PROJECTS_LIST, {})
+        projects = result.get("projects") if isinstance(result, dict) else None
+        mapping: dict[str, str] = {}
+        for project in projects if isinstance(projects, list) else []:
+            path = project.get("path") if isinstance(project, dict) else None
+            if not isinstance(path, str) or not path:
+                continue
+            repo = refresh.checkout_repo(path)
+            if repo:
+                mapping.setdefault(repo.lower(), path)
+        return mapping
+
+    def _suggestion_settings(self) -> dict[str, Any]:
+        settings: dict[str, Any] = {}
+        for key in SUGGESTION_SETTING_KEYS:
+            result = self.call_host(CONFIG_GET, {"key": key})
+            if not isinstance(result, dict):
+                raise TypeError(f"Failed to read suggestion setting {key!r}")
+            settings[key] = result.get("value")
+        return settings
+
+    def _send_suggestions(self, method: str, params: dict[str, Any]) -> None:
+        self.send({"jsonrpc": "2.0", "id": next(_outbound_ids), "method": method, "params": params})
+
+    def _refresh_suggestions(self) -> None:
+        """Publish a complete snapshot of the enabled criteria; on any failure
+        report ``suggestions.error`` and let the host keep its last good snapshot."""
+        if self.stopped:
+            return
+        try:
+            enabled = self._enabled_criteria()
+            if enabled is None:
+                raise RuntimeError("The host did not report which suggestion sources are enabled")  # noqa: TRY301
+            if not enabled:
+                items: list[dict[str, Any]] = []
+            else:
+                # Before any settings or project reads: a rate-limited budget skips the whole discovery.
+                suggestions.check_backoff(enabled & set(suggestions.CRITERIA))
+                settings = self._suggestion_settings()
+                items = suggestions.fetch_suggestions(
+                    enabled=enabled,
+                    repos_raw=settings["suggestion_repositories"],
+                    orgs_raw=settings["suggestion_organizations"],
+                    mapping_raw=settings["suggestion_projects"],
+                    limit_raw=settings["suggestion_limit"],
+                    project_repos=self._project_repos(),
+                )
+        except Exception as exc:  # noqa: BLE001 - report failure, keep the host's last good snapshot
+            self._send_suggestions(
+                SUGGESTIONS_ERROR,
+                {"message": suggestions.clamp(str(exc) or type(exc).__name__, suggestions.ERROR_BYTES)},
+            )
+            return
+        result = self.call_host(SUGGESTIONS_SET, {"items": items})
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            # The host validates the whole snapshot and drops it on one bad item; surface that.
+            logging.getLogger(__name__).warning("host did not accept the suggestions snapshot: %r", result)
+            self._send_suggestions(SUGGESTIONS_ERROR, {"message": "The host rejected the suggestions snapshot"})
 
     def _service_ticks(self) -> None:
         """Run whichever refresh is due: an inbound github.refresh, a fast local
         tick that noticed a session change, or the slower network tick."""
+        suggestions_ran = False
+        if self._suggestions_refresh_due:
+            self._suggestions_refresh_due = False
+            suggestions_ran = True
+            self._refresh_suggestions()
         now = time.monotonic()
         if self.refresh_due:
             self.refresh_due = False
@@ -587,7 +688,11 @@ class Runtime:
                     self._refresh_and_reset(sessions)
             self._next_poll = now + SESSION_POLL_SECS
         if self._next_network is not None and now >= self._next_network:
-            self._refresh_and_reset()
+            self.run_refresh()
+            if not suggestions_ran:
+                self._refresh_suggestions()
+            # Re-arm only after both: a slow discovery must not leave the deadline in the past.
+            self._rearm_network()
 
     def run(self) -> None:
         threading.Thread(target=self._read_stdin, daemon=True).start()
@@ -606,6 +711,8 @@ class Runtime:
             self.run_refresh(sessions)
         else:
             self.run_refresh()
+        # Suggestions do not depend on AoE sessions, so they run even with none.
+        self._refresh_suggestions()
         self._interval = self.resolve_interval()
         # interval 0 disables all background polling (startup + on github.refresh
         # still push); otherwise a fast local tick notices session changes and a

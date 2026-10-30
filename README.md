@@ -49,6 +49,59 @@ anything is written.
 | UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), six `filter-facet`s (`github_ci`, `github_review`, `github_pr`, `github_comments`, `github_conflicts`, `github_queue`), and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
+### GitHub suggestions
+
+On Agent of Empires 1.21.0+ (SDK API 20), this plugin publishes host-managed
+suggested sessions, independent of AoE sessions. Each source below is one
+criterion declared in the manifest's `[suggestions]` block. The host owns the
+per-profile on/off switch for every criterion. Before each discovery the worker
+asks the host which are on and makes no GitHub request for one that is off; if
+the host does not answer, the worker publishes `suggestions.error` and queries
+nothing.
+
+| Criterion | What it finds | GitHub query |
+|---|---|---|
+| `changes_requested` | Your open PRs with a current changes-requested verdict on the head commit | `is:open is:pr author:@me` |
+| `review_requested` | Open PRs where your review is requested | `is:open is:pr review-requested:@me` |
+| `re_review` | PRs you reviewed that got new commits since, without a formal re-request | `is:open is:pr reviewed-by:@me -author:@me -review-requested:@me` |
+| `review_thread_reply` | Your open PRs with unresolved review threads where someone else commented last | shares the `author:@me` search |
+| `merge_conflict` | Your open PRs that conflict with their base branch | shares the `author:@me` search |
+| `ci_failed` | Your open PRs whose head commit has failed or errored checks | shares the `author:@me` search |
+| `mentioned` | Unread issue or PR comments that mention you or your team | `GET /notifications` (ETag-cached, so an unchanged inbox is free) |
+| `assigned_issues` | Open issues assigned to you | `is:open is:issue assignee:@me` |
+| `new_issues` | Issues opened by others in the last 7 days | `is:open is:issue -author:@me created:>=<date>` over the repositories below |
+
+The four `author:@me` criteria run one search and publish one item per PR; its
+criterion is the first match in the order above and its reason lists every
+match. Items are ranked in that table order, then by recency, and deduplicated
+by source URL. Every item carries `variables` for the host's prompt templates
+(`repo`, `org`, `title`, `url`, `timestamp`, plus criterion-specific names); the
+manifest lists them per criterion, and an authored-PR variable that did not
+match is an empty string.
+
+Scope: `suggestion_repositories` (comma-separated `owner/repo`) and
+`suggestion_organizations` restrict every criterion; empty means everything
+the token can see. `new_issues` needs a repository list: the allowlist or
+organizations when set, else the repositories of your registered AoE projects
+(read from each project's `origin` remote via the host's `projects.list`).
+Those same projects give each item its `project`; `suggestion_projects`
+(`owner/repo=project name or path`, one per line) overrides that mapping.
+`suggestion_limit` caps the published snapshot (1-500) after a complete fetch.
+A long allowlist is split across several searches, each within GitHub's 256-character query limit.
+
+Discovery runs at startup, on the host's `suggestions.refresh`, and on the
+`ui_refresh_secs` tick. Searches and review histories are fetched to
+completion (10 pages of 50, 10 pages of 100 reviews per PR); exceeding a cap, a
+GraphQL error, or a rate limit reports `suggestions.error`, and the host keeps
+its last good snapshot. The notification inbox is read newest first and stops
+after 500 entries. A rate limit arms the plugin's shared backoff gate for the
+affected budget (GraphQL searches or REST notifications), so the next refresh
+waits for it to reset. Dismissing a `mentioned` item in AoE does not mark the
+GitHub notification read.
+
+Suggestion text from GitHub is source material, not trusted instructions. The
+provider proposes a task prompt but never creates sessions.
+
 `open_pr` is the command-palette / shortcut way to open the active session's PR
 (requires a host on api_version 6+). It is a client action, not a worker call:
 the host opens the PR `href` the worker already publishes on the `github_pr_badge`
