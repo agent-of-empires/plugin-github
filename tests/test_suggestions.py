@@ -658,6 +658,7 @@ def test_host_refresh_notification_runs_provider_on_main_thread(monkeypatch):
     runtime = main.Runtime(send=lambda _m: None)
     runs = []
     monkeypatch.setattr(runtime, "_refresh_suggestions", lambda: runs.append(True))
+    monkeypatch.setattr(runtime, "_publish_checks", lambda: None)
     runtime.handle_inbound({"jsonrpc": "2.0", "method": "suggestions.refresh"})
     assert runs == []
     runtime._service_ticks()
@@ -1002,13 +1003,13 @@ def test_publish_checks_passes_sources_and_scope_and_replaces_the_host_list(monk
     assert calls[-1] == (main.SUGGESTIONS_CHECKS_SET, {"checks": [{"id": "x", "label": "X", "status": "ok"}]})
 
 
-def test_publish_checks_treats_a_silent_host_as_mentions_off(monkeypatch):
+def test_publish_checks_passes_none_when_the_host_does_not_report_sources(monkeypatch):
     captured = {}
     runtime = main.Runtime(send=lambda _m: None)
     runtime.call_host = _host(sources=None, settings={})
     monkeypatch.setattr(main.checks, "run_checks", lambda **kw: captured.update(kw) or [])
     runtime._publish_checks()
-    assert captured["mentioned_enabled"] is False
+    assert captured["mentioned_enabled"] is None
 
 
 def test_publish_checks_reports_a_failing_check_when_the_run_breaks(monkeypatch):
@@ -1035,6 +1036,17 @@ def test_host_checks_run_notification_publishes_once_on_the_main_thread(monkeypa
     runtime._service_ticks()
     runtime._service_ticks()
     assert runs == [True]
+
+
+def test_suggestions_refresh_republishes_checks_once(monkeypatch):
+    runtime = main.Runtime(send=lambda _m: None)
+    order = []
+    monkeypatch.setattr(runtime, "_refresh_suggestions", lambda: order.append("suggestions"))
+    monkeypatch.setattr(runtime, "_publish_checks", lambda: order.append("checks"))
+    runtime.handle_inbound({"jsonrpc": "2.0", "method": "suggestions.refresh"})
+    runtime._service_ticks()
+    runtime._service_ticks()
+    assert order == ["checks", "suggestions"]
 
 
 def test_network_tick_does_not_republish_checks(monkeypatch):

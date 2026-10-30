@@ -680,10 +680,10 @@ class Runtime:
         if self.stopped:
             return
         try:
-            enabled = self._enabled_criteria() or set()
+            enabled = self._enabled_criteria()
             settings = self._suggestion_settings()
             report = checks.run_checks(
-                mentioned_enabled="mentioned" in enabled,
+                mentioned_enabled=None if enabled is None else "mentioned" in enabled,
                 repos_raw=settings["suggestion_repositories"],
                 orgs_raw=settings["suggestion_organizations"],
             )
@@ -699,6 +699,10 @@ class Runtime:
         """Run whichever refresh is due: an inbound github.refresh, a fast local
         tick that noticed a session change, or the slower network tick."""
         suggestions_ran = False
+        if self._suggestions_refresh_due:
+            # A refresh or a sources change: the checks depend on both the enabled
+            # sources and the scope settings, so they must not outlive them.
+            self._checks_due = True
         if self._checks_due:
             self._checks_due = False
             self._publish_checks()
@@ -745,7 +749,7 @@ class Runtime:
             self.run_refresh()
         # Suggestions do not depend on AoE sessions, so they run even with none.
         self._refresh_suggestions()
-        # Only here and on the host's checks.run: a check run costs requests, so no tick repeats it.
+        # Checks run here, on the host's checks.run and on suggestions.refresh; no timer repeats them.
         self._publish_checks()
         self._interval = self.resolve_interval()
         # interval 0 disables all background polling (startup + on github.refresh
