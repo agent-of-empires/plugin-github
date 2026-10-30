@@ -18,6 +18,7 @@ from datetime import datetime
 from datetime import timezone
 from datetime import timedelta
 from urllib.parse import urlparse
+from collections.abc import Callable
 
 from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
@@ -69,6 +70,12 @@ CRITERIA: tuple[str, ...] = (
 AUTHORED_CRITERIA: tuple[str, ...] = ("changes_requested", "review_thread_reply", "merge_conflict", "ci_failed")
 
 _RATE = "rateLimit { cost remaining resetAt }"
+_PAGE_INFO = "pageInfo { hasNextPage endCursor }"
+_THREAD_FIELDS = f"nodes {{ isResolved comments(last: 1) {{ nodes {{ author {{ login }} }} }} }} {_PAGE_INFO}"
+_CONTEXT_FIELDS = f"""nodes {{
+          ... on CheckRun {{ __typename name status conclusion }}
+          ... on StatusContext {{ __typename context state }}
+        }} {_PAGE_INFO}"""
 _PR_FIELDS = """
         id number title body url updatedAt headRefName baseRefName
         repository { nameWithOwner }
@@ -101,11 +108,10 @@ query($query: String!, $after: String) {{
       ... on PullRequest {{
         {_PR_FIELDS}
         mergeable
-        commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ contexts(first: 100) {{ nodes {{
-          ... on CheckRun {{ __typename name status conclusion }}
-          ... on StatusContext {{ __typename context state }}
-        }} }} }} }} }} }}
-        reviewThreads(first: 100) {{ nodes {{ isResolved comments(last: 1) {{ nodes {{ author {{ login }} }} }} }} }}
+        commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{
+          contexts(first: 100) {{ {_CONTEXT_FIELDS} }}
+        }} }} }} }}
+        reviewThreads(first: 100) {{ {_THREAD_FIELDS} }}
       }}
     }}
   }}
@@ -137,6 +143,27 @@ query($id: ID!, $after: String) {{
         nodes {{ author {{ login }} state commit {{ oid }} }}
         pageInfo {{ hasNextPage endCursor }}
       }}
+    }}
+  }}
+}}
+"""
+
+_REVIEW_THREADS_QUERY = f"""
+query($id: ID!, $after: String) {{
+  {_RATE}
+  node(id: $id) {{
+    ... on PullRequest {{ reviewThreads(first: 100, after: $after) {{ {_THREAD_FIELDS} }} }}
+  }}
+}}
+"""
+_CHECK_CONTEXTS_QUERY = f"""
+query($id: ID!, $after: String) {{
+  {_RATE}
+  node(id: $id) {{
+    ... on PullRequest {{
+      commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{
+        contexts(first: 100, after: $after) {{ {_CONTEXT_FIELDS} }}
+      }} }} }} }}
     }}
   }}
 }}
@@ -289,6 +316,75 @@ def _complete_review_history(client: GitHubClient, pull_request: dict[str, Any])
         reviews.extend(next_connection["nodes"])
         pages += 1
     return {**pull_request, "reviews": {"nodes": reviews}}
+
+
+def _drain_connection(
+    client: GitHubClient,
+    document: str,
+    pull_request: dict[str, Any],
+    first: Any,
+    pick: Callable[[Any], Any],
+) -> list[Any]:
+    """Every node of a PR connection whose first page is ``first``; raise on a partial result.
+
+    ``pick`` extracts the connection from a ``node(id:)`` page of ``document``. A missing
+    ``pageInfo`` means a single page.
+    """
+    if first is None:
+        return []
+    if not isinstance(first, dict) or not isinstance(first.get("nodes"), list):
+        raise TypeError("GitHub returned an invalid pull request connection")
+    nodes = list(first["nodes"])
+    info = first.get("pageInfo") or {}
+    pages = 1
+    while info.get("hasNextPage"):
+        if pages >= MAX_PAGES:
+            raise RuntimeError("GitHub pull request data exceeded the complete pagination limit")
+        cursor, pull_request_id = info.get("endCursor"), pull_request.get("id")
+        if not isinstance(pull_request_id, str) or not isinstance(cursor, str):
+            raise TypeError("GitHub returned an invalid pull request connection cursor")
+        node = _data(client.post_graphql(document, {"id": pull_request_id, "after": cursor})).get("node")
+        page = pick(node)
+        if not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
+            raise TypeError("GitHub returned an invalid pull request connection")
+        nodes.extend(page["nodes"])
+        info = page.get("pageInfo") or {}
+        pages += 1
+    return nodes
+
+
+def _complete_signals(client: GitHubClient, pull_request: dict[str, Any], wanted: list[str]) -> dict[str, Any]:
+    """The PR with every review thread and check context its enabled criteria read."""
+    complete = pull_request
+    if "review_thread_reply" in wanted:
+        threads = _drain_connection(
+            client,
+            _REVIEW_THREADS_QUERY,
+            pull_request,
+            pull_request.get("reviewThreads"),
+            lambda node: node.get("reviewThreads") if isinstance(node, dict) else None,
+        )
+        complete = {**complete, "reviewThreads": {"nodes": threads}}
+    if "ci_failed" in wanted:
+        head = _head_commit(pull_request)
+        rollup = head.get("statusCheckRollup")
+        if isinstance(rollup, dict):
+            contexts = _drain_connection(
+                client,
+                _CHECK_CONTEXTS_QUERY,
+                pull_request,
+                rollup.get("contexts"),
+                lambda node: (
+                    (_head_commit(node).get("statusCheckRollup") or {}).get("contexts")
+                    if isinstance(node, dict)
+                    else None
+                ),
+            )
+            complete = {
+                **complete,
+                "commits": {"nodes": [{"commit": {**head, "statusCheckRollup": {"contexts": {"nodes": contexts}}}}]},
+            }
+    return complete
 
 
 def _latest_verdicts(pr: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -547,6 +643,7 @@ def _authored(
             continue
         # Only changes_requested reads review verdicts; skip the extra pages when it is off.
         complete = _complete_review_history(client, pr) if "changes_requested" in wanted else pr
+        complete = _complete_signals(client, complete, wanted)
         matched, extra = _authored_matches(complete, wanted)
         if not matched:
             continue

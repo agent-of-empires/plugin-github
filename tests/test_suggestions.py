@@ -22,20 +22,38 @@ class FakeClient:
     """Routes each GraphQL search by a substring of its query string, so a test
     declares which GitHub answers exist and asserts which queries ran."""
 
-    def __init__(self, searches=None, *, login="me", notifications=None, comments=None, review_pages=None):
+    def __init__(  # noqa: PLR0913 - one canned answer list per query shape
+        self,
+        searches=None,
+        *,
+        login="me",
+        notifications=None,
+        comments=None,
+        review_pages=None,
+        thread_pages=None,
+        context_pages=None,
+    ):
         self.searches = searches or {}
         self.login = login
         self.notifications = notifications if notifications is not None else []
         self.comments = comments or {}
         self.review_pages = list(review_pages or [])
+        self.thread_pages = list(thread_pages or [])
+        self.context_pages = list(context_pages or [])
         self.queries = []
         self.rest = []
         self.notifications_status = 200
 
-    def post_graphql(self, query, variables):
+    def post_graphql(self, query, variables):  # noqa: PLR0911 - one branch per query shape
         if " viewer {" in query:
             self.queries.append("viewer")
             return {"data": {"viewer": {"login": self.login}}}
+        if "reviewThreads(first: 100, after" in query:
+            self.queries.append("threads")
+            return self.thread_pages.pop(0)
+        if "contexts(first: 100, after" in query:
+            self.queries.append("contexts")
+            return self.context_pages.pop(0)
         if "node(id:" in query:
             self.queries.append("reviews")
             return self.review_pages.pop(0)
@@ -319,6 +337,61 @@ def test_review_history_paginates_before_classifying(monkeypatch):
     # The first page holds the oldest review (on "old"); the newest, on the next page, is on head.
     assert _discover(client, {"re_review"}) == []
     assert "reviews" in client.queries
+
+
+def _thread(author="rev", resolved=False):
+    return {"isResolved": resolved, "comments": {"nodes": [{"author": {"login": author}}]}}
+
+
+def _head(contexts, page=PAGE_DONE):
+    return {
+        "nodes": [{"commit": {"oid": "head", "statusCheckRollup": {"contexts": {"nodes": contexts, **_info(page)}}}}]
+    }
+
+
+def _info(page):
+    return {"pageInfo": page}
+
+
+MORE = {"hasNextPage": True, "endCursor": "c2"}
+
+
+def test_review_threads_paginate_past_the_first_hundred():
+    first = [_thread(resolved=True) for _ in range(100)]
+    pr = _authored_pr(id="PR1", reviewThreads={"nodes": first, "pageInfo": MORE})
+    page = {"data": {"node": {"reviewThreads": {"nodes": [_thread()], "pageInfo": PAGE_DONE}}}}
+    client = FakeClient({" author:@me": [pr]}, thread_pages=[page])
+    items = _discover(client, {"review_thread_reply"})
+    # The only unresolved thread lives on page two.
+    assert [item["criterion"] for item in items] == ["review_thread_reply"]
+    assert items[0]["variables"]["unresolved_threads"] == "1"
+    assert client.queries.count("threads") == 1
+
+
+def test_status_contexts_paginate_past_the_first_hundred():
+    first = [_check_run(f"ok-{i}", "SUCCESS") for i in range(100)]
+    pr = _authored_pr(id="PR1", commits=_head(first, MORE))
+    page = {"data": {"node": {"commits": _head([_check_run("late-fail", "FAILURE")])}}}
+    client = FakeClient({" author:@me": [pr]}, context_pages=[page])
+    items = _discover(client, {"ci_failed"})
+    assert [item["criterion"] for item in items] == ["ci_failed"]
+    assert items[0]["variables"]["failed_checks"] == "late-fail"
+
+
+def test_extra_pages_are_skipped_when_their_criteria_are_off():
+    pr = _authored_pr(id="PR1", reviewThreads={"nodes": [], "pageInfo": MORE}, commits=_head([], MORE))
+    client = FakeClient({" author:@me": [pr]})
+    assert _discover(client, {"merge_conflict"}) == []
+    assert "threads" not in client.queries
+    assert "contexts" not in client.queries
+
+
+def test_thread_pagination_cap_rejects_a_partial_result():
+    pr = _authored_pr(id="PR1", reviewThreads={"nodes": [_thread(resolved=True)], "pageInfo": MORE})
+    page = {"data": {"node": {"reviewThreads": {"nodes": [_thread(resolved=True)], "pageInfo": MORE}}}}
+    client = FakeClient({" author:@me": [pr]}, thread_pages=[page] * suggestions.MAX_PAGES)
+    with pytest.raises(RuntimeError, match="complete pagination limit"):
+        _discover(client, {"review_thread_reply"})
 
 
 # --- mentions -------------------------------------------------------------------
