@@ -154,7 +154,7 @@ def clamp(text: str, limit: int) -> str:
     return text if len(raw) <= limit else raw[:limit].decode(errors="ignore")
 
 
-def _parse_csv(raw: Any, grammar: re.Pattern[str]) -> set[str]:
+def parse_csv(raw: Any, grammar: re.Pattern[str]) -> set[str]:
     if not isinstance(raw, str):
         return set()
     parts = {part.strip().lower() for part in raw.replace("\n", ",").split(",") if part.strip()}
@@ -734,8 +734,8 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
     enabled = set(enabled) & set(CRITERIA)
     if not enabled:
         return []
-    repos = _parse_csv(repos_raw, REPO_RE)
-    orgs = _parse_csv(orgs_raw, ORG_RE)
+    repos = parse_csv(repos_raw, REPO_RE)
+    orgs = parse_csv(orgs_raw, ORG_RE)
     projects = {**{repo.lower(): path for repo, path in (project_repos or {}).items()}, **_project_map(mapping_raw)}
     limit = (
         limit_raw if isinstance(limit_raw, int) and not isinstance(limit_raw, bool) and 1 <= limit_raw <= 500 else 100

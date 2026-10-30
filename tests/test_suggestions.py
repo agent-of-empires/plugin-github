@@ -902,10 +902,10 @@ def test_mention_preview_only_follows_api_github_com_repos_urls():
 
 
 def test_allowlist_entries_must_match_the_owner_repo_grammar():
-    assert suggestions._parse_csv("Acme/Widgets, bad repo is:private, no-slash, a/b/c", suggestions.REPO_RE) == {
+    assert suggestions.parse_csv("Acme/Widgets, bad repo is:private, no-slash, a/b/c", suggestions.REPO_RE) == {
         "acme/widgets"
     }
-    assert suggestions._parse_csv("acme, evil org:x, -bad", suggestions.ORG_RE) == {"acme"}
+    assert suggestions.parse_csv("acme, evil org:x, -bad", suggestions.ORG_RE) == {"acme"}
 
 
 def test_clamp_never_splits_a_multibyte_character():
