@@ -1023,10 +1023,13 @@ def _batched_handler(by_branch, *, gql=None, etag='W/"v1"'):
         if request.headers.get("If-None-Match") == etag:
             return httpx.Response(304)
         # The REST list must agree with the rich set: a warm rich cache is only
-        # served while both describe the same open PRs.
+        # served while both describe the same open PRs, and the 304 path serves
+        # whatever this first response cached.
         branch = request.url.params.get("head", ":feature").split(":", 1)[1]
         return httpx.Response(
-            200, headers={"ETag": etag}, json=[_pull(branch=branch) for _ in by_branch.get(branch, [])]
+            200,
+            headers={"ETag": etag},
+            json=[_pull(number=node["number"], branch=branch) for node in by_branch.get(branch, [])],
         )
 
     return httpx.MockTransport(handler)
@@ -1073,16 +1076,14 @@ def test_partial_alias_failure_isolates_to_its_key(tmp_path):
                 "errors": [{"type": "SERVICE", "message": "boom", "path": ["repository", "b1"]}],
             }
             return httpx.Response(200, json=body)
+        # REST probes report each branch's seeded open-PR set: the 304 path
+        # serves this cached list, and a diverged set would (correctly) withhold
+        # the rich entry, which is what this test asserts must survive.
+        branch = request.url.params.get("head", ":x").split(":", 1)[1]
+        listed = [_pull(number=n["number"], branch=branch) for n in seeds.get(branch, [])]
         if request.headers.get("If-None-Match") == 'W/"v1"':
             return httpx.Response(304)
-        # REST mirrors each branch's seeded rich set; otherwise the richer cache
-        # could not be served (see ``_same_pull_set``).
-        branch = request.url.params.get("head", ":x").split(":", 1)[1]
-        return httpx.Response(
-            200,
-            headers={"ETag": 'W/"v1"'},
-            json=[_pull(number=n["number"], branch=branch) for n in seeds.get(branch, [])],
-        )
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=listed)
 
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler), force=True)
     by_branch = {r["branch"]: r for r in snap["sessions"][0]["repos"]}
@@ -1867,3 +1868,54 @@ def test_invalid_worktree_path_never_falls_back_to_source_and_stored_branch(tmp_
     snapshot = refresh.build_snapshot([session], env=_NoToken(), transport=_transport([_pull()], capture=requests))
     assert snapshot["sessions"][0]["repos"] == []
     assert requests == []
+
+
+def test_fallback_pulls_withholds_rich_when_probe_set_diverges():
+    # The _fallback_pulls half of the truncation-window thread: a cooldown (or
+    # any GraphQL failure) that follows a changed probe, then a later 304 with
+    # changed=False, must not keep serving a rich list describing the OLD set.
+    rich = {"pulls": [{"url": "u1"}]}
+    assert refresh._fallback_pulls({"basic": [{"url": "u1"}], "rich": rich, "changed": False})["pulls"] == [
+        {"url": "u1"}
+    ]
+    assert refresh._fallback_pulls({"basic": [{"url": "u2"}], "rich": rich, "changed": False})["pulls"] == [
+        {"url": "u2"}
+    ]
+    # A changed probe still prefers REST, as #33 requires.
+    assert refresh._fallback_pulls({"basic": [{"url": "u2"}], "rich": rich, "changed": True})["pulls"] == [
+        {"url": "u2"}
+    ]
+
+
+def test_cooldown_after_changed_probe_serves_rest_on_diverged_304(tmp_path):
+    # End-to-end for the same gap through build_snapshot: seed a rich entry for
+    # PR 1, then a changed probe (PR 2) plus a failed query arms the cooldown.
+    # The next tick answers 304 with changed=False; the stale rich list must not
+    # come back, while the preserved rich entry still backs a later failure.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=1)]))
+
+    def diverged(request):
+        if str(request.url).endswith("/graphql"):
+            return httpx.Response(200, json={"errors": [{"message": "boom"}]})
+        if request.headers.get("If-None-Match") == 'W/"v2"':
+            return httpx.Response(304)
+        return httpx.Response(200, headers={"ETag": 'W/"v2"'}, json=[_pull(number=2)])
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(diverged), force=True)
+    assert [p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]] == [2]
+    assert "checks" not in snap["sessions"][0]["repos"][0]["pulls"][0]  # basic REST shape, not rich
+    # The rich entry survived, so it is still available as a last-resort cache.
+    assert refresh._graphql_cache[("o", "r", "feature", "o", "r", False)]["pulls"][0]["number"] == 1
+
+    def agreeing(request):
+        if str(request.url).endswith("/graphql"):
+            return httpx.Response(200, json={"errors": [{"message": "boom"}]})
+        return httpx.Response(304)
+
+    # Same cached probe list (ETag 304, unchanged set) -> the rich shape returns.
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(agreeing))
+    assert len(snap["sessions"][0]["repos"][0]["pulls"]) == 1

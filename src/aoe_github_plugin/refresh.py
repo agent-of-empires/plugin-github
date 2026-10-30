@@ -1005,11 +1005,19 @@ def _fallback_pulls(pending: dict[str, Any]) -> dict[str, Any]:
     one), so serve the fresh basic REST pulls instead. Those lack the rich
     CI/review fields but reflect the current PR set; the next successful GraphQL
     tick restores the rich shape. Without this, a GraphQL rate limit can hide a
-    PR that REST already discovered (#62)."""
+    PR that REST already discovered (#62).
+
+    The rich list is also withheld when the probe's current set disagrees with
+    the set the rich entry was built from even though the ETag still answered
+    304: a changed-probe cooldown followed by an unchanged probe can otherwise
+    keep showing a list a PR has since opened into or closed out of, for as long
+    as the truncation/cooldown window lasts. The rich entry itself is kept, so a
+    later probe error still falls back to it rather than a typed error."""
     rich = pending["rich"]
-    if rich is not None and not pending.get("changed"):
+    basic = pending["basic"]
+    if rich is not None and not pending.get("changed") and _same_pull_set(basic, rich):
         return _pulls_result(rich["pulls"], fresh=False, stale=True)
-    return _pulls_result(pending["basic"], fresh=False, stale=True)
+    return _pulls_result(basic, fresh=False, stale=True)
 
 
 def _chunk_fallback(
