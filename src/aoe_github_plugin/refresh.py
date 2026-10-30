@@ -745,6 +745,15 @@ def note_graphql_rate_limit(rate_info: dict[str, Any]) -> None:
     _observe_rate_limit(rate_info, kind="suggestions", repo="-", aliases=1)
 
 
+def arm_if_graphql_rate_limited(envelope: dict[str, Any]) -> bool:
+    """Arm the GraphQL gate from a 200 envelope carrying a ``RATE_LIMITED`` error,
+    using its ``resetAt``; ``True`` when it was rate limited."""
+    if not _graphql_rate_limited(envelope):
+        return False
+    _set_backoff("graphql", ((envelope.get("data") or {}).get("rateLimit") or {}).get("resetAt"))
+    return True
+
+
 def checkout_repo(path: str) -> str | None:
     """``owner/name`` of a checkout's github.com origin, or ``None``."""
     return _identify(path)[0]

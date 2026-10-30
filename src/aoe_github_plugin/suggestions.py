@@ -9,6 +9,7 @@ the ``author:@me`` PR search serves ``changes_requested``,
 
 from __future__ import annotations
 
+import re
 import time
 import hashlib
 import contextlib
@@ -18,6 +19,7 @@ from datetime import timezone
 from datetime import timedelta
 from urllib.parse import urlparse
 
+from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
 from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.auth import SystemEnvironment
@@ -30,8 +32,20 @@ from aoe_github_plugin.errors import RateLimitedError
 MAX_PAGES = 10
 # ponytail: fixed 7-day window for new issues; make it a setting if anyone asks.
 NEW_ISSUES_WINDOW_DAYS = 7
-# GitHub caps search strings; chunk explicit repo lists for the new-issue search.
-REPOS_PER_QUERY = 20
+# GitHub rejects search queries longer than this; scope terms are chunked to fit.
+MAX_QUERY_CHARS = 256
+# Host limits for one item (docs/plugin-api.md, Suggested sessions), in UTF-8 bytes.
+TITLE_BYTES = 512
+STRING_BYTES = 2048
+PREVIEW_BYTES = 16 * 1024
+PROMPT_BYTES = 64 * 1024
+PROJECT_BYTES = 4096
+ERROR_BYTES = 4096
+# Allowlist grammar, so a setting can never smuggle extra search qualifiers.
+REPO_RE = re.compile(r"^[a-z0-9][a-z0-9-]*/[a-z0-9._-]+$")
+ORG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# Only comment URLs under this prefix are fetched: the client sends the bearer token with them.
+API_REPOS_PREFIX = "https://api.github.com/repos/"
 # Mention previews cost one REST call each; bound the fan-out per refresh.
 MAX_MENTION_PREVIEWS = 20
 # GitHub's hard maximum for /notifications (per_page=100 still returns 50).
@@ -56,7 +70,7 @@ AUTHORED_CRITERIA: tuple[str, ...] = ("changes_requested", "review_thread_reply"
 
 _RATE = "rateLimit { cost remaining resetAt }"
 _PR_FIELDS = """
-        id number title body url isDraft updatedAt headRefName baseRefName
+        id number title body url updatedAt headRefName baseRefName
         repository { nameWithOwner }
         author { login }
         reviews(first: 100) {
@@ -73,9 +87,6 @@ query($query: String!, $after: String) {{
       ... on PullRequest {{
         {_PR_FIELDS}
         commits(last: 1) {{ nodes {{ commit {{ oid }} }} }}
-        reviewRequests(first: 50) {{
-          nodes {{ requestedReviewer {{ ... on User {{ login }} ... on Team {{ name }} }} }}
-        }}
       }}
     }}
   }}
@@ -91,8 +102,8 @@ query($query: String!, $after: String) {{
         {_PR_FIELDS}
         mergeable
         commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ contexts(first: 100) {{ nodes {{
-          ... on CheckRun {{ name conclusion }}
-          ... on StatusContext {{ context state }}
+          ... on CheckRun {{ __typename name status conclusion }}
+          ... on StatusContext {{ __typename context state }}
         }} }} }} }} }} }}
         reviewThreads(first: 100) {{ nodes {{ isResolved comments(last: 1) {{ nodes {{ author {{ login }} }} }} }} }}
       }}
@@ -133,12 +144,21 @@ query($id: ID!, $after: String) {{
 
 # Last notifications pull, replayed on a 304 (which costs no rate limit).
 _notifications_cache: dict[str, Any] = {"etag": None, "items": []}
+# Mention previews by latest_comment_url, kept alongside the ETag so a 304 costs no preview GETs.
+_comment_cache: dict[str, tuple[str, str]] = {}
 
 
-def _parse_csv(raw: Any) -> set[str]:
+def clamp(text: str, limit: int) -> str:
+    """``text`` cut to at most ``limit`` UTF-8 bytes, never mid-character."""
+    raw = text.encode()
+    return text if len(raw) <= limit else raw[:limit].decode(errors="ignore")
+
+
+def _parse_csv(raw: Any, grammar: re.Pattern[str]) -> set[str]:
     if not isinstance(raw, str):
         return set()
-    return {part.strip().lower() for part in raw.replace("\n", ",").split(",") if part.strip()}
+    parts = {part.strip().lower() for part in raw.replace("\n", ",").split(",") if part.strip()}
+    return {part for part in parts if grammar.match(part)}
 
 
 def _project_map(raw: Any) -> dict[str, str]:
@@ -156,9 +176,24 @@ def _project_map(raw: Any) -> dict[str, str]:
     return result
 
 
-def _scope(repos: set[str], orgs: set[str]) -> str:
-    parts = [f"repo:{repo}" for repo in sorted(repos)] + [f"org:{org}" for org in sorted(orgs)]
-    return " " + " ".join(parts) if parts else ""
+def _scope_terms(repos: set[str], orgs: set[str]) -> list[str]:
+    return [f"repo:{repo}" for repo in sorted(repos)] + [f"org:{org}" for org in sorted(orgs)]
+
+
+def _queries(base: str, terms: list[str]) -> list[str]:
+    """``base`` plus the scope terms, split into queries that each fit GitHub's length limit."""
+    if not terms:
+        return [base]
+    queries: list[str] = []
+    current, used = base, False
+    for term in terms:
+        if used and len(current) + 1 + len(term) > MAX_QUERY_CHARS:
+            queries.append(current)
+            current, used = base, False
+        current += " " + term
+        used = True
+    queries.append(current)
+    return queries
 
 
 def _in_scope(repo: str, repos: set[str], orgs: set[str]) -> bool:
@@ -185,6 +220,8 @@ def _head_commit(pr: dict[str, Any]) -> dict[str, Any]:
 
 def _data(envelope: dict[str, Any]) -> dict[str, Any]:
     """Unwrap a GraphQL envelope, record its rate-limit spend, reject partials."""
+    if refresh.arm_if_graphql_rate_limited(envelope):
+        raise RateLimitedError
     if envelope.get("errors"):
         raise RuntimeError("GitHub returned an incomplete search")
     data = envelope.get("data")
@@ -212,6 +249,15 @@ def _search(client: GitHubClient, document: str, query: str) -> list[dict[str, A
         if not isinstance(cursor, str):
             raise TypeError("GitHub returned an invalid search cursor")
     raise RuntimeError("GitHub search exceeded the complete pagination limit")
+
+
+def _search_scoped(client: GitHubClient, document: str, base: str, terms: list[str]) -> list[dict[str, Any]]:
+    """``_search`` over every length-bounded chunk of the scope, one node per URL."""
+    unique: dict[str, dict[str, Any]] = {}
+    for query in _queries(base, terms):
+        for node in _search(client, document, query):
+            unique.setdefault(node["url"], node)
+    return list(unique.values())
 
 
 def _complete_review_history(client: GitHubClient, pull_request: dict[str, Any]) -> dict[str, Any]:
@@ -297,15 +343,11 @@ def _unresolved_threads_awaiting(pr: dict[str, Any]) -> int:
 
 
 def _failed_checks(pr: dict[str, Any]) -> list[str]:
-    failed: list[str] = []
-    for context in _nodes(_head_commit(pr).get("statusCheckRollup"), "contexts"):
-        if not isinstance(context, dict):
-            continue
-        if context.get("conclusion") in {"FAILURE", "ERROR", "TIMED_OUT"}:
-            failed.append(str(context.get("name") or "check"))
-        elif context.get("state") in {"FAILURE", "ERROR"}:
-            failed.append(str(context.get("context") or "status"))
-    return failed
+    return [
+        str(context.get("name") or context.get("context") or "check")
+        for context in _nodes(_head_commit(pr).get("statusCheckRollup"), "contexts")
+        if isinstance(context, dict) and graphql.context_state(context) == "failing"
+    ]
 
 
 def _identity(node: dict[str, Any]) -> tuple[str, int] | None:
@@ -362,28 +404,33 @@ def _item(  # noqa: PLR0913 - one call site per criterion, keyword-only
     prompt: str,
     projects: dict[str, str],
 ) -> dict[str, Any]:
-    source_ref = f"https://github.com/{repo}/{'pull' if kind == 'pr' else 'issues'}/{number}"
+    source_ref = clamp(f"https://github.com/{repo}/{'pull' if kind == 'pr' else 'issues'}/{number}", STRING_BYTES)
+    all_variables = {
+        "repo": repo,
+        "org": repo.split("/", 1)[0],
+        "title": title,
+        "url": source_ref,
+        "timestamp": str(timestamp or ""),
+        **variables,
+    }
+    # The host rejects the whole snapshot when one string exceeds its byte cap, so clamp them all.
     item: dict[str, Any] = {
         "id": hashlib.sha256(f"{criterion}:{source_ref}".encode()).hexdigest()[:24],
-        "title": title,
-        "reason": reason,
+        "title": clamp(title, TITLE_BYTES),
+        "reason": clamp(reason, STRING_BYTES),
         "source_url": source_ref,
         "source_ref": source_ref,
-        "preview": " ".join(str(body or "").split())[:400],
+        "preview": clamp(" ".join(str(body or "").split())[:400], PREVIEW_BYTES),
         "criterion": criterion,
-        "variables": {
-            "repo": repo,
-            "org": repo.split("/", 1)[0],
-            "title": title,
-            "url": source_ref,
-            "timestamp": str(timestamp or ""),
-            **variables,
+        "variables": {name: clamp(value, STRING_BYTES) for name, value in all_variables.items()},
+        "draft": {
+            "title": clamp(draft_title, TITLE_BYTES),
+            "prompt": f"{clamp(prompt, PROMPT_BYTES - len(UNTRUSTED) - 1)} {UNTRUSTED}",
         },
-        "draft": {"title": draft_title, "prompt": f"{prompt} {UNTRUSTED}"},
     }
     project = projects.get(repo.lower())
     if project:
-        item["project"] = project
+        item["project"] = clamp(project, PROJECT_BYTES)
     return item
 
 
@@ -394,11 +441,13 @@ def _viewer_login(client: GitHubClient) -> str:
     return login
 
 
-def _review_side(client: GitHubClient, enabled: set[str], scope: str, projects: dict[str, str]) -> list[dict[str, Any]]:
+def _review_side(
+    client: GitHubClient, enabled: set[str], terms: list[str], projects: dict[str, str]
+) -> list[dict[str, Any]]:
     """``review_requested`` and ``re_review``; a formal request wins over a re-review."""
     items: dict[str, dict[str, Any]] = {}
     if "review_requested" in enabled:
-        for pr in _search(client, _REVIEW_PR_QUERY, "is:open is:pr review-requested:@me" + scope):
+        for pr in _search_scoped(client, _REVIEW_PR_QUERY, "is:open is:pr review-requested:@me", terms):
             identity = _identity(pr)
             if identity is None:
                 continue
@@ -420,8 +469,8 @@ def _review_side(client: GitHubClient, enabled: set[str], scope: str, projects: 
             )
     if "re_review" in enabled:
         login = _viewer_login(client)
-        query = "is:open is:pr reviewed-by:@me -author:@me -review-requested:@me" + scope
-        for pr in _search(client, _REVIEW_PR_QUERY, query):
+        query = "is:open is:pr reviewed-by:@me -author:@me -review-requested:@me"
+        for pr in _search_scoped(client, _REVIEW_PR_QUERY, query, terms):
             identity = _identity(pr)
             if identity is None or pr["url"] in items:
                 continue
@@ -474,17 +523,20 @@ def _authored_matches(pr: dict[str, Any], wanted: list[str]) -> tuple[list[tuple
     return matched, extra
 
 
-def _authored(client: GitHubClient, enabled: set[str], scope: str, projects: dict[str, str]) -> list[dict[str, Any]]:
+def _authored(
+    client: GitHubClient, enabled: set[str], terms: list[str], projects: dict[str, str]
+) -> list[dict[str, Any]]:
     """One search for every criterion about the user's own open PRs; one item per PR."""
     wanted = [criterion for criterion in AUTHORED_CRITERIA if criterion in enabled]
     if not wanted:
         return []
     items: list[dict[str, Any]] = []
-    for pr in _search(client, _AUTHORED_PR_QUERY, "is:open is:pr author:@me" + scope):
+    for pr in _search_scoped(client, _AUTHORED_PR_QUERY, "is:open is:pr author:@me", terms):
         identity = _identity(pr)
         if identity is None:
             continue
-        complete = _complete_review_history(client, pr)
+        # Only changes_requested reads review verdicts; skip the extra pages when it is off.
+        complete = _complete_review_history(client, pr) if "changes_requested" in wanted else pr
         matched, extra = _authored_matches(complete, wanted)
         if not matched:
             continue
@@ -535,6 +587,7 @@ def _notifications(client: GitHubClient) -> list[dict[str, Any]]:
 def _mentions(client: GitHubClient, repos: set[str], orgs: set[str], projects: dict[str, str]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     previews = 0
+    seen: set[str] = set()
     for notification in _notifications(client):
         if not isinstance(notification, dict) or not notification.get("unread"):
             continue
@@ -549,14 +602,18 @@ def _mentions(client: GitHubClient, repos: set[str], orgs: set[str], projects: d
             continue
         body, comment_url = "", ""
         latest = subject.get("latest_comment_url")
-        if isinstance(latest, str) and latest and previews < MAX_MENTION_PREVIEWS:
-            previews += 1
-            # A deleted comment must not blank the snapshot; rate limits still propagate.
-            with contextlib.suppress(NotFoundError):
-                comment = client.get_json(latest)
-                if isinstance(comment, dict):
-                    body = str(comment.get("body") or "")
-                    comment_url = str(comment.get("html_url") or "")
+        if isinstance(latest, str) and latest.startswith(API_REPOS_PREFIX):
+            seen.add(latest)
+            if latest not in _comment_cache and previews < MAX_MENTION_PREVIEWS:
+                previews += 1
+                entry = ("", "")
+                # A deleted comment must not blank the snapshot; rate limits still propagate.
+                with contextlib.suppress(NotFoundError):
+                    comment = client.get_json(latest)
+                    if isinstance(comment, dict):
+                        entry = (str(comment.get("body") or ""), str(comment.get("html_url") or ""))
+                _comment_cache[latest] = entry
+            body, comment_url = _comment_cache.get(latest, ("", ""))
         number = int(number_text)
         title = str(subject.get("title") or f"{repo}#{number}")
         items.append(
@@ -578,6 +635,8 @@ def _mentions(client: GitHubClient, repos: set[str], orgs: set[str], projects: d
                 projects=projects,
             )
         )
+    for stale in set(_comment_cache) - seen:
+        del _comment_cache[stale]
     return items
 
 
@@ -610,15 +669,9 @@ def _issue_items(
     return items
 
 
-def _new_issues(client: GitHubClient, scope: str, repos: list[str], projects: dict[str, str]) -> list[dict[str, Any]]:
+def _new_issues(client: GitHubClient, terms: list[str], projects: dict[str, str]) -> list[dict[str, Any]]:
     since = (datetime.now(timezone.utc) - timedelta(days=NEW_ISSUES_WINDOW_DAYS)).strftime("%Y-%m-%d")
-    base = f"is:open is:issue -author:@me created:>={since}"
-    if scope:
-        queries = [base + scope]
-    else:
-        chunks = [repos[i : i + REPOS_PER_QUERY] for i in range(0, len(repos), REPOS_PER_QUERY)]
-        queries = [base + " " + " ".join(f"repo:{repo}" for repo in chunk) for chunk in chunks]
-    issues = [issue for query in queries for issue in _search(client, _ISSUE_QUERY, query)]
+    issues = _search_scoped(client, _ISSUE_QUERY, f"is:open is:issue -author:@me created:>={since}", terms)
     return _issue_items(
         "new_issues", issues, projects, reason=f"Opened in the last {NEW_ISSUES_WINDOW_DAYS} days", verb="Investigate"
     )
@@ -632,9 +685,9 @@ def _discover(
     orgs: set[str],
     projects: dict[str, str],
 ) -> list[dict[str, Any]]:
-    scope = _scope(repos, orgs)
-    items = _authored(client, enabled, scope, projects)
-    items += _review_side(client, enabled, scope, projects)
+    terms = _scope_terms(repos, orgs)
+    items = _authored(client, enabled, terms, projects)
+    items += _review_side(client, enabled, terms, projects)
     if "mentioned" in enabled:
         try:
             items += _mentions(client, repos, orgs, projects)
@@ -643,11 +696,22 @@ def _discover(
             refresh.arm_backoff("rest")
             raise RuntimeError(str(exc)) from exc
     if "assigned_issues" in enabled:
-        issues = _search(client, _ISSUE_QUERY, "is:open is:issue assignee:@me" + scope)
+        issues = _search_scoped(client, _ISSUE_QUERY, "is:open is:issue assignee:@me", terms)
         items += _issue_items("assigned_issues", issues, projects, reason="Assigned to you", verb="Work on")
-    if "new_issues" in enabled and (scope or projects):
-        items += _new_issues(client, scope, sorted(projects), projects)
+    if "new_issues" in enabled:
+        new_terms = terms or [f"repo:{repo}" for repo in sorted(projects) if REPO_RE.match(repo)]
+        if new_terms:
+            items += _new_issues(client, new_terms, projects)
     return items
+
+
+def check_backoff(enabled: set[str]) -> None:
+    """Raise while the budget an enabled criterion draws on is rate limited."""
+    now = time.monotonic()
+    if (enabled - {"mentioned"} and now < refresh.backoff_until("graphql")) or (
+        "mentioned" in enabled and now < refresh.backoff_until("rest")
+    ):
+        raise RuntimeError("GitHub rate limited; retrying after the budget resets")
 
 
 def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
@@ -670,17 +734,13 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
     enabled = set(enabled) & set(CRITERIA)
     if not enabled:
         return []
-    repos = _parse_csv(repos_raw)
-    orgs = _parse_csv(orgs_raw)
+    repos = _parse_csv(repos_raw, REPO_RE)
+    orgs = _parse_csv(orgs_raw, ORG_RE)
     projects = {**{repo.lower(): path for repo, path in (project_repos or {}).items()}, **_project_map(mapping_raw)}
     limit = (
         limit_raw if isinstance(limit_raw, int) and not isinstance(limit_raw, bool) and 1 <= limit_raw <= 500 else 100
     )
-    now = time.monotonic()
-    if (enabled - {"mentioned"} and now < refresh.backoff_until("graphql")) or (
-        "mentioned" in enabled and now < refresh.backoff_until("rest")
-    ):
-        raise RuntimeError("GitHub rate limited; retrying after the budget resets")
+    check_backoff(enabled)
     try:
         token, _ = resolve_token(env or SystemEnvironment())
     except GitHubAuthError as exc:
@@ -689,7 +749,9 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
         with GitHubClient(token) as client:
             items = _discover(client, enabled=enabled, repos=repos, orgs=orgs, projects=projects)
     except RateLimitedError as exc:
-        refresh.arm_backoff("graphql")
+        # A GraphQL rate-limit envelope already armed the gate with its exact reset; never shorten it.
+        if time.monotonic() >= refresh.backoff_until("graphql"):
+            refresh.arm_backoff("graphql")
         raise RuntimeError(str(exc)) from exc
     items = [item for item in items if _in_scope(item["variables"]["repo"], repos, orgs)]
     items.sort(key=lambda item: item["variables"]["timestamp"], reverse=True)

@@ -585,6 +585,9 @@ class Runtime:
         A scoped refresh leaves other sessions in ``pushed_session_ids``, so
         tracking for other sessions and their UI slots remains intact."""
         self.run_refresh(sessions, force=force, only_session=only_session)
+        self._rearm_network()
+
+    def _rearm_network(self) -> None:
         if self._next_network is not None:
             self._next_network = time.monotonic() + self._interval + _network_jitter(self._interval)
 
@@ -640,6 +643,8 @@ class Runtime:
             if not enabled:
                 items: list[dict[str, Any]] = []
             else:
+                # Before any settings or project reads: a rate-limited budget skips the whole discovery.
+                suggestions.check_backoff(enabled & set(suggestions.CRITERIA))
                 settings = self._suggestion_settings()
                 items = suggestions.fetch_suggestions(
                     enabled=enabled,
@@ -650,15 +655,24 @@ class Runtime:
                     project_repos=self._project_repos(),
                 )
         except Exception as exc:  # noqa: BLE001 - report failure, keep the host's last good snapshot
-            self._send_suggestions(SUGGESTIONS_ERROR, {"message": str(exc)})
+            self._send_suggestions(
+                SUGGESTIONS_ERROR,
+                {"message": suggestions.clamp(str(exc) or type(exc).__name__, suggestions.ERROR_BYTES)},
+            )
             return
-        self._send_suggestions(SUGGESTIONS_SET, {"items": items})
+        result = self.call_host(SUGGESTIONS_SET, {"items": items})
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            # The host validates the whole snapshot and drops it on one bad item; surface that.
+            logging.getLogger(__name__).warning("host did not accept the suggestions snapshot: %r", result)
+            self._send_suggestions(SUGGESTIONS_ERROR, {"message": "The host rejected the suggestions snapshot"})
 
     def _service_ticks(self) -> None:
         """Run whichever refresh is due: an inbound github.refresh, a fast local
         tick that noticed a session change, or the slower network tick."""
+        suggestions_ran = False
         if self._suggestions_refresh_due:
             self._suggestions_refresh_due = False
+            suggestions_ran = True
             self._refresh_suggestions()
         now = time.monotonic()
         if self.refresh_due:
@@ -674,8 +688,11 @@ class Runtime:
                     self._refresh_and_reset(sessions)
             self._next_poll = now + SESSION_POLL_SECS
         if self._next_network is not None and now >= self._next_network:
-            self._refresh_and_reset()
-            self._refresh_suggestions()
+            self.run_refresh()
+            if not suggestions_ran:
+                self._refresh_suggestions()
+            # Re-arm only after both: a slow discovery must not leave the deadline in the past.
+            self._rearm_network()
 
     def run(self) -> None:
         threading.Thread(target=self._read_stdin, daemon=True).start()

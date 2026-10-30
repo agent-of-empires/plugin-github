@@ -474,6 +474,10 @@ def _context_state(ctx: dict[str, Any]) -> str:
     return _STATUS_STATE.get(ctx.get("state") or "", "unknown")
 
 
+# Public name for the suggestions provider, so "failing" has one definition.
+context_state = _context_state
+
+
 def _parse_iso(value: Any) -> datetime | None:
     """An ISO 8601 GraphQL timestamp to an aware ``datetime``, or ``None`` for
     anything unparseable. Total, so a drifted field degrades a display detail."""

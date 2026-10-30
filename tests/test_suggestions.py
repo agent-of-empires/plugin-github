@@ -110,6 +110,10 @@ def _discover(client, enabled, **kwargs):
     return suggestions._discover(client, enabled=set(enabled), repos=set(), orgs=set(), projects={}, **kwargs)
 
 
+def _check_run(name, conclusion, status="COMPLETED"):
+    return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion}
+
+
 def _authored_pr(**overrides):
     return _pr(author={"login": "me"}, reviewRequests={"nodes": []}, **overrides)
 
@@ -117,6 +121,7 @@ def _authored_pr(**overrides):
 @pytest.fixture(autouse=True)
 def _reset_caches(monkeypatch):
     monkeypatch.setattr(suggestions, "_notifications_cache", {"etag": None, "items": []})
+    monkeypatch.setattr(suggestions, "_comment_cache", {})
     monkeypatch.setattr(refresh, "backoff_until", lambda _api: 0.0)
 
 
@@ -206,9 +211,9 @@ def test_authored_pr_reports_every_matched_reason_under_the_first_criterion():
                         "statusCheckRollup": {
                             "contexts": {
                                 "nodes": [
-                                    {"name": "lint", "conclusion": "FAILURE"},
-                                    {"name": "test", "conclusion": "SUCCESS"},
-                                    {"context": "ci/status", "state": "ERROR"},
+                                    _check_run("lint", "FAILURE"),
+                                    _check_run("test", "SUCCESS"),
+                                    {"__typename": "StatusContext", "context": "ci/status", "state": "ERROR"},
                                 ]
                             }
                         },
@@ -403,15 +408,32 @@ def test_new_issues_use_registered_project_repos_when_no_scope_and_skip_without_
     projects = {f"acme/r{i}": f"/code/r{i}" for i in range(25)}
     items = suggestions._discover(client, enabled={"new_issues"}, repos=set(), orgs=set(), projects=projects)
     searches = [query for query in client.queries if "created:>=" in query]
-    assert len(searches) == 2
-    assert searches[0].startswith("is:open is:issue -author:@me created:>=")
-    assert searches[0].count("repo:") == 20
-    assert searches[1].count("repo:") == 5
+    assert len(searches) > 1
+    assert all(len(query) <= suggestions.MAX_QUERY_CHARS for query in searches)
+    assert all(query.startswith("is:open is:issue -author:@me created:>=") for query in searches)
+    assert {term for query in searches for term in query.split() if term.startswith("repo:")} == {
+        f"repo:acme/r{i}" for i in range(25)
+    }
     assert items[0]["criterion"] == "new_issues"
     assert items[0]["variables"]["timestamp"] == "2026-10-21T10:00:00Z"
     empty = FakeClient({"created:>=": [_issue()]})
     assert _discover(empty, {"new_issues"}) == []
     assert empty.queries == []
+
+
+def test_every_search_stays_within_github_query_length_for_a_large_allowlist():
+    repos = {f"acme/widgets-{i:02d}" for i in range(30)}
+    orgs = {f"org-{i}" for i in range(5)}
+    client = FakeClient(
+        {" author:@me": [_authored_pr()], "reviewed-by:@me": [], "review-requested:@me": [], "assignee:@me": []}
+    )
+    suggestions._discover(client, enabled=ALL - {"mentioned"}, repos=repos, orgs=orgs, projects={})
+    searches = [query for query in client.queries if query.startswith("is:")]
+    assert len(searches) > 5
+    assert all(len(query) <= suggestions.MAX_QUERY_CHARS for query in searches)
+    for base in ("author:@me", "reviewed-by:@me", "review-requested:@me", "assignee:@me", "created:>="):
+        terms = {t for q in searches if base in q for t in q.split() if t.startswith(("repo:", "org:"))}
+        assert terms == {f"repo:{r}" for r in repos} | {f"org:{o}" for o in orgs}
 
 
 def test_new_issues_use_explicit_scope_instead_of_project_repos():
@@ -528,8 +550,12 @@ def test_graphql_errors_never_yield_a_partial_snapshot():
 # --- runtime wiring -----------------------------------------------------------------
 
 
-def _host(sources=None, projects=None, settings=None):
+def _host(sources=None, projects=None, settings=None, calls=None, set_result=None):
     def call_host(method, params, timeout=None):
+        if calls is not None:
+            calls.append((method, params))
+        if method == main.SUGGESTIONS_SET:
+            return {"ok": True, "accepted": 1, "dropped": 0} if set_result is None else set_result
         if method == main.SUGGESTIONS_SOURCES:
             return sources
         if method == main.PROJECTS_LIST:
@@ -547,14 +573,15 @@ def test_runtime_passes_host_enabled_criteria_and_derived_projects(monkeypatch, 
     subprocess.run(
         ["git", "-C", str(checkout), "remote", "add", "origin", "git@github.com:Acme/Widgets.git"], check=True
     )
-    sent = []
-    runtime = main.Runtime(send=sent.append)
+    calls = []
+    runtime = main.Runtime(send=lambda _m: None)
     runtime.call_host = _host(
         sources={
             "sources": [{"criterion": "mentioned", "enabled": True}, {"criterion": "new_issues", "enabled": False}]
         },
         projects={"projects": [{"name": "widgets", "path": str(checkout)}, {"name": "nogit", "path": str(tmp_path)}]},
         settings={"suggestion_limit": 5},
+        calls=calls,
     )
     captured = {}
 
@@ -567,8 +594,7 @@ def test_runtime_passes_host_enabled_criteria_and_derived_projects(monkeypatch, 
     assert captured["enabled"] == {"mentioned"}
     assert captured["project_repos"] == {"acme/widgets": str(checkout)}
     assert captured["limit_raw"] == 5
-    assert sent[-1]["method"] == "suggestions.set"
-    assert sent[-1]["params"] == {"items": [{"id": "x"}]}
+    assert calls[-1] == (main.SUGGESTIONS_SET, {"items": [{"id": "x"}]})
 
 
 def test_runtime_fails_closed_when_host_cannot_list_sources(monkeypatch):
@@ -582,12 +608,15 @@ def test_runtime_fails_closed_when_host_cannot_list_sources(monkeypatch):
 
 
 def test_runtime_publishes_empty_snapshot_without_fetching_when_everything_is_off(monkeypatch):
-    sent = []
-    runtime = main.Runtime(send=sent.append)
-    runtime.call_host = _host(sources={"sources": [{"criterion": "mentioned", "enabled": False}]}, settings={})
+    calls = []
+    runtime = main.Runtime(send=lambda _m: None)
+    runtime.call_host = _host(
+        sources={"sources": [{"criterion": "mentioned", "enabled": False}]}, settings={}, calls=calls
+    )
     monkeypatch.setattr(main.suggestions, "resolve_token", lambda _env: pytest.fail("fetched with everything off"))
     runtime._refresh_suggestions()
-    assert sent[-1] == {"jsonrpc": "2.0", "id": sent[-1]["id"], "method": "suggestions.set", "params": {"items": []}}
+    assert calls[-1] == (main.SUGGESTIONS_SET, {"items": []})
+    assert [method for method, _ in calls] == [main.SUGGESTIONS_SOURCES, main.SUGGESTIONS_SET]
 
 
 def test_runtime_reports_fetch_failure_as_suggestions_error(monkeypatch):
@@ -668,6 +697,8 @@ def test_worker_round_trip_queries_only_enabled_sources(monkeypatch, tmp_path):
             reply["result"] = {"sessions": []}
             stdin.put(json.dumps(reply))
         elif method == "suggestions.set":
+            reply["result"] = {"ok": True, "accepted": 1, "dropped": 0}
+            stdin.put(json.dumps(reply))
             stdin.put(None)
 
     runtime = main.Runtime(send=host, stdin=iter(stdin.get, None))
@@ -694,23 +725,254 @@ def test_mentions_rate_limit_arms_the_rest_gate_only(monkeypatch):
     assert armed == ["rest"]
 
 
-def test_item_variables_match_the_manifest_declaration_for_every_authored_criterion():
+def _failing_authored_pr(**overrides):
+    fields = {
+        "mergeable": "CONFLICTING",
+        "reviews": {"nodes": [_review("rev", "CHANGES_REQUESTED")], "pageInfo": PAGE_DONE},
+        "reviewThreads": {"nodes": [{"isResolved": False, "comments": {"nodes": [{"author": {"login": "rev"}}]}}]},
+        "commits": {
+            "nodes": [
+                {
+                    "commit": {
+                        "oid": "head",
+                        "statusCheckRollup": {"contexts": {"nodes": [_check_run("lint", "FAILURE")]}},
+                    }
+                }
+            ]
+        },
+        **overrides,
+    }
+    return _authored_pr(**fields)
+
+
+def test_item_variables_match_the_manifest_declaration_for_every_criterion():
     """The host rejects a whole publication when an item's variables differ from its source's."""
     declared = {
         source["criterion"]: set(source["variables"])
         for source in tomlkit.parse(main_manifest_text()).unwrap()["suggestions"]["sources"]
     }
-    pr = _authored_pr(
-        mergeable="CONFLICTING",
-        reviews={"nodes": [_review("rev", "CHANGES_REQUESTED")], "pageInfo": PAGE_DONE},
-    )
-    items = _discover(FakeClient({"author:@me": [pr]}), set(suggestions.AUTHORED_CRITERIA))
-    assert items
-    for item in items:
-        assert set(item["variables"]) == declared[item["criterion"]]
-    only_conflict = _discover(FakeClient({"author:@me": [_authored_pr(mergeable="CONFLICTING")]}), ALL)
-    assert set(only_conflict[0]["variables"]) == declared["merge_conflict"]
+    assert set(declared) == set(suggestions.CRITERIA)
+    stale_review = _pr(reviews={"nodes": [_review("me", "COMMENTED", oid="old")], "pageInfo": PAGE_DONE})
+    for criterion in suggestions.CRITERIA:
+        client = FakeClient(
+            {
+                " author:@me": [_failing_authored_pr()],
+                "reviewed-by:@me": [stale_review],
+                "review-requested:@me": [_pr()],
+                "assignee:@me": [_issue()],
+                "created:>=": [_issue()],
+            },
+            notifications=[_notification()],
+            comments={"https://api.github.com/repos/acme/widgets/issues/comments/9": {"body": "hi", "html_url": "u"}},
+        )
+        items = suggestions._discover(client, enabled={criterion}, repos={"acme/widgets"}, orgs=set(), projects={})
+        assert [item["criterion"] for item in items] == [criterion], criterion
+        assert set(items[0]["variables"]) == declared[criterion], criterion
 
 
 def main_manifest_text():
     return (Path(__file__).resolve().parent.parent / "aoe-plugin.toml").read_text()
+
+
+# --- review fixes: byte caps, rate-limit envelope, gating, caching ------------------
+
+
+def _utf8_len(text):
+    return len(text.encode())
+
+
+def test_every_bounded_string_is_clamped_to_the_host_byte_caps():
+    title = "\u00e9" * 256  # 512 bytes is the cap; this is 512 chars, 1024 bytes
+    contexts = [_check_run(f"check-number-{i:03d}-with-a-long-name", "FAILURE") for i in range(100)]
+    pr = _failing_authored_pr(
+        title=title,
+        commits={"nodes": [{"commit": {"oid": "head", "statusCheckRollup": {"contexts": {"nodes": contexts}}}}]},
+    )
+    [item] = _discover(FakeClient({" author:@me": [pr]}), set(suggestions.AUTHORED_CRITERIA))
+    assert 0 < _utf8_len(item["title"]) <= suggestions.TITLE_BYTES
+    assert 0 < _utf8_len(item["draft"]["title"]) <= suggestions.TITLE_BYTES
+    assert _utf8_len(item["reason"]) <= suggestions.STRING_BYTES
+    assert all(_utf8_len(value) <= suggestions.STRING_BYTES for value in item["variables"].values())
+    assert (
+        _utf8_len(item["variables"]["failed_checks"]) == suggestions.STRING_BYTES - 0
+        or _utf8_len(item["variables"]["failed_checks"]) <= suggestions.STRING_BYTES
+    )
+    assert _utf8_len(item["draft"]["prompt"]) <= suggestions.PROMPT_BYTES
+    item["title"].encode()  # valid UTF-8, never cut mid-character
+
+
+def test_project_is_clamped():
+    items = _discover(FakeClient({"assignee:@me": [_issue()]}), {"assigned_issues"})
+    assert items
+    long_project = "p" * 5000
+    [item] = suggestions._discover(
+        FakeClient({"assignee:@me": [_issue()]}),
+        enabled={"assigned_issues"},
+        repos=set(),
+        orgs=set(),
+        projects={"acme/widgets": long_project},
+    )
+    assert _utf8_len(item["project"]) == suggestions.PROJECT_BYTES
+
+
+def test_graphql_rate_limited_envelope_arms_the_gate_with_its_reset(monkeypatch):
+    armed = []
+    monkeypatch.setattr(refresh, "_set_backoff", lambda api, reset_at=None: armed.append((api, reset_at)))
+
+    def limited(variables):
+        return {
+            "data": {"rateLimit": {"resetAt": "2026-10-30T12:00:00Z"}},
+            "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}],
+        }
+
+    with pytest.raises(RateLimitedError):
+        _discover(FakeClient({"assignee:@me": limited}), {"assigned_issues"})
+    assert armed == [("graphql", "2026-10-30T12:00:00Z")]
+
+
+@pytest.mark.parametrize("criterion", suggestions.AUTHORED_CRITERIA)
+def test_each_authored_criterion_alone_runs_only_its_own_requests(criterion):
+    many_reviews = {"nodes": [_review("rev", "CHANGES_REQUESTED")], "pageInfo": {"hasNextPage": True, "endCursor": "c"}}
+    more = {"data": {"node": {"reviews": {"nodes": [_review("other", "APPROVED")], "pageInfo": PAGE_DONE}}}}
+    client = FakeClient({" author:@me": [_failing_authored_pr(reviews=many_reviews)]}, review_pages=[more])
+    items = _discover(client, {criterion})
+    assert [item["criterion"] for item in items] == [criterion]
+    searches = [query for query in client.queries if query.startswith("is:")]
+    assert searches == ["is:open is:pr author:@me"]
+    extra = [query for query in client.queries if not query.startswith("is:")]
+    # Only changes_requested reads review verdicts, so only it may page the review history.
+    assert extra == (["reviews"] if criterion == "changes_requested" else [])
+    assert client.rest == []
+
+
+def test_cancelled_and_action_required_checks_count_as_failing_but_running_ones_do_not():
+    contexts = [
+        _check_run("a", "CANCELLED"),
+        _check_run("b", "ACTION_REQUIRED"),
+        _check_run("c", "STARTUP_FAILURE"),
+        _check_run("d", None, status="IN_PROGRESS"),
+        _check_run("e", "NEUTRAL"),
+    ]
+    pr = _authored_pr(
+        commits={"nodes": [{"commit": {"oid": "head", "statusCheckRollup": {"contexts": {"nodes": contexts}}}}]}
+    )
+    [item] = _discover(FakeClient({" author:@me": [pr]}), {"ci_failed"})
+    assert item["variables"]["failed_checks"] == "a, b, c"
+
+
+def test_mention_previews_are_cached_across_a_304():
+    comment_url = "https://api.github.com/repos/acme/widgets/issues/comments/9"
+    client = FakeClient(
+        notifications=[_notification()], comments={comment_url: {"body": "look", "html_url": "https://x/c"}}
+    )
+    first = _discover(client, {"mentioned"})
+    client.notifications_status = 304
+    second = _discover(client, {"mentioned"})
+    assert first[0]["preview"] == second[0]["preview"] == "look"
+    assert second[0]["variables"]["comment_url"] == "https://x/c"
+    assert [path for path, _, _ in client.rest if path == comment_url] == [comment_url]
+
+
+def test_mention_preview_cache_drops_comments_no_longer_in_the_inbox():
+    comment_url = "https://api.github.com/repos/acme/widgets/issues/comments/9"
+    client = FakeClient(
+        notifications=[_notification()], comments={comment_url: {"body": "look", "html_url": "https://x/c"}}
+    )
+    _discover(client, {"mentioned"})
+    assert comment_url in suggestions._comment_cache
+    client.notifications = []
+    _discover(client, {"mentioned"})
+    assert suggestions._comment_cache == {}
+
+
+def test_mention_preview_only_follows_api_github_com_repos_urls():
+    evil = _notification(
+        subject={
+            "type": "Issue",
+            "title": "t",
+            "url": "https://api.github.com/repos/acme/widgets/issues/5",
+            "latest_comment_url": "https://evil.example/steal-the-token",
+        }
+    )
+    client = FakeClient(notifications=[evil])
+    items = _discover(client, {"mentioned"})
+    assert len(items) == 1
+    assert items[0]["preview"] == ""
+    assert [path for path, _, _ in client.rest] == ["/notifications"]
+
+
+def test_allowlist_entries_must_match_the_owner_repo_grammar():
+    assert suggestions._parse_csv("Acme/Widgets, bad repo is:private, no-slash, a/b/c", suggestions.REPO_RE) == {
+        "acme/widgets"
+    }
+    assert suggestions._parse_csv("acme, evil org:x, -bad", suggestions.ORG_RE) == {"acme"}
+
+
+def test_clamp_never_splits_a_multibyte_character():
+    assert suggestions.clamp("\u00e9\u00e9", 3) == "\u00e9"
+    assert suggestions.clamp("abc", 10) == "abc"
+
+
+# --- runtime review fixes ------------------------------------------------------------
+
+
+def test_runtime_reports_a_host_rejected_snapshot_as_suggestions_error(monkeypatch):
+    sent = []
+    runtime = main.Runtime(send=sent.append)
+    runtime.call_host = _host(
+        sources={"sources": [{"criterion": "mentioned", "enabled": True}]}, settings={}, set_result={"ok": False}
+    )
+    monkeypatch.setattr(main.suggestions, "fetch_suggestions", lambda **_kw: [{"id": "x"}])
+    runtime._refresh_suggestions()
+    assert sent[-1]["method"] == "suggestions.error"
+    assert "rejected" in sent[-1]["params"]["message"]
+
+
+def test_runtime_error_message_is_clamped_to_the_host_limit(monkeypatch):
+    sent = []
+    runtime = main.Runtime(send=sent.append)
+    runtime.call_host = _host(sources={"sources": [{"criterion": "mentioned", "enabled": True}]}, settings={})
+
+    def fail(**kwargs):
+        raise RuntimeError("\u00e9" * 5000)
+
+    monkeypatch.setattr(main.suggestions, "fetch_suggestions", fail)
+    runtime._refresh_suggestions()
+    assert _utf8_len(sent[-1]["params"]["message"]) <= suggestions.ERROR_BYTES
+
+
+def test_rate_limited_gate_skips_settings_and_project_reads(monkeypatch):
+    sent, calls = [], []
+    runtime = main.Runtime(send=sent.append)
+    runtime.call_host = _host(
+        sources={"sources": [{"criterion": "assigned_issues", "enabled": True}]}, settings={}, calls=calls
+    )
+    monkeypatch.setattr(refresh, "backoff_until", lambda _api: time.monotonic() + 60)
+    runtime._refresh_suggestions()
+    assert [method for method, _ in calls] == [main.SUGGESTIONS_SOURCES]
+    assert sent[-1]["method"] == "suggestions.error"
+
+
+def test_network_tick_rearms_only_after_discovery_finishes(monkeypatch):
+    runtime = main.Runtime(send=lambda _m: None)
+    runtime._interval = 120
+    runtime._next_network = time.monotonic() - 1
+    seen = []
+    monkeypatch.setattr(runtime, "run_refresh", lambda *_a, **_k: None)
+    monkeypatch.setattr(runtime, "_refresh_suggestions", lambda: seen.append(runtime._next_network))
+    runtime._service_ticks()
+    assert len(seen) == 1
+    assert seen[0] < time.monotonic()  # still the old, due deadline while discovery runs
+    assert runtime._next_network > time.monotonic() + 60
+
+
+def test_a_host_refresh_and_a_network_tick_together_run_discovery_once(monkeypatch):
+    runtime = main.Runtime(send=lambda _m: None)
+    runtime._interval = 120
+    runtime._next_network = time.monotonic() - 1
+    runtime._suggestions_refresh_due = True
+    runs = []
+    monkeypatch.setattr(runtime, "run_refresh", lambda *_a, **_k: None)
+    monkeypatch.setattr(runtime, "_refresh_suggestions", lambda: runs.append(True))
+    runtime._service_ticks()
+    assert runs == [True]

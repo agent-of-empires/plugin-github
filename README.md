@@ -87,6 +87,7 @@ organizations when set, else the repositories of your registered AoE projects
 Those same projects give each item its `project`; `suggestion_projects`
 (`owner/repo=project name or path`, one per line) overrides that mapping.
 `suggestion_limit` caps the published snapshot (1-500) after a complete fetch.
+A long allowlist is split across several searches, each within GitHub's 256-character query limit.
 
 Discovery runs at startup, on the host's `suggestions.refresh`, and on the
 `ui_refresh_secs` tick. Searches and review histories are fetched to
