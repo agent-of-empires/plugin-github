@@ -40,7 +40,7 @@ TITLE_BYTES = 512
 STRING_BYTES = 2048
 PREVIEW_BYTES = 16 * 1024
 PROMPT_BYTES = 64 * 1024
-PROJECT_BYTES = 4096
+MAPPING_KEY_BYTES = 256
 ERROR_BYTES = 4096
 # Allowlist grammar, so a setting can never smuggle extra search qualifiers.
 REPO_RE = re.compile(r"^[a-z0-9][a-z0-9-]*/[a-z0-9._-]+$")
@@ -186,21 +186,6 @@ def parse_csv(raw: Any, grammar: re.Pattern[str]) -> set[str]:
         return set()
     parts = {part.strip().lower() for part in raw.replace("\n", ",").split(",") if part.strip()}
     return {part for part in parts if grammar.match(part)}
-
-
-def _project_map(raw: Any) -> dict[str, str]:
-    """Parse explicit owner/repo=project entries; never infer local paths."""
-    result: dict[str, str] = {}
-    if not isinstance(raw, str):
-        return result
-    for entry in raw.splitlines():
-        if "=" not in entry:
-            continue
-        repo, project = entry.split("=", 1)
-        repo, project = repo.strip().lower(), project.strip()
-        if repo and project:
-            result[repo] = project
-    return result
 
 
 def _scope_terms(repos: set[str], orgs: set[str]) -> list[str]:
@@ -498,7 +483,6 @@ def _item(  # noqa: PLR0913 - one call site per criterion, keyword-only
     variables: dict[str, str],
     draft_title: str,
     prompt: str,
-    projects: dict[str, str],
 ) -> dict[str, Any]:
     source_ref = clamp(f"https://github.com/{repo}/{'pull' if kind == 'pr' else 'issues'}/{number}", STRING_BYTES)
     all_variables = {
@@ -517,6 +501,8 @@ def _item(  # noqa: PLR0913 - one call site per criterion, keyword-only
         "source_url": source_ref,
         "source_ref": source_ref,
         "preview": clamp(" ".join(str(body or "").split())[:400], PREVIEW_BYTES),
+        # Opaque key core maps to registered projects (the user's mapping, not this plugin, picks the project).
+        "mapping_key": clamp(repo.lower(), MAPPING_KEY_BYTES),
         "criterion": criterion,
         "variables": {name: clamp(value, STRING_BYTES) for name, value in all_variables.items()},
         "draft": {
@@ -524,9 +510,6 @@ def _item(  # noqa: PLR0913 - one call site per criterion, keyword-only
             "prompt": f"{UNTRUSTED} {clamp(prompt, PROMPT_BYTES - len(UNTRUSTED) - 1)}",
         },
     }
-    project = projects.get(repo.lower())
-    if project:
-        item["project"] = clamp(project, PROJECT_BYTES)
     return item
 
 
@@ -537,9 +520,7 @@ def _viewer_login(client: GitHubClient) -> str:
     return login
 
 
-def _review_side(
-    client: GitHubClient, enabled: set[str], terms: list[str], projects: dict[str, str]
-) -> list[dict[str, Any]]:
+def _review_side(client: GitHubClient, enabled: set[str], terms: list[str]) -> list[dict[str, Any]]:
     """``review_requested`` and ``re_review``; a formal request wins over a re-review."""
     items: dict[str, dict[str, Any]] = {}
     if "review_requested" in enabled:
@@ -561,7 +542,6 @@ def _review_side(
                 variables=_pr_variables(pr),
                 draft_title=f"Review: {title}",
                 prompt=f"Review https://github.com/{repo}/pull/{number} and address the review request.",
-                projects=projects,
             )
     if "re_review" in enabled:
         login = _viewer_login(client)
@@ -592,7 +572,6 @@ def _review_side(
                     f"Re-review https://github.com/{repo}/pull/{number}: "
                     "new commits were pushed since your last review."
                 ),
-                projects=projects,
             )
     return list(items.values())
 
@@ -629,9 +608,7 @@ def _authored_matches(pr: dict[str, Any], wanted: list[str]) -> tuple[list[tuple
     return matched, extra
 
 
-def _authored(
-    client: GitHubClient, enabled: set[str], terms: list[str], projects: dict[str, str]
-) -> list[dict[str, Any]]:
+def _authored(client: GitHubClient, enabled: set[str], terms: list[str]) -> list[dict[str, Any]]:
     """One search for every criterion about the user's own open PRs; one item per PR."""
     wanted = [criterion for criterion in AUTHORED_CRITERIA if criterion in enabled]
     if not wanted:
@@ -667,7 +644,6 @@ def _authored(
                     + "; ".join(_AUTHORED_PROMPT[criterion] for criterion, _ in matched)
                     + ". Resolve each point."
                 ),
-                projects=projects,
             )
         )
     return items
@@ -695,7 +671,7 @@ def _notifications(client: GitHubClient) -> list[dict[str, Any]]:
     return notifications
 
 
-def _mentions(client: GitHubClient, repos: set[str], orgs: set[str], projects: dict[str, str]) -> list[dict[str, Any]]:
+def _mentions(client: GitHubClient, repos: set[str], orgs: set[str]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     previews = 0
     seen: set[str] = set()
@@ -743,7 +719,6 @@ def _mentions(client: GitHubClient, repos: set[str], orgs: set[str], projects: d
                     f"Read the latest comments on https://github.com/{repo}/{'pull' if kind == 'pr' else 'issues'}"
                     f"/{number} where you were mentioned and prepare a response or a fix."
                 ),
-                projects=projects,
             )
         )
     for stale in set(_comment_cache) - seen:
@@ -751,9 +726,7 @@ def _mentions(client: GitHubClient, repos: set[str], orgs: set[str], projects: d
     return items
 
 
-def _issue_items(
-    criterion: str, issues: list[dict[str, Any]], projects: dict[str, str], *, reason: str, verb: str
-) -> list[dict[str, Any]]:
+def _issue_items(criterion: str, issues: list[dict[str, Any]], *, reason: str, verb: str) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for issue in issues:
         identity = _identity(issue)
@@ -774,17 +747,16 @@ def _issue_items(
                 variables=_issue_variables(issue),
                 draft_title=f"{verb}: {title}",
                 prompt=f"{verb} https://github.com/{repo}/issues/{number} and propose a fix plan.",
-                projects=projects,
             )
         )
     return items
 
 
-def _new_issues(client: GitHubClient, terms: list[str], projects: dict[str, str]) -> list[dict[str, Any]]:
+def _new_issues(client: GitHubClient, terms: list[str]) -> list[dict[str, Any]]:
     since = (datetime.now(timezone.utc) - timedelta(days=NEW_ISSUES_WINDOW_DAYS)).strftime("%Y-%m-%d")
     issues = _search_scoped(client, _ISSUE_QUERY, f"is:open is:issue -author:@me created:>={since}", terms)
     return _issue_items(
-        "new_issues", issues, projects, reason=f"Opened in the last {NEW_ISSUES_WINDOW_DAYS} days", verb="Investigate"
+        "new_issues", issues, reason=f"Opened in the last {NEW_ISSUES_WINDOW_DAYS} days", verb="Investigate"
     )
 
 
@@ -794,25 +766,25 @@ def _discover(
     enabled: set[str],
     repos: set[str],
     orgs: set[str],
-    projects: dict[str, str],
+    project_repos: set[str],
 ) -> list[dict[str, Any]]:
     terms = _scope_terms(repos, orgs)
-    items = _authored(client, enabled, terms, projects)
-    items += _review_side(client, enabled, terms, projects)
+    items = _authored(client, enabled, terms)
+    items += _review_side(client, enabled, terms)
     if "mentioned" in enabled:
         try:
-            items += _mentions(client, repos, orgs, projects)
+            items += _mentions(client, repos, orgs)
         except RateLimitedError as exc:
             # /notifications is REST; the searches draw on the separate GraphQL budget.
             refresh.arm_backoff("rest")
             raise RuntimeError(str(exc)) from exc
     if "assigned_issues" in enabled:
         issues = _search_scoped(client, _ISSUE_QUERY, "is:open is:issue assignee:@me", terms)
-        items += _issue_items("assigned_issues", issues, projects, reason="Assigned to you", verb="Work on")
+        items += _issue_items("assigned_issues", issues, reason="Assigned to you", verb="Work on")
     if "new_issues" in enabled:
-        new_terms = terms or [f"repo:{repo}" for repo in sorted(projects) if REPO_RE.match(repo)]
+        new_terms = terms or [f"repo:{repo}" for repo in sorted(project_repos) if REPO_RE.match(repo)]
         if new_terms:
-            items += _new_issues(client, new_terms, projects)
+            items += _new_issues(client, new_terms)
     return items
 
 
@@ -830,24 +802,22 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
     enabled: set[str],
     repos_raw: Any,
     orgs_raw: Any,
-    mapping_raw: Any,
     limit_raw: Any = None,
-    project_repos: dict[str, str] | None = None,
+    project_repos: set[str] | None = None,
     env: TokenEnvironment | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch the enabled criteria only, ranked in provider order, deduplicated by source.
 
-    ``project_repos`` maps ``owner/repo`` to a registered project path (derived
-    by the worker from the host's project list); explicit ``suggestion_projects``
-    entries override it. Any rate-limit hit arms the shared backoff gate so the
-    next refresh is skipped until the budget refills.
+    ``project_repos`` holds the ``owner/repo`` of the registered projects (from the
+    host's project list); ``new_issues`` searches them when no scope is configured.
+    Any rate-limit hit arms the shared backoff gate so the next refresh is skipped
+    until the budget refills.
     """
     enabled = set(enabled) & set(CRITERIA)
     if not enabled:
         return []
     repos = parse_csv(repos_raw, REPO_RE)
     orgs = parse_csv(orgs_raw, ORG_RE)
-    projects = {**{repo.lower(): path for repo, path in (project_repos or {}).items()}, **_project_map(mapping_raw)}
     limit = (
         limit_raw if isinstance(limit_raw, int) and not isinstance(limit_raw, bool) and 1 <= limit_raw <= 500 else 100
     )
@@ -858,7 +828,7 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
         raise RuntimeError(str(exc)) from exc
     try:
         with GitHubClient(token) as client:
-            items = _discover(client, enabled=enabled, repos=repos, orgs=orgs, projects=projects)
+            items = _discover(client, enabled=enabled, repos=repos, orgs=orgs, project_repos=project_repos or set())
     except RateLimitedError as exc:
         # A GraphQL rate-limit envelope already armed the gate with its exact reset; never shorten it.
         if time.monotonic() >= refresh.backoff_until("graphql"):
