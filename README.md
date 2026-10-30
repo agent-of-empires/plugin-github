@@ -84,8 +84,9 @@ Scope: `suggestion_repositories` (comma-separated `owner/repo`) and
 the token can see. `new_issues` needs a repository list: the allowlist or
 organizations when set, else the repositories of your registered AoE projects
 (read from each project's `origin` remote via the host's `projects.list`).
-Those same projects give each item its `project`; `suggestion_projects`
-(`owner/repo=project name or path`, one per line) overrides that mapping.
+Each item carries a `mapping_key` (the lowercased `owner/repo`); the project an
+item starts in comes from the mapping you set in AoE's suggestion mappings, not
+from this plugin.
 `suggestion_limit` caps the published snapshot (1-500) after a complete fetch.
 A long allowlist is split across several searches, each within GitHub's 256-character query limit.
 

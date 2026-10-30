@@ -125,7 +125,7 @@ def _review(login, state, oid="head"):
 
 
 def _discover(client, enabled, **kwargs):
-    return suggestions._discover(client, enabled=set(enabled), repos=set(), orgs=set(), projects={}, **kwargs)
+    return suggestions._discover(client, enabled=set(enabled), repos=set(), orgs=set(), project_repos=set(), **kwargs)
 
 
 def _check_run(name, conclusion, status="COMPLETED"):
@@ -182,7 +182,7 @@ def test_review_requested_builds_item_with_variables_and_untrusted_prompt():
 )
 def test_disabled_criterion_never_queries_github(off, needle):
     client = FakeClient({needle: [_pr()]})
-    suggestions._discover(client, enabled=ALL - off, repos=set(), orgs=set(), projects={"acme/widgets": "/w"})
+    suggestions._discover(client, enabled=ALL - off, repos=set(), orgs=set(), project_repos={"acme/widgets"})
     assert client.queries
     assert not any(needle in query for query in client.queries)
 
@@ -204,7 +204,7 @@ def test_mentions_off_skips_notifications_entirely():
 
 def test_no_enabled_criteria_makes_no_requests_at_all(monkeypatch):
     monkeypatch.setattr(suggestions, "resolve_token", lambda _env: pytest.fail("token resolved for nothing"))
-    assert suggestions.fetch_suggestions(enabled=set(), repos_raw="", orgs_raw="", mapping_raw="") == []
+    assert suggestions.fetch_suggestions(enabled=set(), repos_raw="", orgs_raw="") == []
 
 
 # --- authored PR classification -----------------------------------------------
@@ -459,7 +459,7 @@ def test_mentions_replay_cached_inbox_on_304():
 
 def test_mentions_respect_repo_scope():
     client = FakeClient(notifications=[_notification()])
-    items = suggestions._discover(client, enabled={"mentioned"}, repos={"other/repo"}, orgs=set(), projects={})
+    items = suggestions._discover(client, enabled={"mentioned"}, repos={"other/repo"}, orgs=set(), project_repos=set())
     assert items == []
 
 
@@ -478,8 +478,8 @@ def test_assigned_issue_builds_issue_variables():
 
 def test_new_issues_use_registered_project_repos_when_no_scope_and_skip_without_any():
     client = FakeClient({"created:>=": [_issue()]})
-    projects = {f"acme/r{i}": f"/code/r{i}" for i in range(25)}
-    items = suggestions._discover(client, enabled={"new_issues"}, repos=set(), orgs=set(), projects=projects)
+    project_repos = {f"acme/r{i}" for i in range(25)}
+    items = suggestions._discover(client, enabled={"new_issues"}, repos=set(), orgs=set(), project_repos=project_repos)
     searches = [query for query in client.queries if "created:>=" in query]
     assert len(searches) > 1
     assert all(len(query) <= suggestions.MAX_QUERY_CHARS for query in searches)
@@ -500,7 +500,7 @@ def test_every_search_stays_within_github_query_length_for_a_large_allowlist():
     client = FakeClient(
         {" author:@me": [_authored_pr()], "reviewed-by:@me": [], "review-requested:@me": [], "assignee:@me": []}
     )
-    suggestions._discover(client, enabled=ALL - {"mentioned"}, repos=repos, orgs=orgs, projects={})
+    suggestions._discover(client, enabled=ALL - {"mentioned"}, repos=repos, orgs=orgs, project_repos=set())
     searches = [query for query in client.queries if query.startswith("is:")]
     assert len(searches) > 5
     assert all(len(query) <= suggestions.MAX_QUERY_CHARS for query in searches)
@@ -511,9 +511,7 @@ def test_every_search_stays_within_github_query_length_for_a_large_allowlist():
 
 def test_new_issues_use_explicit_scope_instead_of_project_repos():
     client = FakeClient({"created:>=": [_issue()]})
-    suggestions._discover(
-        client, enabled={"new_issues"}, repos={"acme/widgets"}, orgs={"other"}, projects={"x/y": "/x"}
-    )
+    suggestions._discover(client, enabled={"new_issues"}, repos={"acme/widgets"}, orgs={"other"}, project_repos={"x/y"})
     assert client.queries[0].endswith(" repo:acme/widgets org:other")
     assert "repo:x/y" not in client.queries[0]
 
@@ -532,18 +530,18 @@ def test_fetch_ranks_by_criterion_then_recency_and_dedups_by_source(monkeypatch)
         enabled={"assigned_issues", "new_issues"},
         repos_raw="",
         orgs_raw="",
-        mapping_raw="acme/widgets=/code/widgets",
-        project_repos={"ACME/widgets": "/derived"},
+        project_repos={"acme/widgets"},
     )
     assert [(item["criterion"], item["source_ref"].rsplit("/", 1)[1]) for item in items] == [
         ("assigned_issues", "7"),
         ("new_issues", "8"),
         ("new_issues", "9"),
     ]
-    assert all(item["project"] == "/code/widgets" for item in items)
+    assert all(item["mapping_key"] == "acme/widgets" for item in items)
+    assert all("project" not in item for item in items)
 
 
-def test_fetch_applies_limit_and_derived_project_mapping(monkeypatch):
+def test_fetch_applies_limit(monkeypatch):
     client = FakeClient(
         {"assignee:@me": [_issue(number=n, url=f"https://github.com/acme/widgets/issues/{n}") for n in range(5)]}
     )
@@ -553,12 +551,9 @@ def test_fetch_applies_limit_and_derived_project_mapping(monkeypatch):
         enabled={"assigned_issues"},
         repos_raw=None,
         orgs_raw=None,
-        mapping_raw=None,
         limit_raw=2,
-        project_repos={"acme/widgets": "/derived"},
     )
     assert len(items) == 2
-    assert items[0]["project"] == "/derived"
 
 
 class _Ctx:
@@ -579,7 +574,7 @@ def test_active_backoff_gate_raises_before_any_request(monkeypatch):
     monkeypatch.setattr(refresh, "backoff_until", lambda api: time.monotonic() + 60 if api == "graphql" else 0.0)
     monkeypatch.setattr(suggestions, "resolve_token", lambda _env: pytest.fail("token resolved while backed off"))
     with pytest.raises(RuntimeError, match="rate limited"):
-        suggestions.fetch_suggestions(enabled={"assigned_issues"}, repos_raw="", orgs_raw="", mapping_raw="")
+        suggestions.fetch_suggestions(enabled={"assigned_issues"}, repos_raw="", orgs_raw="")
 
 
 def test_rate_limited_response_arms_backoff_and_reports_error(monkeypatch):
@@ -593,7 +588,7 @@ def test_rate_limited_response_arms_backoff_and_reports_error(monkeypatch):
 
     monkeypatch.setattr(suggestions, "GitHubClient", lambda _token: _Ctx(Limited()))
     with pytest.raises(RuntimeError, match="rate limit"):
-        suggestions.fetch_suggestions(enabled={"assigned_issues"}, repos_raw="", orgs_raw="", mapping_raw="")
+        suggestions.fetch_suggestions(enabled={"assigned_issues"}, repos_raw="", orgs_raw="")
     assert armed == ["graphql"]
 
 
@@ -640,7 +635,7 @@ def _host(sources=None, projects=None, settings=None, calls=None, set_result=Non
     return call_host
 
 
-def test_runtime_passes_host_enabled_criteria_and_derived_projects(monkeypatch, tmp_path):
+def test_runtime_passes_host_enabled_criteria_and_project_repos(monkeypatch, tmp_path):
     checkout = tmp_path / "widgets"
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
     subprocess.run(
@@ -665,7 +660,7 @@ def test_runtime_passes_host_enabled_criteria_and_derived_projects(monkeypatch, 
     monkeypatch.setattr(main.suggestions, "fetch_suggestions", fetch)
     runtime._refresh_suggestions()
     assert captured["enabled"] == {"mentioned"}
-    assert captured["project_repos"] == {"acme/widgets": str(checkout)}
+    assert captured["project_repos"] == {"acme/widgets"}
     assert captured["limit_raw"] == 5
     assert calls[-1] == (main.SUGGESTIONS_SET, {"items": [{"id": "x"}]})
 
@@ -871,7 +866,9 @@ def test_item_variables_match_the_manifest_declaration_for_every_criterion():
             notifications=[_notification()],
             comments={"https://api.github.com/repos/acme/widgets/issues/comments/9": {"body": "hi", "html_url": "u"}},
         )
-        items = suggestions._discover(client, enabled={criterion}, repos={"acme/widgets"}, orgs=set(), projects={})
+        items = suggestions._discover(
+            client, enabled={criterion}, repos={"acme/widgets"}, orgs=set(), project_repos=set()
+        )
         assert [item["criterion"] for item in items] == [criterion], criterion
         assert set(items[0]["variables"]) == declared[criterion], criterion
 
@@ -907,18 +904,12 @@ def test_every_bounded_string_is_clamped_to_the_host_byte_caps():
     item["title"].encode()  # valid UTF-8, never cut mid-character
 
 
-def test_project_is_clamped():
-    items = _discover(FakeClient({"assignee:@me": [_issue()]}), {"assigned_issues"})
-    assert items
-    long_project = "p" * 5000
-    [item] = suggestions._discover(
-        FakeClient({"assignee:@me": [_issue()]}),
-        enabled={"assigned_issues"},
-        repos=set(),
-        orgs=set(),
-        projects={"acme/widgets": long_project},
+def test_items_carry_a_lowercased_repo_mapping_key_and_no_project_hint():
+    [item] = _discover(
+        FakeClient({"assignee:@me": [_issue(repository={"nameWithOwner": "Acme/Widgets"})]}), {"assigned_issues"}
     )
-    assert _utf8_len(item["project"]) == suggestions.PROJECT_BYTES
+    assert item["mapping_key"] == "acme/widgets"
+    assert "project" not in item
 
 
 def test_graphql_rate_limited_envelope_arms_the_gate_with_its_reset(monkeypatch):
