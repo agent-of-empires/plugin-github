@@ -10,8 +10,9 @@ shape degrades a field rather than raising (the worker stays fail-soft).
 Why infer ``review_state`` instead of mapping ``reviewDecision`` directly:
 GitHub's ``reviewDecision`` only yields ``APPROVED`` / ``CHANGES_REQUESTED`` /
 ``REVIEW_REQUIRED`` / null. It cannot express "commented", so that state is
-inferred from a COMMENTED review (except bot approval recommendations) or any
-unresolved thread.
+inferred from a COMMENTED review or any unresolved thread. When the opt-in
+``ignore_bot_approval_recommendations`` setting is on, a bot's COMMENTED review
+whose body is exactly "Recommendation: Approve" is excluded from that inference.
 
 ``reviewDecision`` also reads ``APPROVED`` while a code-owner group or ruleset
 requirement is unmet, so ``approved`` additionally needs no outstanding review
@@ -38,7 +39,9 @@ from datetime import timezone
 # - pullRequests first:3 (a branch rarely has more than one open + one merged PR);
 # - reviews last:20, states:[COMMENTED] (body and author type distinguish bot
 #   approval recommendations from actual review comments); APPROVED /
-#   CHANGES_REQUESTED come from reviewDecision);
+#   CHANGES_REQUESTED come from reviewDecision). The review ``body`` is fetched
+#   for every COMMENTED review (and ``latestReviews`` entry) even though the
+#   opt-in filter is off by default, so payloads grow; point cost is unchanged.
 # - reviewThreads first:100 with pageInfo, so a big review (e.g. a CodeRabbit
 #   pass) surfaces every unresolved comment; refresh paginates by the node ``id``
 #   for the rare PR that still has more (#28).
@@ -339,8 +342,10 @@ def review_state(pr: dict[str, Any], *, ignore_bot_approval_recommendations: boo
     were all made on an older commit: the author has pushed since, so the review
     still blocks the merge on GitHub but is likely addressed and awaits a re-review.
 
-    ``commented`` is inferred (see module docstring): a non-recommendation COMMENTED
-    review or any unresolved thread, when the decision is neither approved nor changes-needed.
+    ``commented`` is inferred (see module docstring): a COMMENTED review or any
+    unresolved thread, when the decision is neither approved nor changes-needed.
+    A bot's "Recommendation: Approve" review is excluded only when the opt-in
+    ``ignore_bot_approval_recommendations`` setting is on.
     """
     decision = pr.get("reviewDecision")
     if decision == "APPROVED":
@@ -361,6 +366,16 @@ def review_state(pr: dict[str, Any], *, ignore_bot_approval_recommendations: boo
     return "waiting"
 
 
+def _thread_openers(pr: dict[str, Any]) -> set[str]:
+    """Logins who opened an unresolved thread (a deleted account is ``""``)."""
+    openers: set[str] = set()
+    for thread in _nodes(pr, "reviewThreads"):
+        if not thread.get("isResolved"):
+            first = _nodes(thread, "comments")
+            openers.add(_actor_login(first[0], "author") if first else "")
+    return openers
+
+
 def commenters(pr: dict[str, Any], *, ignore_bot_approval_recommendations: bool = False) -> list[str]:
     """Logins behind an inferred ``commented`` state: COMMENTED-review authors plus
     each unresolved thread's opener. An unknown author is ``""`` (counts as a
@@ -371,10 +386,7 @@ def commenters(pr: dict[str, Any], *, ignore_bot_approval_recommendations: bool 
         if r.get("state") == "COMMENTED"
         and (not ignore_bot_approval_recommendations or not _is_bot_approval_recommendation(r))
     }
-    for thread in _nodes(pr, "reviewThreads"):
-        if not thread.get("isResolved"):
-            first = _nodes(thread, "comments")
-            logins.add(_actor_login(first[0], "author") if first else "")
+    logins |= _thread_openers(pr)
     return sorted(logins)
 
 
@@ -772,15 +784,27 @@ def reviewers(pr: dict[str, Any], *, ignore_bot_approval_recommendations: bool =
     ``latestReviews`` dropped (re-requested reviewer) is restored; outstanding
     ``reviewRequests`` are appended as ``pending``. A reviewer who has both (a
     re-request after a review) keeps their submitted state, since that is the
-    position still on record. Totals: malformed nodes are skipped, never raised;
-    a bot approval recommendation is dropped only when that exclusion is on.
+    position still on record. Totals: malformed nodes are skipped, never raised.
+    A bot approval recommendation is dropped only when that exclusion is on and
+    the bot opens no unresolved thread (a thread keeps it a ``commented``
+    reviewer, matching ``commenters``/``review_state``).
     """
     out: list[dict[str, str]] = []
     seen: set[str] = set()
+    # A bot whose review is an excluded approval recommendation still drives
+    # ``commented`` through an unresolved thread (see ``commenters``), so it must
+    # stay visible as a reviewer rather than vanishing from the pane.
+    thread_openers = _thread_openers(pr)
     for node in _nodes(pr, "latestReviews"):
-        if ignore_bot_approval_recommendations and _is_bot_approval_recommendation(node):
-            continue
         name = _reviewer_name(node.get("author"))
+        is_excluded_recommendation = (
+            ignore_bot_approval_recommendations
+            and name is not None
+            and name not in thread_openers
+            and _is_bot_approval_recommendation(node)
+        )
+        if is_excluded_recommendation:
+            continue
         if name is None or name in seen:
             continue
         seen.add(name)

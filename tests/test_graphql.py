@@ -195,6 +195,10 @@ def test_bot_approval_recommendation_is_opt_in():
     threaded["latestReviews"] = {"nodes": [bot_recommendation]}
     assert graphql.review_state(threaded, ignore_bot_approval_recommendations=True) == "commented"
     assert graphql.commenters(threaded, ignore_bot_approval_recommendations=True) == ["reviewbot"]
+    # An unresolved thread is genuine feedback, so the bot stays a reviewer.
+    assert graphql.reviewers(threaded, ignore_bot_approval_recommendations=True) == [
+        {"name": "reviewbot", "state": "commented"}
+    ]
 
     formal_approval = {**bot_recommendation, "state": "APPROVED"}
     approved = _pr(decision="APPROVED")
