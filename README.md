@@ -133,8 +133,10 @@ session-less `github.refresh` cover every session and prune vanished ones:
    checkout's origin identity and each PR's real head owner/repository; PR
    links, selection, and stack navigation use the destination repository. This
    applies to web snapshots and the direct-worker `github.status` / `github.open`
-   handlers. An explicit `upstream` remote is also how a fork-of-a-fork
-   (grandparent) is discovered: metadata only resolves the direct parent.
+   handlers.
+   Metadata resolves only the direct parent (`parent`, not `source`), so a
+   fork-of-fork (`upstream/r <- bob/r <- alice/r`) never looks up PRs against the
+   root: configure an explicit `upstream` remote to reach a grandparent.
    Deduplicate lookups by destination, branch, and head owner/repository, so
    shared workspaces fetch once without mixing contributors' results.
    Same-repository PRs, fork-local PRs, and multi-repository sessions remain
