@@ -18,6 +18,7 @@ from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.auth import SystemEnvironment
 from aoe_github_plugin.auth import resolve_token
 from aoe_github_plugin.client import GitHubClient
+from aoe_github_plugin.errors import ApiError
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import GitHubAuthError
 from aoe_github_plugin.errors import NoTokenNoGhError
@@ -31,8 +32,14 @@ LABEL_BYTES = 512
 TEXT_BYTES = 2048
 # Scope entries per GraphQL document, to stay well inside GitHub's complexity limits.
 SCOPE_CHUNK = 40
+# At most this many entries are looked up (five round trips); the rest is reported, not checked.
+MAX_SCOPE_ENTRIES = SCOPE_CHUNK * 5
+# A 200 envelope carries these per-alias when the token cannot see an entry; any other
+# error type is transient or account-wide and must not read as "grant access".
+READ_DENIED = frozenset({"NOT_FOUND", "FORBIDDEN"})
 SIGN_IN_FIX = "Run `gh auth login`, or set GITHUB_TOKEN."
 SKIPPED = "Skipped until the plugin is signed in to GitHub."
+UNKNOWN_SOURCES = "Could not read which sources are on."
 
 
 def check(check_id: str, label: str, status: str, detail: str = "", fix: str = "") -> dict[str, Any]:
@@ -76,8 +83,21 @@ def _scope_chunk(entries: list[tuple[str, str]], *, first: bool) -> tuple[str, d
     return f"query{args} {{ {' '.join(fields)} }}", variables
 
 
+def _raise_unless_denied(errors: Any) -> None:
+    """Let per-alias NOT_FOUND/FORBIDDEN errors through (their alias is null);
+    raise the first other error so its message reaches the user."""
+    if not isinstance(errors, list):
+        return
+    for error in errors:
+        entry = error if isinstance(error, dict) else {}
+        path = entry.get("path")
+        if entry.get("type") in READ_DENIED and isinstance(path, list) and path:
+            continue
+        raise ApiError(200, str(entry.get("message") or "GitHub returned an error"))
+
+
 def _lookup(client: GitHubClient, entries: list[tuple[str, str]]) -> tuple[str, list[str]]:
-    """``(viewer login, entries the token cannot read)``; a null alias is unreadable."""
+    """``(viewer login, entries the token cannot see)``; a null alias is unreadable."""
     chunks = [entries[i : i + SCOPE_CHUNK] for i in range(0, len(entries), SCOPE_CHUNK)] or [[]]
     login = ""
     unreadable: list[str] = []
@@ -88,7 +108,11 @@ def _lookup(client: GitHubClient, entries: list[tuple[str, str]]) -> tuple[str, 
             raise RateLimitedError
         data = envelope.get("data")
         if not isinstance(data, dict):
+            # e.g. SAML enforcement answers data: null; keep GitHub's own message.
+            if envelope.get("errors"):
+                _raise_unless_denied(envelope["errors"])
             raise TypeError("GitHub returned an invalid response")
+        _raise_unless_denied(envelope.get("errors"))
         if number == 0:
             viewer = data.get("viewer")
             found = viewer.get("login") if isinstance(viewer, dict) else None
@@ -99,12 +123,21 @@ def _lookup(client: GitHubClient, entries: list[tuple[str, str]]) -> tuple[str, 
     return login, unreadable
 
 
+def _raw_count(raw: Any) -> int:
+    """Distinct non-empty entries in a comma or newline separated setting."""
+    if not isinstance(raw, str):
+        return 0
+    return len({part.strip().lower() for part in raw.replace("\n", ",").split(",") if part.strip()})
+
+
 def _graphql_checks(
-    client: GitHubClient, repos: set[str], orgs: set[str]
+    client: GitHubClient, repos: set[str], orgs: set[str], *, ignored: int = 0
 ) -> tuple[dict[str, Any], dict[str, Any], bool]:
     """``(logged_in, read_repositories, rejected)`` from one batched lookup; the
-    viewer proves the token, a null alias is an entry the token cannot read."""
+    viewer proves the token, a null alias is an entry the token cannot see."""
     entries = [("repo", repo) for repo in sorted(repos)] + [("owner", org) for org in sorted(orgs)]
+    unchecked = max(0, len(entries) - MAX_SCOPE_ENTRIES)
+    entries = entries[:MAX_SCOPE_ENTRIES]
     try:
         login, unreadable = _lookup(client, entries)
     except UnauthorizedError:
@@ -122,19 +155,24 @@ def _graphql_checks(
     except (GitHubError, TypeError) as exc:
         return _unverified(_first_line(exc))
     signed_in = check("logged_in", "Signed in to GitHub", "ok", f"Signed in as {login}.")
+    notes = []
+    if unchecked:
+        notes.append(f"and {unchecked} more not checked.")
+    if ignored:
+        notes.append(f"{ignored} entries ignored (invalid owner/repo).")
+    note = "".join(f" {text}" for text in notes)
     if unreadable:
-        shown = ", ".join(unreadable)
         fix = "Grant the token access to them, or remove them from the repository and organization settings."
-        return (
-            signed_in,
-            check("read_repositories", "Can read repositories", "fail", f"Cannot read: {shown}.", fix),
-            False,
-        )
-    detail = (
-        f"Can read all {len(entries)} configured entries."
-        if entries
-        else "No scope configured; every repository the token can see."
-    )
+        detail = f"Not found or not visible to the token: {', '.join(unreadable)}.{note}"
+        return signed_in, check("read_repositories", "Can read repositories", "fail", detail, fix), False
+    if ignored:
+        fix = "Use `owner/repo` for repositories and a plain name for organizations, separated by commas."
+        detail = f"{len(entries)} entries exist and are visible.{note}" if entries else f"No valid scope.{note}"
+        return signed_in, check("read_repositories", "Can read repositories", "warn", detail, fix), False
+    if entries:
+        detail = f"{len(entries)} configured entries exist and are visible to the token.{note}"
+    else:
+        detail = "No scope configured; every repository the token can see."
     return signed_in, check("read_repositories", "Can read repositories", "ok", detail), False
 
 
@@ -166,13 +204,14 @@ def _notifications_check(client: GitHubClient) -> dict[str, Any]:
 
 def run_checks(
     *,
-    mentioned_enabled: bool,
+    mentioned_enabled: bool | None,
     repos_raw: Any,
     orgs_raw: Any,
     env: TokenEnvironment | None = None,
 ) -> list[dict[str, Any]]:
     """Evaluate the four checks. ``mentioned_enabled`` says whether the host has
-    the ``mentioned`` source on; with it off the notifications probe is skipped."""
+    the ``mentioned`` source on (``None``: the host did not say); with it off or
+    unknown the notifications probe is skipped."""
     env = env or SystemEnvironment()
     installed = env.gh_available()
     token: str | None = None
@@ -192,7 +231,14 @@ def run_checks(
             "The `gh` command was not found." + (" A token from the environment is in use." if token else ""),
             "Install the GitHub CLI from https://cli.github.com/.",
         )
-    notifications_off = check("notifications_scope", "Notifications scope", "ok", "Not needed: mentions are off.")
+    # What the notifications check says without probing; None means it must probe.
+    if mentioned_enabled is None:
+        unprobed: dict[str, Any] | None = check("notifications_scope", "Notifications scope", "warn", UNKNOWN_SOURCES)
+    elif not mentioned_enabled:
+        unprobed = check("notifications_scope", "Notifications scope", "ok", "Not needed: mentions are off.")
+    else:
+        unprobed = None
+    skipped = check("notifications_scope", "Notifications scope", "warn", SKIPPED)
     if token is None:
         fix = (
             "Install the GitHub CLI and run `gh auth login`, or set GITHUB_TOKEN."
@@ -203,21 +249,20 @@ def run_checks(
             cli,
             check("logged_in", "Signed in to GitHub", "fail", _first_line(failure or RuntimeError("no token")), fix),
             check("read_repositories", "Can read repositories", "warn", SKIPPED),
-            check("notifications_scope", "Notifications scope", "warn", SKIPPED)
-            if mentioned_enabled
-            else notifications_off,
+            unprobed or skipped,
         ]
     repos = suggestions.parse_csv(repos_raw, suggestions.REPO_RE)
     orgs = suggestions.parse_csv(orgs_raw, suggestions.ORG_RE)
+    ignored = _raw_count(repos_raw) - len(repos) + _raw_count(orgs_raw) - len(orgs)
     with GitHubClient(token) as client:
         if _backed_off("graphql"):
             logged_in, readable, rejected = _unverified("GitHub rate limited; will check again later.")
         else:
-            logged_in, readable, rejected = _graphql_checks(client, repos, orgs)
-        if not mentioned_enabled:
-            notifications = notifications_off
+            logged_in, readable, rejected = _graphql_checks(client, repos, orgs, ignored=ignored)
+        if unprobed:
+            notifications = unprobed
         elif rejected:
-            notifications = check("notifications_scope", "Notifications scope", "warn", SKIPPED)
+            notifications = skipped
         else:
             notifications = _notifications_check(client)
     return [cli, logged_in, readable, notifications]

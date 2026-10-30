@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from aoe_github_plugin import checks
@@ -50,7 +52,7 @@ class FakeClient:
         if self.envelope is not None:
             return self.envelope
         data = {"viewer": {"login": "me"}} if "viewer" in query else {}
-        for index in range(len(variables)):
+        for index in map(int, re.findall(r"\ba(\d+):", query)):
             data[f"a{index}"] = None if index in self.null_aliases else {"id": "x"}
         return {"data": data}
 
@@ -203,3 +205,88 @@ def test_strings_are_clamped_by_utf8_bytes():
     assert len(check["label"].encode()) <= checks.LABEL_BYTES
     assert len(check["detail"].encode()) <= checks.TEXT_BYTES
     assert len(check["fix"].encode()) <= checks.TEXT_BYTES
+
+
+def _envelope(errors=None, **data):
+    return {"data": {"viewer": {"login": "me"}, **data}, "errors": errors}
+
+
+def test_a_not_found_alias_error_is_unreadable_not_a_failure_to_verify(monkeypatch):
+    errors = [{"type": "NOT_FOUND", "path": ["a0"], "message": "Could not resolve to a Repository"}]
+    client = FakeClient(envelope=_envelope(errors, a0=None))
+    by_id, _, _ = _run(monkeypatch, client=client, repos_raw="acme/gone")
+    assert by_id["read_repositories"]["status"] == "fail"
+    assert "acme/gone" in by_id["read_repositories"]["detail"]
+
+
+def test_a_transient_alias_error_is_unverified_with_its_message_not_a_grant_access_fix(monkeypatch):
+    errors = [{"type": "INTERNAL", "path": ["a0"], "message": "Something went wrong while executing your query"}]
+    client = FakeClient(envelope=_envelope(errors, a0=None))
+    by_id, _, _ = _run(monkeypatch, client=client, repos_raw="acme/widgets")
+    assert by_id["read_repositories"]["status"] == "warn"
+    assert "Something went wrong" in by_id["read_repositories"]["detail"]
+    assert "fix" not in by_id["read_repositories"]
+    assert by_id["logged_in"]["status"] == "warn"
+
+
+def test_a_null_data_envelope_keeps_the_error_message(monkeypatch):
+    errors = [{"type": "FORBIDDEN", "message": "Resource protected by organization SAML enforcement."}]
+    by_id, _, _ = _run(monkeypatch, client=FakeClient(envelope={"data": None, "errors": errors}))
+    assert by_id["logged_in"]["status"] == "warn"
+    assert "SAML enforcement" in by_id["logged_in"]["detail"]
+
+
+def test_a_rate_limited_envelope_arms_the_gate_but_never_shortens_it(monkeypatch):
+    gate = {"until": 0.0}
+    seen, armed = [], []
+
+    def arm_from_envelope(envelope):
+        seen.append(envelope)
+        gate["until"] = 99.0  # the exact reset GitHub reported
+        return True
+
+    monkeypatch.setattr(refresh, "arm_if_graphql_rate_limited", arm_from_envelope)
+    monkeypatch.setattr(refresh, "arm_backoff", lambda api, _reset_at=None: armed.append(api))
+    monkeypatch.setattr(refresh, "backoff_until", lambda _api: gate["until"])
+    monkeypatch.setattr(checks.time, "monotonic", lambda: 10.0)
+    envelope = {"data": None, "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}
+    by_id, client, _ = _run(monkeypatch, client=FakeClient(envelope=envelope))
+    assert len(client.queries) == 1
+    assert seen == [envelope]
+    assert armed == []
+    assert by_id["logged_in"]["status"] == "warn"
+
+
+def test_scope_round_trips_are_bounded_and_the_rest_is_reported(monkeypatch):
+    repos = ",".join(f"acme/r{n:03}" for n in range(checks.MAX_SCOPE_ENTRIES + 7))
+    by_id, client, _ = _run(monkeypatch, repos_raw=repos)
+    assert len(client.queries) == 5
+    assert by_id["read_repositories"]["status"] == "ok"
+    assert "and 7 more not checked." in by_id["read_repositories"]["detail"]
+
+
+def test_a_scope_with_only_invalid_entries_is_not_reported_as_unconfigured(monkeypatch):
+    by_id, _, _ = _run(monkeypatch, repos_raw="not a repo, is:private", orgs_raw="-bad")
+    assert by_id["read_repositories"]["status"] == "warn"
+    assert "3 entries ignored (invalid owner/repo)." in by_id["read_repositories"]["detail"]
+    assert "owner/repo" in by_id["read_repositories"]["fix"]
+
+
+def test_ignored_entries_are_noted_next_to_valid_ones(monkeypatch):
+    by_id, _, _ = _run(monkeypatch, repos_raw="acme/widgets, bad entry")
+    assert by_id["read_repositories"]["status"] == "warn"
+    assert "1 entries exist and are visible." in by_id["read_repositories"]["detail"]
+    assert "1 entries ignored" in by_id["read_repositories"]["detail"]
+
+
+def test_owner_entries_claim_visibility_not_readability(monkeypatch):
+    by_id, _, _ = _run(monkeypatch, orgs_raw="acme")
+    assert "exist and are visible" in by_id["read_repositories"]["detail"]
+
+
+@pytest.mark.parametrize("env", [FakeEnv(env={"GITHUB_TOKEN": "t"}), FakeEnv(gh=False)])
+def test_a_silent_host_leaves_notifications_unknown_not_ok(monkeypatch, env):
+    by_id, client, _ = _run(monkeypatch, env=env, mentioned_enabled=None)
+    assert by_id["notifications_scope"]["status"] == "warn"
+    assert by_id["notifications_scope"]["detail"] == checks.UNKNOWN_SOURCES
+    assert client.rest == []
