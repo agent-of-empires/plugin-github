@@ -780,6 +780,29 @@ def _set_backoff(api: str, reset_at: Any = None, *, host: str) -> None:
             gate["reset_known"] = gate["reset_known"] or new_known
 
 
+def backoff_until(api: str) -> float:
+    """Monotonic deadline of one budget's backoff gate on github.com (0 when idle). Shared
+    with the suggestions provider so one rate-limit hit pauses every GitHub caller."""
+    with _cache_lock:
+        return float(_backoff["github.com"][api]["until"])
+
+
+def arm_backoff(api: str, reset_at: Any = None) -> None:
+    """Public face of ``_set_backoff`` for callers outside this module (github.com only)."""
+    _set_backoff(api, reset_at, host="github.com")
+
+
+def note_graphql_rate_limit(rate_info: dict[str, Any]) -> None:
+    """Record a ``rateLimit`` payload from a query that is not per-repo (the
+    suggestions searches), so budget-pressure pacing sees that spend too."""
+    _observe_rate_limit(rate_info, host="github.com", kind="suggestions", repo="-", aliases=1)
+
+
+def checkout_repo(path: str) -> str | None:
+    """``owner/name`` of a checkout's github.com origin, or ``None``."""
+    return _identify(path, {"github.com": GitHubHost.dotcom()})[1]
+
+
 def _active_backoff_locked(now: float, *, host: str) -> dict[str, Any] | None:
     """The active gate that stays limited LONGEST (the point the whole plugin is
     clear again), as ``{"seconds", "reset_known", "budget"}``, or ``None`` when
