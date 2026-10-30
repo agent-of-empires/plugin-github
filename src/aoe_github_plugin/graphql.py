@@ -12,7 +12,8 @@ GitHub's ``reviewDecision`` only yields ``APPROVED`` / ``CHANGES_REQUESTED`` /
 ``REVIEW_REQUIRED`` / null. It cannot express "commented", so that state is
 inferred from a COMMENTED review or any unresolved thread. When the opt-in
 ``ignore_bot_approval_recommendations`` setting is on, a bot's COMMENTED review
-whose body is exactly "Recommendation: Approve" is excluded from that inference.
+whose body contains a line reading "Recommendation: Approve" is excluded from
+that inference.
 
 ``reviewDecision`` also reads ``APPROVED`` while a code-owner group or ruleset
 requirement is unmet, so ``approved`` additionally needs no outstanding review
