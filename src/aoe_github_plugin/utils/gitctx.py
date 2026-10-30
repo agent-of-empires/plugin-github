@@ -42,5 +42,13 @@ def remote_owner_repo(path: str) -> tuple[str, str] | None:
     return parse_owner_repo(_git(path, "remote", "get-url", "origin"))
 
 
+def upstream_owner_repo(path: str) -> tuple[str, str] | None:
+    """Optional configured upstream, without changing origin's meaning."""
+    try:
+        return parse_owner_repo(_git(path, "remote", "get-url", "upstream"))
+    except GitHubError:
+        return None
+
+
 def current_branch(path: str) -> str:
     return _git(path, "rev-parse", "--abbrev-ref", "HEAD")

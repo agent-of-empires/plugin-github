@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 import httpx
 
+from aoe_github_plugin import lookup
 from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.auth import SystemEnvironment
 from aoe_github_plugin.auth import resolve_token
@@ -23,6 +24,7 @@ from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import GitHubAuthError
 from aoe_github_plugin.utils.gitctx import current_branch
 from aoe_github_plugin.utils.gitctx import remote_owner_repo
+from aoe_github_plugin.utils.gitctx import upstream_owner_repo
 
 
 def _resolve_optional_token(env: TokenEnvironment | None) -> str | None:
@@ -35,29 +37,6 @@ def _resolve_optional_token(env: TokenEnvironment | None) -> str | None:
         token, _ = resolve_token(env or SystemEnvironment())
         return token
     return None
-
-
-def _open_pulls_for_branch(
-    client: GitHubClient,
-    owner: str,
-    repo: str,
-    branch: str,
-) -> list[dict[str, Any]]:
-    """Open PRs whose head is ``branch``, trimmed to the fields a UI renders."""
-    raw = client.get_json(
-        f"/repos/{owner}/{repo}/pulls",
-        params={"state": "open", "head": f"{owner}:{branch}", "per_page": "10"},
-    )
-    return [
-        {
-            "number": pr["number"],
-            "url": pr["html_url"],
-            "title": pr["title"],
-            "state": pr["state"],
-            "draft": bool(pr.get("draft", False)),
-        }
-        for pr in raw
-    ]
 
 
 def github_status(
@@ -91,7 +70,8 @@ def github_status(
         result["branch"] = branch
         token = _resolve_optional_token(env)
         with GitHubClient(token=token, transport=transport) as client:
-            pulls = _open_pulls_for_branch(client, owner, repo, branch)
+            repos = lookup.repositories(client, owner_repo, upstream_owner_repo(path))
+            pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         result["pulls"] = pulls
         if pulls:
             result["summary"] = f"{owner}/{repo}: PR #{pulls[0]['number']} open for {branch}"
@@ -124,7 +104,8 @@ def github_open(
     with contextlib.suppress(GitHubError):
         token = _resolve_optional_token(env)
         with GitHubClient(token=token, transport=transport) as client:
-            pulls = _open_pulls_for_branch(client, owner, repo, branch)
+            repos = lookup.repositories(client, owner_repo, upstream_owner_repo(path))
+            pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         if pulls:
             return {"url": pulls[0]["url"], "kind": "pull"}
     quoted = quote(branch, safe="")

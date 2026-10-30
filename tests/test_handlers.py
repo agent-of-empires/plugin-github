@@ -1,5 +1,7 @@
 """Structured status + open-in-GitHub handlers. No network (MockTransport)."""
 
+import subprocess
+
 import httpx
 import pytest
 
@@ -25,11 +27,21 @@ def _pr(number=7, branch="feature", draft=False):
         "title": f"PR for {branch}",
         "state": "open",
         "draft": draft,
+        "head": {"ref": branch, "repo": {"name": "r", "owner": {"login": "o"}}},
     }
 
 
 def _transport(handler):
     return httpx.MockTransport(handler)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_parent_cache():
+    handlers.lookup._parent_cache.clear()
+    # The older handler unit fixtures model a non-fork o/r repository.
+    handlers.lookup._parent_cache[("o", "r")] = (float("inf"), None)
+    yield
+    handlers.lookup._parent_cache.clear()
 
 
 def test_status_returns_structured_pull(monkeypatch):
@@ -116,3 +128,50 @@ def test_open_raises_without_github_remote(monkeypatch):
     monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: None)
     with pytest.raises(errors.GitHubError):
         handlers.github_open(env=_NoTokenEnv())
+
+
+def test_status_discovers_fork_pull_targeting_parent(tmp_path):
+    subprocess.run(["git", "init", "-q", "-b", "feature", str(tmp_path)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin", "https://github.com/alice/r.git"],
+        check=True,
+    )
+
+    def handler(request):
+        if request.url.path == "/repos/alice/r":
+            return httpx.Response(200, json={"parent": {"owner": {"login": "upstream"}, "name": "r"}})
+        if request.url.path == "/repos/upstream/r/pulls" and request.url.params["head"] == "alice:feature":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        **_pr(),
+                        "html_url": "https://github.com/upstream/r/pull/7",
+                        "head": {"ref": "feature", "repo": {"name": "r", "owner": {"login": "alice"}}},
+                    }
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    result = handlers.github_status(str(tmp_path), env=_NoTokenEnv(), transport=_transport(handler))
+    assert result["repo"] == "alice/r"
+    assert result["pulls"][0]["url"] == "https://github.com/upstream/r/pull/7"

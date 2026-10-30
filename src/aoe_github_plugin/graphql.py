@@ -48,8 +48,10 @@ from datetime import timezone
 # check_summary keeps the raw rollup whenever the page is still truncated.
 _PR_CONNECTION_FRAGMENT = """
 fragment PRConnection on PullRequestConnection {
+  pageInfo { hasNextPage endCursor }
   nodes {
     id number title url state isDraft merged mergeable mergeStateStatus reviewDecision updatedAt headRefOid
+    headRefName headRepository { name owner { login } }
     mergeQueueEntry { position state }
     mergeQueue { url }
     baseRefName additions deletions changedFiles
@@ -115,7 +117,7 @@ fragment PRConnection on PullRequestConnection {
 # GraphQL literals that survive ``str.format``. rateLimit.cost (one per batched
 # query) lets the per-query budget be verified (#23).
 _ALIAS_FIELD = """    b{i}: pullRequests(
-      headRefName: $b{i}, states: [OPEN, MERGED], first: 3,
+      headRefName: $b{i}, states: [OPEN, MERGED], first: 100,
       orderBy: {{field: UPDATED_AT, direction: DESC}}
     ) {{ ...PRConnection }}"""
 
@@ -146,10 +148,11 @@ query({params}) {{
 # selected both here and in ``_PR_CONNECTION_FRAGMENT`` so a signature computed
 # from a full response compares equal to one computed from a digest response.
 _DIGEST_ALIAS_FIELD = """    b{i}: pullRequests(
-      headRefName: $b{i}, states: [OPEN, MERGED], first: 3,
+      headRefName: $b{i}, states: [OPEN, MERGED], first: 100,
       orderBy: {{field: UPDATED_AT, direction: DESC}}
-    ) {{ nodes {{
+    ) {{ pageInfo {{ hasNextPage endCursor }} nodes {{
       number state isDraft merged mergeable mergeStateStatus reviewDecision updatedAt headRefOid
+      headRefName headRepository {{ name owner {{ login }} }}
       mergeQueueEntry {{ position state }}
       commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }}
       reviewThreads(first: 1) {{ totalCount }}
@@ -915,6 +918,7 @@ def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -
         "title": pr.get("title") or "",
         "state": pr.get("state"),
         "draft": bool(pr.get("isDraft", False)),
+        "head": {"ref": pr.get("headRefName"), "repo": pr.get("headRepository")},
         "merged": bool(pr.get("merged", False)),
         "merge_state": merge_state(pr),
         "merge_queue": _merge_queue(pr),
