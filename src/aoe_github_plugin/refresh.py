@@ -1186,10 +1186,11 @@ def _apply_digest_aliases(
             if truncated:
                 # Cannot verify the owned set from a truncated page: promote to
                 # the full query (which will itself fall back to REST if also
-                # truncated). Serve the rich cache meanwhile so the key is never
-                # left unset if the promoted fetch declines to write. A
-                # collision is not a failure, so no cooldown.
-                out[key] = _pulls_result(pending[key]["rich"]["pulls"], fresh=True)
+                # truncated). Serve the fail-soft cache-shaped result meanwhile
+                # so the key is never left unset if the promoted fetch declines
+                # to write. The digest proved nothing, so it must report stale,
+                # never fresh. A collision is not a failure, so no cooldown.
+                out[key] = _fallback_pulls(pending[key])
                 promoted.append(key)
                 continue
             signature = graphql.digest_signature(owned)
