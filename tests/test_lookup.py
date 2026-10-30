@@ -370,6 +370,25 @@ def test_truncated_page_serves_rest_without_cooldown_on_busy_branch(tmp_path):
     assert len(graphql_queries) == 1
     assert refresh._graphql_cache == {}  # nothing cached as a confirmed result
     assert refresh._retry_cooldown == {}  # a collision is not a failure
+    # The truncation is remembered so the next tick cannot re-spend a full query
+    # that is certain to truncate identically.
+    assert refresh._truncated_until != {}
+
+    # Second tick: no new GraphQL query, and the same owned PR is still shown.
+    second = refresh.build_snapshot(
+        [{"id": "s", "project_path": str(path)}], env=_Env(token=True), transport=httpx.MockTransport(handler)
+    )
+    assert len(graphql_queries) == 1  # unchanged: the full query was skipped
+    assert [p["number"] for p in second["sessions"][0]["repos"][0]["pulls"]] == [2]
+
+    # A forced refresh is the user asking for a live attempt, so it spends one.
+    refresh.build_snapshot(
+        [{"id": "s", "project_path": str(path)}],
+        env=_Env(token=True),
+        transport=httpx.MockTransport(handler),
+        force=True,
+    )
+    assert len(graphql_queries) == 2
 
 
 def test_origin_empty_upstream_error_keeps_status_failsoft(tmp_path):

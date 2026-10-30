@@ -84,6 +84,7 @@ def _clear_cache(monkeypatch):
         refresh._backoff["notified"] = False
         refresh._graphql_budget.update({"remaining": None, "valid_until": None})
         refresh._retry_cooldown.clear()
+        refresh._truncated_until.clear()
 
     _reset()
     yield

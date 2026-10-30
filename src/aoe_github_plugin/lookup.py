@@ -26,6 +26,9 @@ PullKey = tuple[str, str, str, str, str]
 
 PARENT_TTL = 3600.0
 PARENT_RETRY = 60.0
+# A ``head=owner:branch`` filter can span several repositories of one
+# destination; five pages is far past any realistic case and bounds the loop.
+MAX_PULL_PAGES = 5
 
 _parent_lock = threading.Lock()
 _parent_cache: dict[Repository, tuple[float, Repository | None]] = {}
@@ -122,6 +125,27 @@ def trim_pull(pr: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _page_pulls(client: GitHubClient, owner: str, repo: str, branch: str, head_owner: str) -> list[dict[str, Any]]:
+    """Every open PR with ``head_owner:branch`` as its head, across pages.
+
+    The ``head`` filter is ``owner:branch``, so one owner with the same branch
+    name open against several repositories of this destination can exceed a
+    single page. Bounded so an unexpected full-page loop cannot spin.
+    """
+    raw: list[dict[str, Any]] = []
+    for page in range(1, MAX_PULL_PAGES + 1):
+        batch = client.get_json(
+            f"/repos/{owner}/{repo}/pulls",
+            params={"state": "open", "head": f"{head_owner}:{branch}", "per_page": "100", "page": str(page)},
+        )
+        if not isinstance(batch, list):
+            break
+        raw.extend(item for item in batch if isinstance(item, dict))
+        if len(batch) < 100:
+            break
+    return raw
+
+
 def open_pulls(client: GitHubClient, keys: list[PullKey]) -> list[dict[str, Any]]:
     """Open PRs matching every key, deduplicated by URL.
 
@@ -133,10 +157,7 @@ def open_pulls(client: GitHubClient, keys: list[PullKey]) -> list[dict[str, Any]
     for index, key in enumerate(keys):
         owner, repo, branch, head_owner, _ = key
         try:
-            raw = client.get_json(
-                f"/repos/{owner}/{repo}/pulls",
-                params={"state": "open", "head": f"{head_owner}:{branch}", "per_page": "100"},
-            )
+            raw = _page_pulls(client, owner, repo, branch, head_owner)
         except GitHubError as exc:
             if index == 0:
                 origin_error = exc

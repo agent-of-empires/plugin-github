@@ -197,6 +197,12 @@ _graphql_budget: dict[str, Any] = {"remaining": None, "valid_until": None}
 # every background tick, at the DIGEST tier and for COLD keys too, both of which
 # the old per-entry ``full_retry_at`` could not reach.
 _retry_cooldown: dict[RichCacheKey, float] = {}
+# Per-key deadline (monotonic) before the FULL query may retry a page that came
+# back truncated. Distinct from ``_retry_cooldown``: truncation is not a failure,
+# so it must not feed the error path, but re-asking immediately is guaranteed to
+# truncate again and burns shared GraphQL budget for a result that is discarded.
+GRAPHQL_TRUNCATED_RETRY = 1800.0
+_truncated_until: dict[RichCacheKey, float] = {}
 
 
 def _snapshot_cache_path() -> Path:
@@ -1087,9 +1093,15 @@ def _apply_aliases(
         if truncated:
             # The single page was exhausted by foreign same-name PRs, so it
             # cannot prove the checkout's own PR is absent. The owner-scoped
-            # REST probe already lists it; serve that fresh rather than caching
-            # a false empty, and do not arm the cooldown (this is not a failure).
-            out[key] = _pulls_result(pending[key]["basic"], fresh=True)
+            # REST probe already lists it; serve that, reporting the probe's
+            # own freshness rather than asserting fresh for a backoff-served
+            # cache. Remember the truncation so the next tick does not re-spend
+            # a full query that is certain to truncate the same way.
+            with _cache_lock:
+                _truncated_until[_rich_cache_key(key, required_checks_only=required_checks_only)] = (
+                    now + GRAPHQL_TRUNCATED_RETRY
+                )
+            out[key] = _pulls_result(pending[key]["basic"], fresh=pending[key]["rest_fresh"])
             continue
         # Compute the ownership-filtered signature before thread pagination.
         digest = graphql.digest_signature(conn)
@@ -1106,6 +1118,7 @@ def _apply_aliases(
                 "validated_at": now,
             }
             _retry_cooldown.pop(cache_key, None)
+            _truncated_until.pop(cache_key, None)
         out[key] = _pulls_result(pulls, fresh=True)
     return out
 
@@ -1323,14 +1336,25 @@ def _fetch_rich(
             out[key] = stale if stale is not None else _error_entry(probe)
             continue
         changed, basic, _fresh = probe
-        entry = {"basic": basic, "rich": rich, "changed": changed, "cache_key": cache_key}
+        entry = {"basic": basic, "rich": rich, "changed": changed, "cache_key": cache_key, "rest_fresh": _fresh}
         with _cache_lock:
             cooling = now < _retry_cooldown.get(cache_key, 0.0)
+            truncated = now < _truncated_until.get(cache_key, 0.0)
         if not force and cooling:
             # A recent non-rate failure for this key: serve what we have and
             # spend nothing until the cooldown lapses (#71). A forced refresh
             # bypasses it, since the user asked for a live attempt.
             out[key] = _fallback_pulls(entry)
+        elif not force and truncated:
+            # This page truncated recently: another full query would spend
+            # budget to be discarded again. A changed REST probe still reflects
+            # the current PR set, so prefer it; otherwise serve the cached rich
+            # result, and with neither, the basic pulls, every time reporting
+            # the probe's own freshness rather than asserting fresh.
+            if changed or rich is None:
+                out[key] = _pulls_result(basic, fresh=_fresh)
+            else:
+                out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True)
         elif rich is None or force or changed or rich.get("digest") is None or _full_stale(rich, now):
             full_pending[key] = entry
         elif _digest_stale(rich, now):
