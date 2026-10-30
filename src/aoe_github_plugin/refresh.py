@@ -128,7 +128,7 @@ BACKOFF_SECS = 60.0
 MAX_BACKOFF_SECS = 3600.0
 
 RepoKey = lookup.PullKey
-CheckoutKey = tuple[str, str, str, str, str]  # origin owner/repo, branch, optional upstream owner/repo
+CheckoutKey = tuple[str, str, str, str, str]  # origin owner/repo, branch, configured upstream owner/repo
 RichCacheKey = tuple[str, str, str, str, str, bool]
 StackCacheKey = tuple[str, str, int]
 StackRepoKey = tuple[str, str]
@@ -327,9 +327,9 @@ def _identify(path: str, branch_override: str | None = None) -> tuple[str | None
     branch = branch_override or _git(path, "rev-parse", "--abbrev-ref", "HEAD")
     if not branch or branch == "HEAD":
         return f"{owner}/{repo}", None
-    upstream = _git(path, "remote", "get-url", "upstream")
-    upstream_repo = parse_owner_repo(upstream) if upstream else None
-    upstream_owner, upstream_name = upstream_repo or ("", "")
+    remote = _git(path, "remote", "get-url", "upstream")
+    upstream = parse_owner_repo(remote) if remote else None
+    upstream_owner, upstream_name = upstream or ("", "")
     return f"{owner}/{repo}", (owner, repo, branch, upstream_owner, upstream_name)
 
 
