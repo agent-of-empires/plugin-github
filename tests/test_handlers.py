@@ -35,15 +35,6 @@ def _transport(handler):
     return httpx.MockTransport(handler)
 
 
-@pytest.fixture(autouse=True)
-def _isolate_parent_cache():
-    handlers.lookup._parent_cache.clear()
-    # The older handler unit fixtures model a non-fork o/r repository.
-    handlers.lookup._parent_cache[("o", "r")] = (float("inf"), None)
-    yield
-    handlers.lookup._parent_cache.clear()
-
-
 def test_status_returns_structured_pull(monkeypatch):
     monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
@@ -130,7 +121,7 @@ def test_open_raises_without_github_remote(monkeypatch):
         handlers.github_open(env=_NoTokenEnv())
 
 
-def test_status_discovers_fork_pull_targeting_parent(tmp_path):
+def test_status_discovers_fork_pull_targeting_configured_upstream(tmp_path):
     subprocess.run(["git", "init", "-q", "-b", "feature", str(tmp_path)], check=True)
     subprocess.run(
         [
@@ -155,10 +146,15 @@ def test_status_discovers_fork_pull_targeting_parent(tmp_path):
         ["git", "-C", str(tmp_path), "remote", "add", "origin", "https://github.com/alice/r.git"],
         check=True,
     )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "upstream", "git@github.com:upstream/r.git"],
+        check=True,
+    )
 
     def handler(request):
-        if request.url.path == "/repos/alice/r":
-            return httpx.Response(200, json={"parent": {"owner": {"login": "upstream"}, "name": "r"}})
+        # No repo-metadata request: the configured upstream is the only extra
+        # destination, and origin is probed directly.
+        assert request.url.path != "/repos/alice/r"
         if request.url.path == "/repos/upstream/r/pulls" and request.url.params["head"] == "alice:feature":
             return httpx.Response(
                 200,

@@ -24,7 +24,7 @@ from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import GitHubAuthError
 from aoe_github_plugin.utils.gitctx import current_branch
 from aoe_github_plugin.utils.gitctx import remote_owner_repo
-from aoe_github_plugin.utils.gitctx import upstream_owner_repo
+from aoe_github_plugin.utils.gitctx import remote_owner_repos
 
 
 def _resolve_optional_token(env: TokenEnvironment | None) -> str | None:
@@ -70,7 +70,7 @@ def github_status(
         result["branch"] = branch
         token = _resolve_optional_token(env)
         with GitHubClient(token=token, transport=transport) as client:
-            repos = lookup.repositories(client, owner_repo, upstream_owner_repo(path))
+            repos = lookup.repositories(owner_repo, remote_owner_repos(path))
             pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         result["pulls"] = pulls
         if pulls:
@@ -104,7 +104,7 @@ def github_open(
     with contextlib.suppress(GitHubError):
         token = _resolve_optional_token(env)
         with GitHubClient(token=token, transport=transport) as client:
-            repos = lookup.repositories(client, owner_repo, upstream_owner_repo(path))
+            repos = lookup.repositories(owner_repo, remote_owner_repos(path))
             pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         if pulls:
             return {"url": pulls[0]["url"], "kind": "pull"}

@@ -80,11 +80,9 @@ def _rest(node):
 
 
 class _API:
-    def __init__(self, nodes, parents=None):
+    def __init__(self, nodes):
         self.nodes = nodes
-        self.parents = parents or {}
         self.requests = []
-        self.metadata_status = 200
 
     def __call__(self, request):
         self.requests.append(request)
@@ -106,13 +104,7 @@ class _API:
                 }
             return httpx.Response(200, json={"data": {"rateLimit": {"remaining": 5000}, "repository": aliases}})
         destination = "/".join(parts[1:3])
-        if len(parts) == 3:
-            parent = self.parents.get(destination)
-            owner, name = parent.split("/") if parent else (None, None)
-            return httpx.Response(
-                self.metadata_status,
-                json={"parent": {"owner": {"login": owner}, "name": name}} if parent else {},
-            )
+        assert len(parts) > 3, f"unexpected metadata request: {request.url}"
         if parts[-1] == "stacks":
             return httpx.Response(404)
         assert parts[-1] == "pulls"
@@ -128,7 +120,6 @@ class _API:
 @pytest.fixture(autouse=True)
 def _caches():
     def reset():
-        lookup._parent_cache.clear()
         refresh._etag_cache.clear()
         refresh._graphql_cache.clear()
         refresh._session_refresh_cache.clear()
@@ -152,9 +143,8 @@ def _snapshot(paths, api, token=False):
 
 
 @pytest.mark.parametrize("token", [False, True])
-@pytest.mark.parametrize("explicit_upstream", [False, True])
-def test_fork_upstream_status_open_and_web(tmp_path, token, explicit_upstream):
-    path = _checkout(tmp_path / "fork", "alice/r", "upstream/r" if explicit_upstream else None)
+def test_fork_upstream_status_open_and_web(tmp_path, token):
+    path = _checkout(tmp_path / "fork", "alice/r", "upstream/r")
     nodes = [_node("upstream/r", f"stranger{i}/r", i) for i in range(1, 4)]
     nodes += [
         _node("upstream/r", "alice/another-repo", 6),
@@ -162,7 +152,7 @@ def test_fork_upstream_status_open_and_web(tmp_path, token, explicit_upstream):
         _node("upstream/r", "upstream/r", 9),
         _node("upstream/r", "alice/r", 10, branch="different"),
     ]
-    api = _API({"upstream/r": nodes}, {"alice/r": "upstream/r"})
+    api = _API({"upstream/r": nodes})
     transport = httpx.MockTransport(api)
     status = handlers.github_status(str(path), env=_Env(token), transport=transport)
     assert status["repo"] == "alice/r"
@@ -181,8 +171,6 @@ def test_fork_upstream_status_open_and_web(tmp_path, token, explicit_upstream):
     # permitted head is always the checkout's own origin repository.
     assert 9 not in {p["number"] for p in repo["pulls"]}
     assert all(p["url"].startswith("https://github.com/upstream/r/pull/") for p in repo["pulls"])
-    metadata = [r for r in api.requests if r.url.path == "/repos/alice/r"]
-    assert len(metadata) == (0 if explicit_upstream else 1)
     if token:
         assert any(r.url.path == "/graphql" for r in api.requests)
         assert {r.url.path for r in api.requests if r.url.path.endswith("/stacks")} == {"/repos/upstream/r/stacks"}
@@ -202,8 +190,8 @@ def test_same_repo_still_matches_exact_head(tmp_path, token):
 
 @pytest.mark.parametrize("token", [False, True])
 def test_two_forks_and_multiple_repos_do_not_share_foreign_heads(tmp_path, token):
-    alice = _checkout(tmp_path / "alice", "alice/r")
-    bob = _checkout(tmp_path / "bob", "bob/r")
+    alice = _checkout(tmp_path / "alice", "alice/r", "upstream/r")
+    bob = _checkout(tmp_path / "bob", "bob/r", "upstream/r")
     other = _checkout(tmp_path / "other", "team/other")
     api = _API(
         {
@@ -211,7 +199,6 @@ def test_two_forks_and_multiple_repos_do_not_share_foreign_heads(tmp_path, token
             "alice/r": [_node("alice/r", "alice/r", 43)],
             "team/other": [_node("team/other", "team/other", 41)],
         },
-        {"alice/r": "upstream/r", "bob/r": "upstream/r"},
     )
     snapshot = _snapshot([alice, bob, other, alice], api, token)
     pulls = [[p["url"] for p in session["repos"][0]["pulls"]] for session in snapshot["sessions"]]
@@ -229,23 +216,40 @@ def test_two_forks_and_multiple_repos_do_not_share_foreign_heads(tmp_path, token
     assert [{p["url"] for p in s["repos"][0]["pulls"]} for s in again["sessions"]] == [set(p) for p in pulls[:3]]
 
 
-def test_parent_failure_cools_down_then_recovers(tmp_path, monkeypatch):
+def test_two_worktrees_of_one_origin_keep_their_own_remotes(tmp_path):
+    # Same origin, different declared destinations. The snapshot shares one
+    # query per origin/branch, so both sessions see the union; the per-checkout
+    # answer - the one the handlers use - must not leak upstream into the plain
+    # clone.
+    plain = _checkout(tmp_path / "plain", "alice/r")
+    forked = _checkout(tmp_path / "forked", "alice/r", "upstream/r")
+
+    def api_for(destination):
+        return _API(
+            {
+                "alice/r": [_node("alice/r", "alice/r", 1)],
+                destination: [_node(destination, "alice/r", 2)],
+            }
+        )
+
+    plain_api, fork_api = api_for("upstream/r"), api_for("upstream/r")
+    plain_pulls = handlers.github_status(str(plain), env=_Env(), transport=httpx.MockTransport(plain_api))["pulls"]
+    fork_pulls = handlers.github_status(str(forked), env=_Env(), transport=httpx.MockTransport(fork_api))["pulls"]
+    assert [p["number"] for p in plain_pulls] == [1]
+    assert [p["number"] for p in fork_pulls] == [1, 2]
+    assert not any("upstream" in r.url.path for r in plain_api.requests)
+    shared = _snapshot([plain, forked], api_for("upstream/r"))
+    assert [[p["number"] for p in session["repos"][0]["pulls"]] for session in shared["sessions"]] == [[1, 2], [1, 2]]
+
+
+def test_unconfigured_parent_is_never_searched(tmp_path):
+    # A fork of a fork only sees what it declares (#129): the middle remote
+    # must be configured, so no lineage probing is attempted.
     path = _checkout(tmp_path / "fork", "alice/r")
-    api = _API(
-        {"alice/r": [_node("alice/r", "alice/r", 1)], "upstream/r": [_node("upstream/r", "alice/r", 2)]},
-        {"alice/r": "upstream/r"},
-    )
-    api.metadata_status = 503
-    now = [100.0]
-    monkeypatch.setattr(lookup.time, "monotonic", lambda: now[0])
-    transport = httpx.MockTransport(api)
-    for _ in range(2):
-        assert [p["number"] for p in handlers.github_status(str(path), env=_Env(), transport=transport)["pulls"]] == [1]
-    assert sum(r.url.path == "/repos/alice/r" for r in api.requests) == 1
-    now[0] += lookup.PARENT_RETRY + 1
-    api.metadata_status = 200
-    assert {p["number"] for p in handlers.github_status(str(path), env=_Env(), transport=transport)["pulls"]} == {1, 2}
-    assert sum(r.url.path == "/repos/alice/r" for r in api.requests) == 2
+    api = _API({"alice/r": [_node("alice/r", "alice/r", 1)], "upstream/r": [_node("upstream/r", "alice/r", 2)]})
+    pulls = handlers.github_status(str(path), env=_Env(), transport=httpx.MockTransport(api))["pulls"]
+    assert [p["number"] for p in pulls] == [1]
+    assert not any("upstream" in r.url.path for r in api.requests)
 
 
 def test_digest_ignores_foreign_head_changes_but_observes_own(tmp_path):

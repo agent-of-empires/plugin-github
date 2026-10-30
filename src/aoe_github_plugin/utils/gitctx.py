@@ -42,12 +42,26 @@ def remote_owner_repo(path: str) -> tuple[str, str] | None:
     return parse_owner_repo(_git(path, "remote", "get-url", "origin"))
 
 
-def upstream_owner_repo(path: str) -> tuple[str, str] | None:
-    """Optional configured upstream, without changing origin's meaning."""
+def remote_owner_repos(path: str) -> list[tuple[str, str]]:
+    """Every configured GitHub remote's ``(owner, repo)``, origin first.
+
+    The checkout's own PR may live against any of them: a fork's PR targets the
+    upstream repository, so only searching origin misses it (#129). Non-GitHub
+    remotes are skipped rather than failing the lookup.
+    """
     try:
-        return parse_owner_repo(_git(path, "remote", "get-url", "upstream"))
+        names = _git(path, "remote").split()
     except GitHubError:
-        return None
+        return []
+    out: list[tuple[str, str]] = []
+    for name in sorted(names, key=lambda n: (n != "origin", n)):
+        try:
+            repo = parse_owner_repo(_git(path, "remote", "get-url", name))
+        except GitHubError:
+            continue
+        if repo is not None and repo not in out:
+            out.append(repo)
+    return out
 
 
 def current_branch(path: str) -> str:

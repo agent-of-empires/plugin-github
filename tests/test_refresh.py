@@ -68,11 +68,16 @@ def _make_submodule(parent, name):
 
 @pytest.fixture(autouse=True)
 def _clear_cache(monkeypatch):
-    # Polling fixtures isolate metadata; test_lookup exercises the real resolver.
-    monkeypatch.setattr(refresh.lookup, "repositories", lambda _client, origin, *_args, **_kwargs: [origin])
+    # Polling fixtures model a plain origin-only checkout; test_lookup exercises
+    # the real resolver against real remotes.
+    def _plain(path):
+        found = refresh.remote_owner_repos(path)
+        # Model an origin-only checkout: the first GitHub remote is the only one.
+        return found[:1]
+
+    monkeypatch.setattr(refresh, "_remote_repos", _plain)
 
     def _reset():
-        refresh.lookup._parent_cache.clear()
         refresh._etag_cache.clear()
         refresh._graphql_cache.clear()
         refresh._stack_cache.clear()
@@ -1919,3 +1924,48 @@ def test_cooldown_after_changed_probe_serves_rest_on_diverged_304(tmp_path):
     # Same cached probe list (ETag 304, unchanged set) -> the rich shape returns.
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(agreeing))
     assert len(snap["sessions"][0]["repos"][0]["pulls"]) == 1
+
+
+def test_fallback_rich_set_ignores_merged_pulls():
+    # The rich query returns OPEN and MERGED pulls (the pane renders merged
+    # ones); the REST probe only ever lists open ones. A cached merged pull must
+    # not look like a divergence, or a still-correct rich result is withheld.
+    rich = {"pulls": [{"url": "u1", "merged": False}, {"url": "u9", "merged": True}]}
+    pending = {"basic": [{"url": "u1"}], "rich": rich, "changed": False}
+    assert refresh._same_pull_set(pending["basic"], rich) is True
+    # The rich entry is served (it carries the merged pull), not the REST list.
+    fallback = refresh._fallback_pulls(pending)
+    assert {p["url"] for p in fallback["pulls"]} == {"u1", "u9"}
+    # A genuinely open pull that REST does not list is still a divergence.
+    assert refresh._same_pull_set([{"url": "u2"}], rich) is False
+
+
+def test_failed_query_keeps_rich_result_while_only_merged_pulls_differ(tmp_path):
+    # End-to-end: seed rich data for an open PR plus a merged one, then make
+    # every GraphQL call fail. The 304 probe agrees on the open set, so the
+    # cached rich result must be served rather than the merged-less REST shape.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    nodes = [_gql_node(number=1), _gql_node(number=9, state="MERGED", merged=True)]
+    transport = _rich_transport(nodes)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    cached = refresh._graphql_cache[("o", "r", "feature", "o", "r", False)]
+    assert {p["number"] for p in cached["pulls"]} == {1, 9}
+
+    def down(request):
+        if str(request.url).endswith("/graphql"):
+            # No ``data``: the repo-level error path that arms the cooldown.
+            return httpx.Response(200, json={"errors": [{"message": "boom"}]})
+        return httpx.Response(304)
+
+    # The failed query goes through `_resolve_null_repository` -> the rich
+    # fallback for this tick. The probe's open set (PR 1) agrees with the rich
+    # entry's open subset, so the rich result is still correct and must be kept.
+    down_transport = httpx.MockTransport(down)
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=down_transport, force=True)
+    pulls = snap["sessions"][0]["repos"][0]["pulls"]
+    # The REST probe only lists open PR 1; PR 9 survives solely because the
+    # rich cache was served instead of the basic fallback.
+    assert [p["number"] for p in pulls] == [1, 9]

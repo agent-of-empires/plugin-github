@@ -123,22 +123,23 @@ session-less `github.refresh` cover every session and prune vanished ones:
    child submodules are skipped by default; turn off `ignore_submodules` to
    include them.
 3. Resolve each checkout's origin and branch, then look for PRs targeting origin
-   or its configured GitHub `upstream`. Without an `upstream` remote, use
-   GitHub's direct-parent metadata for forks (cached for one hour; failed
-   metadata requests retry after one minute). No arbitrary remote or fork-network
-   search is performed. The head is always the checkout's own origin
-   repository; upstream/direct parent is only an additional destination, so a
+   or any other GitHub remote that checkout configures (an `upstream` remote, a
+   differently named one, or several). Destinations come only from configured
+   remotes: there is no metadata call and no fork-network or arbitrary remote
+   search, so a fork-of-fork needs its middle remote configured to be visible.
+   The head is always the checkout's own origin
+   repository; a configured upstream is only an additional destination, so a
    contributor's PR against upstream matches while an otherwise unrelated
    upstream-owned or third-party branch with the same name never does. Keep the
    checkout's origin identity and each PR's real head owner/repository; PR
    links, selection, and stack navigation use the destination repository. This
    applies to web snapshots and the direct-worker `github.status` / `github.open`
    handlers.
-   Metadata resolves only the direct parent (`parent`, not `source`), so a
-   fork-of-fork (`upstream/r <- bob/r <- alice/r`) never looks up PRs against the
-   root: configure an explicit `upstream` remote to reach a grandparent.
-   Deduplicate lookups by destination, branch, and head owner/repository, so
-   shared workspaces fetch once without mixing contributors' results.
+   Two worktrees of one origin can declare different remotes; the snapshot
+   shares one query per origin/branch, so it searches their union, while the
+   per-checkout handlers search only that checkout's own. Deduplicate lookups by
+   destination, branch, and head owner/repository, so shared workspaces fetch
+   once without mixing contributors' results.
    Same-repository PRs, fork-local PRs, and multi-repository sessions remain
    supported. Local git identity and REST lookups use bounded thread pools;
    GraphQL queries stay serial to respect GitHub's concurrency limits.

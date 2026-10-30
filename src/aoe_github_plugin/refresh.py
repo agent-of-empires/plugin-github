@@ -60,6 +60,7 @@ from aoe_github_plugin.errors import NotFoundError
 from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.handlers import _resolve_optional_token
 from aoe_github_plugin.utils.gitctx import parse_owner_repo
+from aoe_github_plugin.utils.gitctx import remote_owner_repos
 
 _LOG = logging.getLogger(__name__)
 
@@ -128,7 +129,7 @@ BACKOFF_SECS = 60.0
 MAX_BACKOFF_SECS = 3600.0
 
 RepoKey = lookup.PullKey
-CheckoutKey = tuple[str, str, str, str, str]  # origin owner/repo, branch, configured upstream owner/repo
+CheckoutKey = tuple[str, str, str]  # origin owner/repo, branch; remotes are per-checkout
 RichCacheKey = tuple[str, str, str, str, str, bool]
 StackCacheKey = tuple[str, str, int]
 StackRepoKey = tuple[str, str]
@@ -333,10 +334,17 @@ def _identify(path: str, branch_override: str | None = None) -> tuple[str | None
     branch = branch_override or _git(path, "rev-parse", "--abbrev-ref", "HEAD")
     if not branch or branch == "HEAD":
         return f"{owner}/{repo}", None
-    remote = _git(path, "remote", "get-url", "upstream")
-    upstream = parse_owner_repo(remote) if remote else None
-    upstream_owner, upstream_name = upstream or ("", "")
-    return f"{owner}/{repo}", (owner, repo, branch, upstream_owner, upstream_name)
+    return f"{owner}/{repo}", (owner, repo, branch)
+
+
+def _remote_repos(path: str) -> list[tuple[str, str]]:
+    """Destinations this checkout may target: its configured GitHub remotes.
+
+    Read per checkout, not per session or origin: two worktrees of the same
+    origin can declare different remotes, so a shared list would search
+    destinations another checkout never configured.
+    """
+    return remote_owner_repos(path)
 
 
 def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> list[tuple[str, str | None]]:
@@ -986,13 +994,19 @@ def _paginate_threads(client: GitHubClient, pull_node: dict[str, Any]) -> None:
 
 
 def _same_pull_set(basic: list[dict[str, Any]], rich: dict[str, Any] | None) -> bool:
-    """Whether the REST probe's current open-PR set equals the set the cached
-    rich entry was built from. The rich entry is only safe to serve while they
-    agree: a differing set means a PR opened or closed since, and the rich list
-    would hide the new one or resurrect the closed one."""
+    """Whether the REST probe's current open-PR set equals the set of OPEN
+    pulls the cached rich entry was built from. The rich entry is only safe to
+    serve while they agree: a differing set means a PR opened or closed since,
+    and the rich list would hide the new one or resurrect the closed one.
+
+    The rich query also returns MERGED pulls (the pane renders them), so they
+    are excluded here: they are absent from the basic list by construction and
+    would otherwise never match, withholding a rich result that is still
+    correct for every open PR."""
     if rich is None:
         return False
-    return {pr.get("url") for pr in basic} == {pr.get("url") for pr in rich.get("pulls") or []}
+    open_rich = [pr for pr in rich.get("pulls") or [] if not pr.get("merged")]
+    return {pr.get("url") for pr in basic} == {pr.get("url") for pr in open_rich}
 
 
 def _fallback_pulls(pending: dict[str, Any]) -> dict[str, Any]:
@@ -1404,14 +1418,14 @@ def _fetch_rich(
     return out
 
 
-def _session_fingerprint(keys: list[RepoKey]) -> tuple[RepoKey, ...]:
+def _session_fingerprint(keys: list[CheckoutKey]) -> tuple[CheckoutKey, ...]:
     """Stable identity for the GitHub data a session pane displays."""
     return tuple(sorted(set(keys)))
 
 
 def _session_freshness(
     session_id: Any,
-    fingerprint: tuple[RepoKey, ...],
+    fingerprint: tuple[CheckoutKey, ...],
     results: list[dict[str, Any]],
     refreshed_at: str,
 ) -> dict[str, Any] | None:
@@ -1440,7 +1454,7 @@ def _session_freshness(
 
 
 def _fetch_all(
-    keys: set[CheckoutKey],
+    destinations: dict[CheckoutKey, list[tuple[str, str]]],
     env: TokenEnvironment | None,
     transport: httpx.BaseTransport | None,
     *,
@@ -1457,18 +1471,14 @@ def _fetch_all(
     pool (#70); GraphQL is batched per repo and stays serialized (sorted for
     determinism), to stay under GitHub's secondary/concurrency limits (#22);
     none of this touches stdin or host RPCs."""
-    if not keys:
+    if not destinations:
         return {}, True
     token = _resolve_optional_token(env)
     present = token is not None
     by_checkout: dict[CheckoutKey, list[RepoKey]] = {}
     with GitHubClient(token=token, transport=transport) as client:
-        for key in sorted(keys):
-            with _cache_lock:
-                metadata_allowed = time.monotonic() >= _backoff["rest"]["until"]
-            upstream = (key[3], key[4]) if key[3] else None
-            repos = lookup.repositories(client, (key[0], key[1]), upstream, metadata_allowed=metadata_allowed)
-            by_checkout[key] = lookup.pull_keys(repos, key[2])
+        for key in sorted(destinations):
+            by_checkout[key] = lookup.pull_keys(destinations[key], key[2])
         ordered = sorted({candidate for candidates in by_checkout.values() for candidate in candidates})
         if present:
             fetched = _fetch_rich(client, ordered, force=force, required_checks_only=required_checks_only)
@@ -1496,6 +1506,58 @@ def _fetch_all(
             result["error"] = origin["error"]
         results[key] = result
     return results, present
+
+
+@dataclass(frozen=True)
+class _Resolved:
+    """One checkout's query identity plus the destinations it may target."""
+
+    path_key: tuple[str, str | None]
+    repo: str | None
+    key: CheckoutKey | None
+    remotes: list[tuple[str, str]]
+
+
+def _resolve_checkouts(
+    sessions: list[dict[str, Any]], settings: SnapshotSettings
+) -> tuple[
+    list[tuple[dict[str, Any], list[tuple[str, str | None]]]],
+    dict[tuple[str, str | None], tuple[str | None, CheckoutKey | None]],
+    dict[CheckoutKey, list[tuple[str, str]]],
+]:
+    """Discover each session's checkouts, then each checkout's identity and remotes.
+
+    Returns the per-session checkout pairs, the identity map keyed by
+    ``(realpath, branch)``, and the destinations keyed by query key. Remotes are
+    read per checkout: two worktrees of one origin can declare different ones, so
+    a shared list would search destinations another checkout never configured.
+    """
+
+    def _discover(session: dict[str, Any]) -> list[tuple[str, str | None]]:
+        return _session_checkouts(session, ignore_submodules=settings.ignore_submodules)
+
+    def _checkout(item: tuple[tuple[str, str | None], str]) -> _Resolved:
+        """Identity and remotes for one checkout, read once in the shared pool."""
+        (path, branch), checkout = item
+        repo, key = _identify(checkout, branch)
+        return _Resolved((path, branch), repo, key, _remote_repos(checkout))
+
+    with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
+        per_session = list(zip(sessions, pool.map(_discover, sessions), strict=True))
+        reps: dict[tuple[str, str | None], str] = {}
+        for _, checkouts in per_session:
+            for checkout, branch in checkouts:
+                reps.setdefault((os.path.realpath(checkout), branch), checkout)
+        resolved: list[_Resolved] = list(pool.map(_checkout, reps.items()))
+    ident = {found.path_key: (found.repo, found.key) for found in resolved}
+    # Union, not overwrite: two worktrees of one origin share a query key but
+    # can declare different remotes. Both are real destinations for that key.
+    destinations: dict[CheckoutKey, list[tuple[str, str]]] = {}
+    for found in resolved:
+        if found.key is not None:
+            merged = destinations.setdefault(found.key, [])
+            merged.extend(repo for repo in found.remotes if repo not in merged)
+    return per_session, ident, destinations
 
 
 def build_snapshot(
@@ -1526,21 +1588,9 @@ def build_snapshot(
     ``transport`` are test seams.
     """
 
-    def _discover(session: dict[str, Any]) -> list[tuple[str, str | None]]:
-        return _session_checkouts(session, ignore_submodules=settings.ignore_submodules)
-
-    with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
-        per_session = list(zip(sessions, pool.map(_discover, sessions), strict=True))
-        reps: dict[tuple[str, str | None], str] = {}
-        for _, checkouts in per_session:
-            for checkout, branch in checkouts:
-                reps.setdefault((os.path.realpath(checkout), branch), checkout)
-        ident: dict[tuple[str, str | None], tuple[str | None, CheckoutKey | None]] = dict(
-            zip(reps.keys(), pool.map(lambda item: _identify(item[1], item[0][1]), reps.items()), strict=True)
-        )
-    keys: set[CheckoutKey] = {key for _, key in ident.values() if key is not None}
+    per_session, ident, destinations = _resolve_checkouts(sessions, settings)
     fetched, auth_present = _fetch_all(
-        keys,
+        destinations,
         env,
         transport,
         force=force,
@@ -1550,7 +1600,7 @@ def build_snapshot(
     out_sessions: list[dict[str, Any]] = []
     for session, checkouts in per_session:
         repos: list[dict[str, Any]] = []
-        session_keys: list[RepoKey] = []
+        session_keys: list[CheckoutKey] = []
         for checkout, branch in checkouts:
             repo_str, key = ident[(os.path.realpath(checkout), branch)]
             entry: dict[str, Any] = {
