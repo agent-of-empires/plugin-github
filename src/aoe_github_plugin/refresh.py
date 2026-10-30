@@ -985,6 +985,16 @@ def _paginate_threads(client: GitHubClient, pull_node: dict[str, Any]) -> None:
         return
 
 
+def _same_pull_set(basic: list[dict[str, Any]], rich: dict[str, Any] | None) -> bool:
+    """Whether the REST probe's current open-PR set equals the set the cached
+    rich entry was built from. The rich entry is only safe to serve while they
+    agree: a differing set means a PR opened or closed since, and the rich list
+    would hide the new one or resurrect the closed one."""
+    if rich is None:
+        return False
+    return {pr.get("url") for pr in basic} == {pr.get("url") for pr in rich.get("pulls") or []}
+
+
 def _fallback_pulls(pending: dict[str, Any]) -> dict[str, Any]:
     """Per-key result when GraphQL could not produce fresh data: the last-good
     rich cache if present, else the basic REST open-PR pulls. Never an error and
@@ -1101,7 +1111,9 @@ def _apply_aliases(
                 _truncated_until[_rich_cache_key(key, required_checks_only=required_checks_only)] = (
                     now + GRAPHQL_TRUNCATED_RETRY
                 )
-            out[key] = _pulls_result(pending[key]["basic"], fresh=pending[key]["rest_fresh"])
+            out[key] = _pulls_result(
+                pending[key]["basic"], fresh=pending[key]["rest_fresh"], stale=not pending[key]["rest_fresh"]
+            )
             continue
         # Compute the ownership-filtered signature before thread pagination.
         digest = graphql.digest_signature(conn)
@@ -1345,16 +1357,20 @@ def _fetch_rich(
             # spend nothing until the cooldown lapses (#71). A forced refresh
             # bypasses it, since the user asked for a live attempt.
             out[key] = _fallback_pulls(entry)
+        elif not force and truncated and rich is not None and _same_pull_set(basic, rich):
+            # The REST probe's current open-PR set equals the set the rich entry
+            # was built from, so that entry is still accurate even though no
+            # query ran; hiding it would drop every rich field for the whole
+            # window. A differing set means a PR opened or closed since, and the
+            # rich list would hide the new one or resurrect the closed one, so
+            # the current basic pulls are served instead.
+            out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True)
         elif not force and truncated:
             # This page truncated recently: another full query would spend
             # budget to be discarded again. A changed REST probe still reflects
-            # the current PR set, so prefer it; otherwise serve the cached rich
-            # result, and with neither, the basic pulls, every time reporting
-            # the probe's own freshness rather than asserting fresh.
-            if changed or rich is None:
-                out[key] = _pulls_result(basic, fresh=_fresh)
-            else:
-                out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True)
+            # the current PR set, so prefer it; otherwise serve the basic pulls,
+            # reporting the probe's own freshness rather than asserting fresh.
+            out[key] = _pulls_result(basic, fresh=_fresh, stale=not _fresh)
         elif rich is None or force or changed or rich.get("digest") is None or _full_stale(rich, now):
             full_pending[key] = entry
         elif _digest_stale(rich, now):

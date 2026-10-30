@@ -382,7 +382,12 @@ def _rich_transport(nodes, *, etag='W/"v1"', remaining=5000, errors=None, gql=No
             return httpx.Response(200, json=body)
         if request.headers.get("If-None-Match") == etag:
             return httpx.Response(304)
-        return httpx.Response(200, headers={"ETag": etag}, json=[_pull()])
+        # The REST list mirrors the rich nodes this transport fronts, so a warm
+        # rich cache describes the same open PRs (see ``_same_pull_set``). With no
+        # nodes it still lists one PR: the "rich saw nothing, REST sees one"
+        # divergence the fallback tests exercise.
+        listed = [_pull(number=n["number"]) for n in nodes] or [_pull()]
+        return httpx.Response(200, headers={"ETag": etag}, json=listed)
 
     return httpx.MockTransport(handler)
 
@@ -894,7 +899,7 @@ def test_graphql_failure_falls_back_to_basic_pulls(tmp_path):
     snap = refresh.build_snapshot(
         sessions,
         env=_Env(),
-        transport=_rich_transport([], errors=[{"message": "boom"}]),
+        transport=_rich_transport([_gql_node(number=12)], errors=[{"message": "boom"}]),
     )
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 12
 
@@ -1017,7 +1022,12 @@ def _batched_handler(by_branch, *, gql=None, etag='W/"v1"'):
             return httpx.Response(200, json=body)
         if request.headers.get("If-None-Match") == etag:
             return httpx.Response(304)
-        return httpx.Response(200, headers={"ETag": etag}, json=[_pull()])
+        # The REST list must agree with the rich set: a warm rich cache is only
+        # served while both describe the same open PRs.
+        branch = request.url.params.get("head", ":feature").split(":", 1)[1]
+        return httpx.Response(
+            200, headers={"ETag": etag}, json=[_pull(branch=branch) for _ in by_branch.get(branch, [])]
+        )
 
     return httpx.MockTransport(handler)
 
@@ -1045,9 +1055,8 @@ def test_partial_alias_failure_isolates_to_its_key(tmp_path):
     _make_repo(ws / "b", branch="b2")
     sessions = [{"id": "s1", "project_path": str(ws)}]
     # Seed both branches' rich cache (numbers 1 and 2).
-    refresh.build_snapshot(
-        sessions, env=_Env(), transport=_batched_handler({"b1": [_gql_node(number=1)], "b2": [_gql_node(number=2)]})
-    )
+    seeds = {"b1": [_gql_node(number=1)], "b2": [_gql_node(number=2)]}
+    refresh.build_snapshot(sessions, env=_Env(), transport=_batched_handler(seeds))
 
     # Forced refresh where the b2-branch alias (b1, by sorted order) errors via
     # errors[].path while the b1-branch alias (b0) returns fresh data. The REST
@@ -1066,7 +1075,14 @@ def test_partial_alias_failure_isolates_to_its_key(tmp_path):
             return httpx.Response(200, json=body)
         if request.headers.get("If-None-Match") == 'W/"v1"':
             return httpx.Response(304)
-        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+        # REST mirrors each branch's seeded rich set; otherwise the richer cache
+        # could not be served (see ``_same_pull_set``).
+        branch = request.url.params.get("head", ":x").split(":", 1)[1]
+        return httpx.Response(
+            200,
+            headers={"ETag": 'W/"v1"'},
+            json=[_pull(number=n["number"], branch=branch) for n in seeds.get(branch, [])],
+        )
 
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler), force=True)
     by_branch = {r["branch"]: r for r in snap["sessions"][0]["repos"]}

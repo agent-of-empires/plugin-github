@@ -435,7 +435,10 @@ _KEY = ("team", "r", "feature", "team", "team/r")
 class _StubClient:
     """Records GraphQL spends; its conditional probe answers 304 from the cache."""
 
-    def __init__(self):
+    def __init__(self, key=None, cached_pulls=None, *, changed=False):
+        self.key = key
+        self.cached_pulls = cached_pulls if cached_pulls is not None else []
+        self.changed = changed
         self.asked = []
 
     def post_json(self, path, payload, **_kwargs):
@@ -443,6 +446,11 @@ class _StubClient:
         return {"data": {}}
 
     def get_json_conditional(self, path, params, etag):
+        if self.changed:
+            # A conditional probe whose etag differed: full list, confirmed current.
+            return 200, '"new"', self.cached_pulls
+        # 304 with a warm cache: the probe serves the cached list as stale.
+        refresh._etag_cache[self.key] = {"etag": '"etag"', "pulls": self.cached_pulls}
         return 304, '"etag"', []
 
     def get_json(self, path, params=None):
@@ -496,6 +504,90 @@ def test_truncated_key_reports_probe_freshness_not_fresh(tmp_path):
     assert stub.asked == []  # the marker suppressed the full query entirely
     assert [p["number"] for p in repo["pulls"]] == [2]
     assert repo["_fresh"] is False  # a backoff-served probe is not reported fresh
+    # `_session_freshness` gates on `_stale`, so a stale probe must not advance
+    # the displayed freshness timestamp.
+    assert repo["_stale"] is True
+
+
+def test_truncated_window_serves_rest_when_rich_set_diverged(tmp_path):
+    # During a truncation window a 304 reports changed=False. If a PR opened in
+    # the meantime the rich entry no longer matches the REST set, and serving it
+    # would hide the new PR for the whole window. Only a matching set may serve.
+    key = lookup.pull_keys([("team", "r")], "feature")[0]
+    cache_key = refresh._rich_cache_key(key, required_checks_only=False)
+    old = _rest(_node("team/r", "team/r", 2))
+    new = _rest(_node("team/r", "team/r", 3, branch="feature"))
+    refresh._graphql_cache[cache_key] = {
+        "pulls": [old],
+        "digest": "d",
+        "fetched_at": 0.0,
+        "validated_at": 0.0,
+    }
+    refresh._truncated_until.clear()
+    refresh._truncated_until[cache_key] = float("inf")
+    refresh._etag_cache[key] = {"etag": '"etag"', "pulls": [old, new]}
+
+    # A changed probe is the divergence signal; the rich list must not win.
+    changed_stub = _StubClient(key, [old, new], changed=True)
+    repo = refresh._fetch_rich(changed_stub, [key], force=False, required_checks_only=False)[key]
+    assert [p["number"] for p in repo["pulls"]] == [2, 3]
+    assert repo["_stale"] is False  # the fresh REST list does not claim stale
+
+    # Even an unchanged probe must not serve a rich set that disagrees with REST.
+    stub = _StubClient(key, [old, new])
+    diverged = refresh._fetch_rich(stub, [key], force=False, required_checks_only=False)[key]
+    assert [p["number"] for p in diverged["pulls"]] == [2, 3]
+    assert diverged["_stale"] is False  # a 304 list is confirmed current
+
+    # With the sets agreeing, the richer cached shape is still served.
+    refresh._etag_cache[key] = {"etag": '"etag"', "pulls": [old]}
+    same = refresh._fetch_rich(_StubClient(key, [old]), [key], force=False, required_checks_only=False)[key]
+    assert [p["number"] for p in same["pulls"]] == [2]
+    assert same["_stale"] is True
+
+
+def test_truncated_window_with_rest_backoff_keeps_freshness_stamp(tmp_path):
+    # The thread's scenario end to end: a truncation is recorded, then a tick is
+    # served from the REST backoff cache. No GraphQL query may be spent, and the
+    # displayed freshness stamp must not advance.
+    refresh._truncated_until.clear()  # isolate markers seeded by earlier tests
+    path = _checkout(tmp_path / "repo", "team/r")
+    team_pull = _node("team/r", "team/r", 2)
+    foreign = [_node("team/r", f"stranger{i}/r", i + 10) for i in range(105)]
+    api = _API({"team/r": [*foreign, team_pull]})
+    queries = []
+
+    def handler(request):
+        if request.url.path == "/graphql":
+            variables = json.loads(request.content)["variables"]
+            queries.append(variables)
+            matching = [n for n in api.nodes.get("team/r", []) if n["headRefName"] == variables["b0"]]
+            page = matching[:100]
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                        "repository": {"b0": {"nodes": page, "pageInfo": {"hasNextPage": len(matching) > len(page)}}},
+                    }
+                },
+            )
+        return api(request)
+
+    transport = httpx.MockTransport(handler)
+    first = refresh.build_snapshot([{"id": "s", "project_path": str(path)}], env=_Env(token=True), transport=transport)
+    stamp = first["sessions"][0]["freshness"]["refreshed_at"]
+    assert refresh._truncated_until != {}
+    assert len(queries) == 1
+
+    refresh._backoff["rest"]["until"] = float("inf")
+    second = refresh.build_snapshot([{"id": "s", "project_path": str(path)}], env=_Env(token=True), transport=transport)
+    repo = second["sessions"][0]["repos"][0]
+    assert len(queries) == 1  # no GraphQL query spent
+    assert [p["number"] for p in repo["pulls"]] == [2]
+    freshness = second["sessions"][0]["freshness"]
+    assert freshness["stale"] is True
+    assert freshness["refreshed_at"] == stamp  # the stamp did not advance
 
 
 def test_origin_empty_upstream_error_keeps_status_failsoft(tmp_path):
