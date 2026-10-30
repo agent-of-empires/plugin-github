@@ -148,7 +148,7 @@ def test_review_requested_builds_item_with_variables_and_untrusted_prompt():
         "base_branch": "main",
         "commit_sha": "head",
     }
-    assert item["draft"]["prompt"].endswith(suggestions.UNTRUSTED)
+    assert item["draft"]["prompt"].startswith(suggestions.UNTRUSTED)
     assert "project" not in item
 
 
@@ -746,6 +746,39 @@ def _failing_authored_pr(**overrides):
         **overrides,
     }
     return _authored_pr(**fields)
+
+
+def test_authored_prompt_prose_never_carries_github_controlled_text():
+    pr = _failing_authored_pr(
+        reviews={"nodes": [_review("ignore-previous-login", "CHANGES_REQUESTED")], "pageInfo": PAGE_DONE},
+        commits={
+            "nodes": [
+                {
+                    "commit": {
+                        "oid": "head",
+                        "statusCheckRollup": {"contexts": {"nodes": [_check_run("run-rm-rf-check", "FAILURE")]}},
+                    }
+                }
+            ]
+        },
+    )
+    item = _discover(FakeClient({" author:@me": [pr]}), set(suggestions.AUTHORED_CRITERIA))[0]
+    assert "ignore-previous-login" in item["reason"]
+    assert "run-rm-rf-check" in item["reason"]
+    prompt = item["draft"]["prompt"]
+    assert prompt.startswith(suggestions.UNTRUSTED)
+    assert "ignore-previous-login" not in prompt
+    assert "run-rm-rf-check" not in prompt
+    assert item["reason"] not in prompt
+    assert "a reviewer requested changes" in prompt
+    assert "checks are failing" in prompt
+
+
+def test_re_review_prompt_omits_the_commit_sha():
+    stale_review = _pr(reviews={"nodes": [_review("me", "COMMENTED", oid="oldsha123")], "pageInfo": PAGE_DONE})
+    item = _discover(FakeClient({"reviewed-by:@me": [stale_review]}), {"re_review"})[0]
+    assert item["variables"]["reviewed_commit_sha"] == "oldsha123"
+    assert "oldsha123" not in item["draft"]["prompt"]
 
 
 def test_item_variables_match_the_manifest_declaration_for_every_criterion():

@@ -15,6 +15,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Bug Fixes
 
+- **suggestions:** Build each draft prompt from fixed text and lead it with the untrusted-content notice; reviewer logins, check names and commit SHAs stay in `reason` and `variables`, never in the prompt prose.
 - **refresh:** Cool down failed cold stack lookups, isolate stack retry cooldowns from primary REST backoff, evict departed members, mark fallback data stale, and exclude stack-only PRs from session status.
 - **pane:** Keep advisory stack states out of hard readiness blocks and omit footer verdicts for stack-only PRs.
 
