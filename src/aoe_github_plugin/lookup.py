@@ -34,18 +34,24 @@ def repositories(
         cache_key = origin[0].casefold(), origin[1].casefold()
         with _parent_lock:
             cached = _parent_cache.get(cache_key)
-            upstream = cached[1] if cached else None
-            now = time.monotonic()
-            if metadata_allowed and (cached is None or now >= cached[0]):
-                try:
-                    data = client.get_json(f"/repos/{origin[0]}/{origin[1]}")
-                    parent = data.get("parent") if isinstance(data, dict) else None
-                    owner = (parent.get("owner") or {}).get("login") if isinstance(parent, dict) else None
-                    name = parent.get("name") if isinstance(parent, dict) else None
-                    upstream = (owner, name) if isinstance(owner, str) and isinstance(name, str) else None
-                except GitHubError:
+        upstream = cached[1] if cached else None
+        now = time.monotonic()
+        if metadata_allowed and (cached is None or now >= cached[0]):
+            # Never hold the lock across the request: metadata is fetched for
+            # every cold checkout, and a slow parent must not stall other
+            # lookups. A racing caller may repeat the request; the last write
+            # wins and both observe the same answer.
+            try:
+                data = client.get_json(f"/repos/{origin[0]}/{origin[1]}")
+                parent = data.get("parent") if isinstance(data, dict) else None
+                owner = (parent.get("owner") or {}).get("login") if isinstance(parent, dict) else None
+                name = parent.get("name") if isinstance(parent, dict) else None
+                upstream = (owner, name) if isinstance(owner, str) and isinstance(name, str) else None
+            except GitHubError:
+                with _parent_lock:
                     _parent_cache[cache_key] = now + PARENT_RETRY, upstream
-                else:
+            else:
+                with _parent_lock:
                     _parent_cache[cache_key] = now + PARENT_TTL, upstream
     repos = [origin]
     if upstream and tuple(s.casefold() for s in upstream) != tuple(s.casefold() for s in origin):
@@ -61,7 +67,7 @@ def pull_keys(repos: list[Repository], branch: str) -> list[PullKey]:
     same-name branch never does.
     """
     origin = repos[0]
-    return [(owner, repo, branch, *origin) for owner, repo in repos]
+    return [(owner, repo, branch, *origin) for owner, repo in dict.fromkeys(repos)]
 
 
 def matches_head(head: Any, key: PullKey) -> bool:
