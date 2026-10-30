@@ -391,6 +391,113 @@ def test_truncated_page_serves_rest_without_cooldown_on_busy_branch(tmp_path):
     assert len(graphql_queries) == 2
 
 
+def test_head_filter_pages_past_first_hundred(tmp_path):
+    # head=owner:branch is scoped by head OWNER, so one owner with the same
+    # branch open against many repositories of a destination can exceed a page.
+    # The owned PR only appears on page 2; a single-page read would miss it.
+    path = _checkout(tmp_path / "repo", "team/r")
+    team_pull = _node("team/r", "team/r", 7)
+    page_one = [_rest(_node("team/r", "team/other", n)) for n in range(100, 200)]
+    page_two = [_rest(team_pull)]
+    pages = []
+
+    def handler(request):
+        if request.url.path != "/repos/team/r/pulls":
+            return httpx.Response(200, json={})  # repository metadata probe
+        assert request.url.params["head"] == "team:feature"
+        page = int(request.url.params.get("page", "1"))
+        pages.append(page)
+        return httpx.Response(200, json=page_one if page == 1 else page_two)
+
+    status = handlers.github_status(str(path), env=_Env(), transport=httpx.MockTransport(handler))
+    assert pages == [1, 2]  # a short page ended the loop
+    assert [p["number"] for p in status["pulls"]] == [7]
+
+
+def test_head_filter_pagination_is_bounded(tmp_path):
+    # A destination that keeps returning full pages must not spin forever.
+    path = _checkout(tmp_path / "repo", "team/r")
+    pages = []
+
+    def handler(request):
+        if request.url.path != "/repos/team/r/pulls":
+            return httpx.Response(200, json={})
+        pages.append(int(request.url.params.get("page", "1")))
+        return httpx.Response(200, json=[_rest(_node("team/r", "team/other", n)) for n in range(100)])
+
+    handlers.github_status(str(path), env=_Env(), transport=httpx.MockTransport(handler))
+    assert len(pages) == lookup.MAX_PULL_PAGES
+
+
+_KEY = ("team", "r", "feature", "team", "team/r")
+
+
+class _StubClient:
+    """Records GraphQL spends; its conditional probe answers 304 from the cache."""
+
+    def __init__(self):
+        self.asked = []
+
+    def post_json(self, path, payload, **_kwargs):
+        self.asked.append(payload)
+        return {"data": {}}
+
+    def get_json_conditional(self, path, params, etag):
+        return 304, '"etag"', []
+
+    def get_json(self, path, params=None):
+        self.pages.append(params.get("page"))
+        return self.pulls
+
+
+def test_truncated_key_reports_probe_freshness_not_fresh(tmp_path):
+    # While a truncation marker is live, the REST probe may itself be serving a
+    # cached list because of a REST backoff. That must not be reported fresh.
+    path = _checkout(tmp_path / "repo", "team/r")
+    team_pull = _node("team/r", "team/r", 2)
+    foreign = [_node("team/r", f"stranger{i}/r", i + 10) for i in range(105)]
+    api = _API({"team/r": [*foreign, team_pull]})
+    queries = []
+
+    def handler(request):
+        if request.url.path == "/graphql":
+            variables = json.loads(request.content)["variables"]
+            queries.append(variables)
+            matching = [n for n in api.nodes.get("team/r", []) if n["headRefName"] == variables["b0"]]
+            page = matching[:100]
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                        "repository": {"b0": {"nodes": page, "pageInfo": {"hasNextPage": len(matching) > len(page)}}},
+                    }
+                },
+            )
+        return api(request)
+
+    transport = httpx.MockTransport(handler)
+    refresh.build_snapshot([{"id": "s", "project_path": str(path)}], env=_Env(token=True), transport=transport)
+    assert refresh._truncated_until != {}
+
+    # A probe that fails (error or rate limit) takes the fail-soft branch and
+    # never consults the marker, so the marker branch is driven directly with a
+    # probe that changed nothing and is NOT fresh (a backoff-served 304).
+    # A probe that fails (error or rate limit) takes the fail-soft branch and
+    # never consults the marker, so the marker branch is driven directly: a
+    # changed-nowhere probe whose own list came from the backoff-served cache.
+    key = lookup.pull_keys([("team", "r")], "feature")[0]
+    refresh._graphql_cache.clear()
+    refresh._truncated_until = {refresh._rich_cache_key(key, required_checks_only=False): float("inf")}
+    refresh._etag_cache[key] = {"etag": '"etag"', "pulls": [_rest(team_pull)]}
+    refresh._backoff["rest"]["until"] = float("inf")
+    stub = _StubClient()
+    repo = refresh._fetch_rich(stub, [key], force=False, required_checks_only=False)[key]
+    assert stub.asked == []  # the marker suppressed the full query entirely
+    assert [p["number"] for p in repo["pulls"]] == [2]
+    assert repo["_fresh"] is False  # a backoff-served probe is not reported fresh
+
+
 def test_origin_empty_upstream_error_keeps_status_failsoft(tmp_path):
     path = _checkout(tmp_path / "fork", "alice/r", "upstream/r")
     api = _API({})  # no open origin PRs for feature
