@@ -35,7 +35,7 @@ SIGN_IN_FIX = "Run `gh auth login`, or set GITHUB_TOKEN."
 SKIPPED = "Skipped until the plugin is signed in to GitHub."
 
 
-def _check(check_id: str, label: str, status: str, detail: str = "", fix: str = "") -> dict[str, Any]:
+def check(check_id: str, label: str, status: str, detail: str = "", fix: str = "") -> dict[str, Any]:
     check: dict[str, Any] = {
         "id": suggestions.clamp(check_id, ID_BYTES),
         "label": suggestions.clamp(label, LABEL_BYTES),
@@ -110,8 +110,8 @@ def _graphql_checks(
     except UnauthorizedError:
         fix = "Sign in again with `gh auth login`, or set a fresh GITHUB_TOKEN."
         return (
-            _check("logged_in", "Signed in to GitHub", "fail", "GitHub rejected the token.", fix),
-            _check("read_repositories", "Can read repositories", "warn", SKIPPED),
+            check("logged_in", "Signed in to GitHub", "fail", "GitHub rejected the token.", fix),
+            check("read_repositories", "Can read repositories", "warn", SKIPPED),
             True,
         )
     except RateLimitedError:
@@ -121,13 +121,13 @@ def _graphql_checks(
         return _unverified("GitHub rate limited; will check again later.")
     except (GitHubError, TypeError) as exc:
         return _unverified(_first_line(exc))
-    signed_in = _check("logged_in", "Signed in to GitHub", "ok", f"Signed in as {login}.")
+    signed_in = check("logged_in", "Signed in to GitHub", "ok", f"Signed in as {login}.")
     if unreadable:
         shown = ", ".join(unreadable)
         fix = "Grant the token access to them, or remove them from the repository and organization settings."
         return (
             signed_in,
-            _check("read_repositories", "Can read repositories", "fail", f"Cannot read: {shown}.", fix),
+            check("read_repositories", "Can read repositories", "fail", f"Cannot read: {shown}.", fix),
             False,
         )
     detail = (
@@ -135,13 +135,13 @@ def _graphql_checks(
         if entries
         else "No scope configured; every repository the token can see."
     )
-    return signed_in, _check("read_repositories", "Can read repositories", "ok", detail), False
+    return signed_in, check("read_repositories", "Can read repositories", "ok", detail), False
 
 
 def _unverified(reason: str) -> tuple[dict[str, Any], dict[str, Any], bool]:
     return (
-        _check("logged_in", "Signed in to GitHub", "warn", f"A token was found but not verified: {reason}"),
-        _check("read_repositories", "Can read repositories", "warn", f"Not verified: {reason}"),
+        check("logged_in", "Signed in to GitHub", "warn", f"A token was found but not verified: {reason}"),
+        check("read_repositories", "Can read repositories", "warn", f"Not verified: {reason}"),
         False,
     )
 
@@ -149,19 +149,19 @@ def _unverified(reason: str) -> tuple[dict[str, Any], dict[str, Any], bool]:
 def _notifications_check(client: GitHubClient) -> dict[str, Any]:
     label = "Notifications scope"
     if _backed_off("rest"):
-        return _check("notifications_scope", label, "warn", "GitHub rate limited; will check again later.")
+        return check("notifications_scope", label, "warn", "GitHub rate limited; will check again later.")
     try:
         client.get_json("/notifications", {"per_page": "1"})
     except InsufficientScopeError:
         fix = "Run `gh auth refresh -s notifications`, or give GITHUB_TOKEN the notifications scope."
         detail = "The token cannot read notifications, so mentions are not suggested."
-        return _check("notifications_scope", label, "fail", detail, fix)
+        return check("notifications_scope", label, "fail", detail, fix)
     except RateLimitedError:
         refresh.arm_backoff("rest")
-        return _check("notifications_scope", label, "warn", "GitHub rate limited; will check again later.")
+        return check("notifications_scope", label, "warn", "GitHub rate limited; will check again later.")
     except GitHubError as exc:
-        return _check("notifications_scope", label, "warn", f"Not verified: {_first_line(exc)}")
-    return _check("notifications_scope", label, "ok", "The token can read notifications.")
+        return check("notifications_scope", label, "warn", f"Not verified: {_first_line(exc)}")
+    return check("notifications_scope", label, "ok", "The token can read notifications.")
 
 
 def run_checks(
@@ -182,17 +182,17 @@ def run_checks(
     except GitHubAuthError as exc:
         failure = exc
     if installed:
-        cli = _check("gh_installed", "GitHub CLI installed", "ok")
+        cli = check("gh_installed", "GitHub CLI installed", "ok")
     else:
         # gh is only a token source: a token from the environment makes it optional.
-        cli = _check(
+        cli = check(
             "gh_installed",
             "GitHub CLI installed",
             "warn" if token else "fail",
             "The `gh` command was not found." + (" A token from the environment is in use." if token else ""),
             "Install the GitHub CLI from https://cli.github.com/.",
         )
-    notifications_off = _check("notifications_scope", "Notifications scope", "ok", "Not needed: mentions are off.")
+    notifications_off = check("notifications_scope", "Notifications scope", "ok", "Not needed: mentions are off.")
     if token is None:
         fix = (
             "Install the GitHub CLI and run `gh auth login`, or set GITHUB_TOKEN."
@@ -201,9 +201,9 @@ def run_checks(
         )
         return [
             cli,
-            _check("logged_in", "Signed in to GitHub", "fail", _first_line(failure or RuntimeError("no token")), fix),
-            _check("read_repositories", "Can read repositories", "warn", SKIPPED),
-            _check("notifications_scope", "Notifications scope", "warn", SKIPPED)
+            check("logged_in", "Signed in to GitHub", "fail", _first_line(failure or RuntimeError("no token")), fix),
+            check("read_repositories", "Can read repositories", "warn", SKIPPED),
+            check("notifications_scope", "Notifications scope", "warn", SKIPPED)
             if mentioned_enabled
             else notifications_off,
         ]
@@ -217,7 +217,7 @@ def run_checks(
         if not mentioned_enabled:
             notifications = notifications_off
         elif rejected:
-            notifications = _check("notifications_scope", "Notifications scope", "warn", SKIPPED)
+            notifications = check("notifications_scope", "Notifications scope", "warn", SKIPPED)
         else:
             notifications = _notifications_check(client)
     return [cli, logged_in, readable, notifications]

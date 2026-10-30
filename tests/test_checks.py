@@ -198,7 +198,7 @@ def test_each_budget_gate_skips_only_its_own_probe(monkeypatch):
 
 
 def test_strings_are_clamped_by_utf8_bytes():
-    check = checks._check("i" * 300, "é" * 400, "warn", "d" * 5000, "f" * 5000)
+    check = checks.check("i" * 300, "é" * 400, "warn", "d" * 5000, "f" * 5000)
     assert len(check["id"].encode()) <= checks.ID_BYTES
     assert len(check["label"].encode()) <= checks.LABEL_BYTES
     assert len(check["detail"].encode()) <= checks.TEXT_BYTES

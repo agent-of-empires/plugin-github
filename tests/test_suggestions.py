@@ -556,6 +556,8 @@ def _host(sources=None, projects=None, settings=None, calls=None, set_result=Non
             calls.append((method, params))
         if method == main.SUGGESTIONS_SET:
             return {"ok": True, "accepted": 1, "dropped": 0} if set_result is None else set_result
+        if method == main.SUGGESTIONS_CHECKS_SET:
+            return {"ok": True, "stored": len(params["checks"])}
         if method == main.SUGGESTIONS_SOURCES:
             return sources
         if method == main.PROJECTS_LIST:
@@ -976,3 +978,86 @@ def test_a_host_refresh_and_a_network_tick_together_run_discovery_once(monkeypat
     monkeypatch.setattr(runtime, "_refresh_suggestions", lambda: runs.append(True))
     runtime._service_ticks()
     assert runs == [True]
+
+
+# --- setup checks ----------------------------------------------------------------------
+
+
+def test_publish_checks_passes_sources_and_scope_and_replaces_the_host_list(monkeypatch):
+    calls, captured = [], {}
+    runtime = main.Runtime(send=lambda _m: None)
+    runtime.call_host = _host(
+        sources={"sources": [{"criterion": "mentioned", "enabled": True}]},
+        settings={"suggestion_repositories": "acme/widgets", "suggestion_organizations": "acme"},
+        calls=calls,
+    )
+
+    def run_checks(**kwargs):
+        captured.update(kwargs)
+        return [{"id": "x", "label": "X", "status": "ok"}]
+
+    monkeypatch.setattr(main.checks, "run_checks", run_checks)
+    runtime._publish_checks()
+    assert captured == {"mentioned_enabled": True, "repos_raw": "acme/widgets", "orgs_raw": "acme"}
+    assert calls[-1] == (main.SUGGESTIONS_CHECKS_SET, {"checks": [{"id": "x", "label": "X", "status": "ok"}]})
+
+
+def test_publish_checks_treats_a_silent_host_as_mentions_off(monkeypatch):
+    captured = {}
+    runtime = main.Runtime(send=lambda _m: None)
+    runtime.call_host = _host(sources=None, settings={})
+    monkeypatch.setattr(main.checks, "run_checks", lambda **kw: captured.update(kw) or [])
+    runtime._publish_checks()
+    assert captured["mentioned_enabled"] is False
+
+
+def test_publish_checks_reports_a_failing_check_when_the_run_breaks(monkeypatch):
+    calls = []
+    runtime = main.Runtime(send=lambda _m: None)
+    runtime.call_host = _host(sources={"sources": []}, settings={}, calls=calls)
+
+    def boom(**kwargs):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(main.checks, "run_checks", boom)
+    runtime._publish_checks()
+    method, params = calls[-1]
+    assert method == main.SUGGESTIONS_CHECKS_SET
+    assert [(c["id"], c["status"], c["detail"]) for c in params["checks"]] == [("checks_error", "fail", "kaboom")]
+
+
+def test_host_checks_run_notification_publishes_once_on_the_main_thread(monkeypatch):
+    runtime = main.Runtime(send=lambda _m: None)
+    runs = []
+    monkeypatch.setattr(runtime, "_publish_checks", lambda: runs.append(True))
+    runtime.handle_inbound({"jsonrpc": "2.0", "method": "suggestions.checks.run"})
+    assert runs == []
+    runtime._service_ticks()
+    runtime._service_ticks()
+    assert runs == [True]
+
+
+def test_network_tick_does_not_republish_checks(monkeypatch):
+    runtime = main.Runtime(send=lambda _m: None)
+    runtime._next_network = 0.0
+    runtime._interval = 60
+    monkeypatch.setattr(runtime, "run_refresh", lambda *_a, **_kw: None)
+    monkeypatch.setattr(runtime, "_refresh_suggestions", lambda: None)
+    monkeypatch.setattr(runtime, "_publish_checks", lambda: pytest.fail("checks republished on the tick"))
+    runtime._service_ticks()
+
+
+def test_startup_publishes_checks_once(monkeypatch):
+    runtime = main.Runtime(send=lambda _m: None, stdin=iter(()))
+    published = []
+    monkeypatch.setattr(runtime, "list_sessions", lambda *_a, **_kw: None)
+    monkeypatch.setattr(runtime, "run_refresh", lambda *_a, **_kw: None)
+    monkeypatch.setattr(runtime, "_refresh_suggestions", lambda: None)
+    monkeypatch.setattr(runtime, "_publish_checks", lambda: published.append(True))
+    monkeypatch.setattr(runtime, "resolve_chip_flags", frozenset)
+    monkeypatch.setattr(runtime, "resolve_ignore_submodules", lambda: True)
+    monkeypatch.setattr(runtime, "resolve_required_checks_only", lambda: False)
+    monkeypatch.setattr(runtime, "_setting_bool", lambda *_a, **_kw: True)
+    monkeypatch.setattr(runtime, "resolve_interval", lambda: 0)
+    runtime.run()
+    assert published == [True]
