@@ -425,7 +425,7 @@ def _item(  # noqa: PLR0913 - one call site per criterion, keyword-only
         "variables": {name: clamp(value, STRING_BYTES) for name, value in all_variables.items()},
         "draft": {
             "title": clamp(draft_title, TITLE_BYTES),
-            "prompt": f"{clamp(prompt, PROMPT_BYTES - len(UNTRUSTED) - 1)} {UNTRUSTED}",
+            "prompt": f"{UNTRUSTED} {clamp(prompt, PROMPT_BYTES - len(UNTRUSTED) - 1)}",
         },
     }
     project = projects.get(repo.lower())
@@ -493,12 +493,22 @@ def _review_side(
                 variables={**_pr_variables(complete), "reviewed_commit_sha": reviewed},
                 draft_title=f"Re-review: {title}",
                 prompt=(
-                    f"Re-review https://github.com/{repo}/pull/{number}: new commits were pushed since "
-                    f"your review at {reviewed}."
+                    f"Re-review https://github.com/{repo}/pull/{number}: "
+                    "new commits were pushed since your last review."
                 ),
                 projects=projects,
             )
     return list(items.values())
+
+
+# Fixed prose per criterion: the draft prompt is built from these, never from ``reason``, which
+# carries GitHub-controlled text (reviewer logins, check names).
+_AUTHORED_PROMPT = {
+    "changes_requested": "a reviewer requested changes",
+    "review_thread_reply": "review threads are unresolved and await your reply",
+    "merge_conflict": "the branch conflicts with its base",
+    "ci_failed": "checks are failing",
+}
 
 
 def _authored_matches(pr: dict[str, Any], wanted: list[str]) -> tuple[list[tuple[str, str]], dict[str, str]]:
@@ -555,7 +565,11 @@ def _authored(
                 reason=reason,
                 variables={**_pr_variables(complete), **extra},
                 draft_title=f"Address: {title}",
-                prompt=f"On https://github.com/{repo}/pull/{number}: {reason}. Resolve each point.",
+                prompt=(
+                    f"On https://github.com/{repo}/pull/{number}: "
+                    + "; ".join(_AUTHORED_PROMPT[criterion] for criterion, _ in matched)
+                    + ". Resolve each point."
+                ),
                 projects=projects,
             )
         )

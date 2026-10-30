@@ -100,7 +100,10 @@ waits for it to reset. Dismissing a `mentioned` item in AoE does not mark the
 GitHub notification read.
 
 Suggestion text from GitHub is source material, not trusted instructions. The
-provider proposes a task prompt but never creates sessions.
+provider proposes a task prompt but never creates sessions. Each draft prompt is
+fixed text that names only the PR or issue URL and starts with an untrusted-content
+notice; GitHub-controlled strings (titles, logins, check names, SHAs) live in
+`reason` and `variables`, never in the prompt prose.
 
 `open_pr` is the command-palette / shortcut way to open the active session's PR
 (requires a host on api_version 6+). It is a client action, not a worker call:
