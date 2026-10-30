@@ -325,24 +325,32 @@ def test_truncated_page_serves_rest_without_cooldown_on_busy_branch(tmp_path):
     # re-query in a loop.
     path = _checkout(tmp_path / "repo", "team/r")
     team_pull = _node("team/r", "team/r", 2)
-    foreign = [_node("team/r", f"stranger{i}/r", i + 10) for i in range(35)]
+    foreign = [_node("team/r", f"stranger{i}/r", i + 10) for i in range(105)]
     api = _API({"team/r": [*foreign, team_pull]})
     graphql_queries = []
+    served_pages = []
 
     def handler(request):
         if request.url.path == "/graphql":
             variables = json.loads(request.content)["variables"]
             graphql_queries.append(variables)
             destination = f"{variables['owner']}/{variables['repo']}"
-            nodes = [n for n in api.nodes.get(destination, []) if n["headRefName"] == variables["b0"]]
+            matching = [n for n in api.nodes.get(destination, []) if n["headRefName"] == variables["b0"]]
+            # Real single-page semantics: cap the page and let the server flag
+            # truncation only because the branch has more than first:100 nodes.
+            page = matching[:100]
+            served_pages.append(page)
             return httpx.Response(
                 200,
                 json={
                     "data": {
                         "rateLimit": {"remaining": 5000, "resetAt": "x"},
-                        # Simulate the server truncating at 100 even though the
-                        # branch is crowded with foreign same-name PRs.
-                        "repository": {"b0": {"nodes": nodes, "pageInfo": {"hasNextPage": True}}},
+                        "repository": {
+                            "b0": {
+                                "nodes": page,
+                                "pageInfo": {"hasNextPage": len(matching) > len(page)},
+                            }
+                        },
                     }
                 },
             )
@@ -352,6 +360,10 @@ def test_truncated_page_serves_rest_without_cooldown_on_busy_branch(tmp_path):
         [{"id": "s", "project_path": str(path)}], env=_Env(token=True), transport=httpx.MockTransport(handler)
     )
     repo = snapshot["sessions"][0]["repos"][0]
+    # The fixture must genuinely be a full, truncated page, not a small page
+    # with a hand-set flag.
+    assert len(served_pages) == 1
+    assert len(served_pages[0]) == 100
     # The owned PR survives through the owner-scoped REST fallback, not an empty
     # rich page, and only one GraphQL query is spent.
     assert [p["number"] for p in repo["pulls"]] == [2]
