@@ -127,7 +127,8 @@ BACKOFF_SECS = 60.0
 MAX_BACKOFF_SECS = 3600.0
 
 RepoKey = tuple[str, str, str]  # (owner, repo, branch)
-RichCacheKey = tuple[str, str, str, bool]
+# (owner, repo, branch, required_checks_only, ignore_bot_approval_recommendations).
+RichCacheKey = tuple[str, str, str, bool, bool]
 StackCacheKey = tuple[str, str, int]
 StackRepoKey = tuple[str, str]
 
@@ -137,11 +138,26 @@ class _UnsupportedStackEndpointError(Exception):
 
 
 @dataclass(frozen=True)
+class _NormalizeFlags:
+    """The two normalize-time booleans that affect a pull's review/CI state and
+    therefore the rich-cache key: passing them as one object keeps the fetch
+    pipeline signatures under Ruff's PLR0913 arg cap and forces every cache-key
+    site to consider both (so toggling either invalidates a cached pull)."""
+
+    required_checks_only: bool = False
+    ignore_bot_approval_recommendations: bool = False
+
+
+DEFAULT_NORMALIZE_FLAGS = _NormalizeFlags()
+
+
+@dataclass(frozen=True)
 class SnapshotSettings:
     ignore_submodules: bool = True
     required_checks_only: bool = False
     ignored_commenters: frozenset[str] = frozenset()
     approved_overrides_stale_block: bool = False
+    ignore_bot_approval_recommendations: bool = False
 
 
 DEFAULT_SNAPSHOT_SETTINGS = SnapshotSettings()
@@ -861,9 +877,9 @@ def _error_entry(exc: GitHubError) -> dict[str, Any]:
     return {"error": {"kind": exc.kind, "hint": str(exc)}, "_fresh": False, "_stale": True}
 
 
-def _rich_cache_key(key: RepoKey, *, required_checks_only: bool) -> RichCacheKey:
+def _rich_cache_key(key: RepoKey, *, flags: _NormalizeFlags) -> RichCacheKey:
     owner, repo, branch = key
-    return owner, repo, branch, required_checks_only
+    return owner, repo, branch, flags.required_checks_only, flags.ignore_bot_approval_recommendations
 
 
 def _is_active(pulls: list[dict[str, Any]]) -> bool:
@@ -1057,7 +1073,7 @@ def _apply_aliases(
     pending: dict[RepoKey, dict[str, Any]],
     data: dict[str, Any],
     *,
-    required_checks_only: bool,
+    flags: _NormalizeFlags,
 ) -> dict[RepoKey, dict[str, Any]]:
     """Normalize each alias connection back into its key's cache + result. A failed
     (named in ``errors[].path``) or malformed alias falls back per key (and arms
@@ -1081,8 +1097,12 @@ def _apply_aliases(
         for node in conn.get("nodes") or []:
             if isinstance(node, dict):
                 _paginate_threads(client, node)
-        pulls = graphql.normalize_connection(conn, required_checks_only=required_checks_only)
-        cache_key = _rich_cache_key(key, required_checks_only=required_checks_only)
+        pulls = graphql.normalize_connection(
+            conn,
+            required_checks_only=flags.required_checks_only,
+            ignore_bot_approval_recommendations=flags.ignore_bot_approval_recommendations,
+        )
+        cache_key = _rich_cache_key(key, flags=flags)
         with _cache_lock:
             _graphql_cache[cache_key] = {
                 "pulls": pulls,
@@ -1101,7 +1121,7 @@ def _fetch_chunk(
     pending: dict[RepoKey, dict[str, Any]],
     out: dict[RepoKey, dict[str, Any]],
     *,
-    required_checks_only: bool,
+    flags: _NormalizeFlags,
 ) -> None:
     """One batched GraphQL query for up to ``MAX_GRAPHQL_ALIASES`` branches of one
     repo (#25), aliased ``b0:``/``b1:``/... ``chunk`` is non-empty and all keys
@@ -1146,7 +1166,7 @@ def _fetch_chunk(
     if not isinstance(repository, dict):
         _resolve_null_repository(chunk, pending, data, out)
         return
-    out.update(_apply_aliases(client, chunk, pending, data, required_checks_only=required_checks_only))
+    out.update(_apply_aliases(client, chunk, pending, data, flags=flags))
 
 
 def _apply_digest_aliases(
@@ -1267,7 +1287,7 @@ def _run_chunked(
 
 
 def _fetch_rich(
-    client: GitHubClient, keys: list[RepoKey], *, force: bool, required_checks_only: bool
+    client: GitHubClient, keys: list[RepoKey], *, force: bool, flags: _NormalizeFlags
 ) -> dict[RepoKey, dict[str, Any]]:
     """Token path: a cheap REST conditional probe gates each key (#21), then a
     two-tier GraphQL pass (#69). Keys that are cold, forced, or REST-changed go
@@ -1285,7 +1305,7 @@ def _fetch_rich(
     digest_pending: dict[RepoKey, dict[str, Any]] = {}
     probes = _probe_all(client, keys)
     for key in keys:
-        cache_key = _rich_cache_key(key, required_checks_only=required_checks_only)
+        cache_key = _rich_cache_key(key, flags=flags)
         with _cache_lock:
             rich = _graphql_cache.get(cache_key)
         probe = probes[key]
@@ -1321,7 +1341,7 @@ def _fetch_rich(
     )
     _run_chunked(
         full_pending,
-        lambda chunk: _fetch_chunk(client, chunk, full_pending, out, required_checks_only=required_checks_only),
+        lambda chunk: _fetch_chunk(client, chunk, full_pending, out, flags=flags),
         out,
     )
     return out
@@ -1368,7 +1388,7 @@ def _fetch_all(
     transport: httpx.BaseTransport | None,
     *,
     force: bool = False,
-    required_checks_only: bool = False,
+    flags: _NormalizeFlags = DEFAULT_NORMALIZE_FLAGS,
 ) -> tuple[dict[RepoKey, dict[str, Any]], bool]:
     """Fetch every unique key. Returns ``(results, token_present)`` where results
     is ``key -> {"pulls": [...]}`` or ``key -> {"error": {...}}``. With a token,
@@ -1387,7 +1407,7 @@ def _fetch_all(
     ordered = sorted(keys)
     with GitHubClient(token=token, transport=transport) as client:
         if present:
-            results = _fetch_rich(client, ordered, force=force, required_checks_only=required_checks_only)
+            results = _fetch_rich(client, ordered, force=force, flags=flags)
         else:
             with ThreadPoolExecutor(max_workers=REST_PROBE_WORKERS) as pool:
                 results = dict(zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True))
@@ -1442,7 +1462,10 @@ def build_snapshot(
         env,
         transport,
         force=force,
-        required_checks_only=settings.required_checks_only,
+        flags=_NormalizeFlags(
+            required_checks_only=settings.required_checks_only,
+            ignore_bot_approval_recommendations=settings.ignore_bot_approval_recommendations,
+        ),
     )
     refreshed_at = _utc_now_iso()
     out_sessions: list[dict[str, Any]] = []
