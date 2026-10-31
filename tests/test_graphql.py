@@ -235,6 +235,9 @@ def test_standing_block_outranks_retained_bot_comment():
     assert graphql.reviewers(blocked, ignore_bot_approval_recommendations=True) == [
         {"name": "reviewbot", "state": "changes-requested"}
     ]
+    pulled = graphql.normalize_connection(_conn(blocked), ignore_bot_approval_recommendations=True)[0]
+    assert pulled["review_summary"] == "changes requested"
+    assert pulled["review_state"] == "changes-requested"
 
 
 def test_ignored_commenters_only_downgrade_bot_only_commented():
