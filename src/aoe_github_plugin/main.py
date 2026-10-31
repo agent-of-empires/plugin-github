@@ -61,6 +61,9 @@ SUGGESTION_SETTING_KEYS = (
     "suggestion_repositories",
     "suggestion_organizations",
     "suggestion_limit",
+    "suggestion_ref_org",
+    "suggestion_ref_repo",
+    "suggestion_ref_number",
 )
 
 Sink = Callable[[dict[str, Any]], None]
@@ -656,6 +659,11 @@ class Runtime:
                     repos_raw=settings["suggestion_repositories"],
                     orgs_raw=settings["suggestion_organizations"],
                     limit_raw=settings["suggestion_limit"],
+                    ref_parts=(
+                        settings["suggestion_ref_org"],
+                        settings["suggestion_ref_repo"],
+                        settings["suggestion_ref_number"],
+                    ),
                     project_repos=self._project_repos() if "new_issues" in enabled else set(),
                 )
         except Exception as exc:  # noqa: BLE001 - report failure, keep the host's last good snapshot

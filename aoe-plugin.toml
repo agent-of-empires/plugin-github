@@ -9,7 +9,7 @@
 # The host parses this strictly (deny_unknown_fields), so every key below must
 # match a field in that schema.
 
-id = "agent-of-empires.github"
+id = "aagent-of-empires.github"
 name = "GitHub"
 version = "2.3.0"
 # Manifest schema / host API version. api_version 5 added the [[screenshots]]
@@ -152,6 +152,30 @@ label = "GitHub suggestion organizations"
 description = "Optional comma-separated organization allowlist, combined with the repository allowlist. When set, new issues come from these organizations instead of your registered projects' repositories."
 type = "string"
 default = ""
+advanced = true
+
+[[settings]]
+key = "suggestion_ref_org"
+label = "Show organization in suggestion references"
+description = "Include the owner in each suggestion's reference, as in acme/widgets#123. AoE shows the reference when its \"Show source reference\" setting is on."
+type = "boolean"
+default = true
+advanced = true
+
+[[settings]]
+key = "suggestion_ref_repo"
+label = "Show repository in suggestion references"
+description = "Include the repository name in each suggestion's reference."
+type = "boolean"
+default = true
+advanced = true
+
+[[settings]]
+key = "suggestion_ref_number"
+label = "Show number in suggestion references"
+description = "Include the issue or pull request number in each suggestion's reference. With all three off, the full reference is shown."
+type = "boolean"
+default = true
 advanced = true
 
 [[settings]]

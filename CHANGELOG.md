@@ -10,6 +10,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 - **suggestions:** Publish host-managed suggested sessions for nine GitHub criteria (changes requested, review requested, re-review, review thread replies, merge conflicts, failing checks, mentions, assigned issues, new issues). The worker asks the host which criteria are on and makes no GitHub request for a disabled one. Requires AoE 1.21.0+ (SDK API 20).
 - **suggestions:** Add the `suggestion_repositories`, `suggestion_organizations` and `suggestion_limit` settings; `new_issues` falls back to the repositories of your registered projects from `projects.list`. Items carry a `mapping_key` (the lowercased `owner/repo`) and AoE's suggestion mappings (agent-of-empires#4912) choose the project, so there is no plugin-side project setting.
+- **suggestions:** Send a short `source_ref` such as `acme/widgets#123` for AoE to show on suggestion rows, with `suggestion_ref_org`, `suggestion_ref_repo` and `suggestion_ref_number` to choose its parts.
 - **suggestions:** Report setup checks to the host (`gh` installed, signed in, repositories readable, notifications scope) at startup, on the host's recheck and on every suggestions refresh, with a one-line fix for each failing check.
 - **pane:** Show GitHub-native pull request stacks, layer navigation, and readiness through the selected PR.
 
