@@ -141,7 +141,7 @@ advanced = true
 [[settings]]
 key = "suggestion_repositories"
 label = "GitHub suggestion repositories"
-description = "Optional comma-separated owner/repo allowlist. Empty searches every repository you can see; new issues then come from your registered projects' repositories."
+description = "Optional comma-separated owner/repo allowlist. When both this and the organization allowlist are empty, searches cover every repository you can see and new issues come from your registered projects' repositories. When only organizations are set, searches cover those organizations, new issues included."
 type = "string"
 default = ""
 advanced = true
@@ -149,7 +149,7 @@ advanced = true
 [[settings]]
 key = "suggestion_organizations"
 label = "GitHub suggestion organizations"
-description = "Optional comma-separated organization allowlist."
+description = "Optional comma-separated organization allowlist, combined with the repository allowlist. When set, new issues come from these organizations instead of your registered projects' repositories."
 type = "string"
 default = ""
 advanced = true
@@ -374,5 +374,5 @@ variables = ["repo", "org", "title", "url", "timestamp", "issue_number", "author
 [[suggestions.sources]]
 criterion = "new_issues"
 label = "New issues"
-description = "Issues opened by others in the last 7 days in your allowlisted repositories, or in your registered projects' repositories when no allowlist is set."
+description = "Issues opened by others in the last 7 days in your allowlisted repositories and organizations, or in your registered projects' repositories when neither allowlist is set."
 variables = ["repo", "org", "title", "url", "timestamp", "issue_number", "author", "labels"]
