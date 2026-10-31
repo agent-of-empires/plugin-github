@@ -155,14 +155,6 @@ default = ""
 advanced = true
 
 [[settings]]
-key = "suggestion_projects"
-label = "GitHub suggestion project mappings"
-description = "owner/repo=registered project name or canonical local path, one per line. Overrides the mapping derived from your registered projects' git remotes."
-type = "string"
-default = ""
-advanced = true
-
-[[settings]]
 key = "suggestion_limit"
 label = "Maximum GitHub suggestions"
 description = "Maximum suggestions retained in the provider snapshot."
