@@ -188,6 +188,14 @@ default = false
 advanced = true
 
 [[settings]]
+key = "ignore_bot_approval_recommendations"
+label = "Ignore bot approval recommendations"
+description = "Off (default): a bot's COMMENTED review whose body literally recommends approval (a \"Recommendation: Approve\" line) counts like any other comment. On: such a review does not make the PR read \"commented\"."
+type = "boolean"
+default = false
+advanced = true
+
+[[settings]]
 key = "show_status_text"
 label = "Show PR status summary text in session row"
 description = "Show the words summary at the end of each session row (e.g. \"CI failing\", \"approved\"). Turn off to keep only the PR status icons. The GitHub pane is unaffected."

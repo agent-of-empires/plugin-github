@@ -364,6 +364,12 @@ excluded), reads "partially approved" (`review:partially-approved` facet). Merge
 blockers other than review, such as failing CI, are not inferred from
 `mergeStateStatus`.
 
+The advanced `ignore_bot_approval_recommendations` setting (default off) stops a
+bot's COMMENTED review whose body literally recommends approval (a
+"Recommendation: Approve" line) from making the PR read "commented", when
+enabled; the bot's unresolved threads still count. Off (the default), such a
+review counts like any other comment.
+
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol
 > (`agent-of-empires#2095`); this repo ships the data those slots consume. The
