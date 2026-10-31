@@ -46,10 +46,16 @@ from datetime import timezone
 # check_summary), so truncating the connection could drop a failing check past the
 # cap and render a PR falsely green. A PR with 50+ checks is routine, and
 # check_summary keeps the raw rollup whenever the page is still truncated.
-_PR_CONNECTION_FRAGMENT = """
-fragment PRConnection on PullRequestConnection {
-  pageInfo { hasNextPage endCursor }
-  nodes {
+#
+# The node body is its own fragment because TWO documents select it: the aliased
+# branch connection below, and DETAIL_QUERY by number. They had drifted apart
+# once (DETAIL_QUERY was missing ``latestReviews``/``decidedReviews``,
+# ``closingIssuesReferences``, the workflow name, and the commit/review/comment
+# timeline types), so a PR recovered by number was silently normalised from
+# partial data: no reviewers, ``head_approved`` false, "changes requested"
+# instead of "changes-pushed". A shared fragment makes that unrepresentable.
+_PR_NODE_FRAGMENT = """
+fragment PRNode on PullRequest {
     id number title url state isDraft merged mergeable mergeStateStatus reviewDecision updatedAt headRefOid
     headRefName headRepository { name owner { login } }
     mergeQueueEntry { position state }
@@ -109,9 +115,18 @@ fragment PRConnection on PullRequestConnection {
         comments(first: 1) { nodes { author { login } bodyText url } }
       }
     }
-  }
 }
 """
+
+_PR_CONNECTION_FRAGMENT = (
+    _PR_NODE_FRAGMENT
+    + """
+fragment PRConnection on PullRequestConnection {
+  pageInfo { hasNextPage endCursor }
+  nodes { ...PRNode }
+}
+"""
+)
 
 # One aliased ``pullRequests`` field. ``{i}`` is the index; the doubled braces are
 # GraphQL literals that survive ``str.format``. rateLimit.cost (one per batched
@@ -145,58 +160,17 @@ query({params}) {{
 # carry (it was crowded with foreign same-name PRs). One document per missing PR,
 # by number: the same rich fragment, but a single node, so the nested
 # connections cost a fraction of a full branch page.
-DETAIL_QUERY = """
+DETAIL_QUERY = (
+    """
 query($owner: String!, $repo: String!, $number: Int!) {
   rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      id number title url state isDraft merged mergeable mergeStateStatus reviewDecision updatedAt headRefOid
-      headRefName headRepository { name owner { login } }
-      mergeQueueEntry { position state }
-      mergeQueue { url }
-      baseRefName additions deletions changedFiles
-      author { login }
-      baseRef { branchProtectionRule {
-        requiresStatusChecks
-        requiredStatusCheckContexts
-        requiredStatusChecks { context app { databaseId slug name } }
-      } }
-      commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { totalCount nodes {
-        __typename
-        ... on CheckRun {
-          name status conclusion detailsUrl startedAt completedAt
-          checkSuite { app { databaseId slug name } }
-        }
-        ... on StatusContext { context description targetUrl state creator { login } }
-      } } } } } }
-      reviews(last: 20, states: [COMMENTED]) { nodes { author { login } state outdated } }
-      reviewThreads(first: 100) {
-        totalCount
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          isResolved path line
-          comments(first: 1) { nodes { author { login } bodyText url } }
-        }
-      }
-      reviewRequests(first: 20) { nodes { requestedReviewer {
-        __typename
-        ... on User { login }
-        ... on Team { slug }
-      } } }
-      timelineItems(last: 30, itemTypes: [
-        REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT, HEAD_REF_FORCE_PUSHED_EVENT, MERGED_EVENT
-      ]) {
-        nodes {
-          __typename
-          ... on ReviewRequestedEvent { createdAt actor { login } }
-          ... on ReviewRequestRemovedEvent { createdAt actor { login } }
-          ... on HeadRefForcePushedEvent { createdAt actor { login } }
-          ... on MergedEvent { createdAt actor { login } }
-        }
-      }
-    }
+    pullRequest(number: $number) { ...PRNode }
   }
-}"""
+}
+"""
+    + _PR_NODE_FRAGMENT
+)
 
 
 # The cheap change-detection tier (#69). Scalars plus the top-level check rollup

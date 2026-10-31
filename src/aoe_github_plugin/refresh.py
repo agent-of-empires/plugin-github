@@ -60,7 +60,6 @@ from aoe_github_plugin.errors import NotFoundError
 from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.handlers import _resolve_optional_token
 from aoe_github_plugin.utils.gitctx import parse_owner_repo
-from aoe_github_plugin.utils.gitctx import remote_owner_repos
 
 _LOG = logging.getLogger(__name__)
 
@@ -343,8 +342,21 @@ def _remote_repos(path: str) -> list[tuple[str, str]]:
     Read per checkout, not per session or origin: two worktrees of the same
     origin can declare different remotes, so a shared list would search
     destinations another checkout never configured.
+
+    Uses this module's timed ``_git`` rather than ``gitctx``'s: a checkout on a
+    stalled network mount or holding a git lock would otherwise block a
+    ``GIT_WORKERS`` thread with no bound and stall the whole refresh tick, which
+    is exactly what the fail-soft identity helpers exist to prevent. A failure
+    degrades to ``[]``, and ``lookup.repositories`` then falls back to origin.
     """
-    return remote_owner_repos(path)
+    names = _git(path, "remote")
+    out: list[tuple[str, str]] = []
+    for name in sorted((names or "").split(), key=lambda n: (n != "origin", n)):
+        url = _git(path, "remote", "get-url", name)
+        repo = parse_owner_repo(url) if url else None
+        if repo is not None and repo not in out:
+            out.append(repo)
+    return out
 
 
 def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> list[tuple[str, str | None]]:
@@ -1112,6 +1124,17 @@ def _fetch_details(
     return found
 
 
+def _needs_discovery(conn: dict[str, Any]) -> bool:
+    """Whether a page could still hide this checkout's own PR past its bounds.
+
+    ``hasNextPage: false`` is the server stating the page is final, so head
+    filtering is the whole answer. Anything else (more pages pending, or no
+    usable ``pageInfo``) needs identity discovery to decide ownership.
+    """
+    page_info = conn.get("pageInfo")
+    return not (isinstance(page_info, dict) and page_info.get("hasNextPage") is False)
+
+
 def _owned_connection(client: GitHubClient, key: RepoKey, conn: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     """Resolve one chunk's page down to the checkout's own PRs.
 
@@ -1129,6 +1152,12 @@ def _owned_connection(client: GitHubClient, key: RepoKey, conn: dict[str, Any]) 
     the per-key cooldown, because a collision is not a failure to retry.
     """
     owner, repo, branch = key[:3]
+    # A final page is self-evident: ``hasNextPage: false`` says this page holds
+    # every OPEN/MERGED PR with the branch name, so head filtering IS the full
+    # answer and discovery would cost one serial round trip per key per tick for
+    # nothing. Discovery then runs only where the page is actually crowded.
+    if not _needs_discovery(conn):
+        return False, lookup.filter_connection(conn, key)
 
     def observe(rate_info: dict[str, Any]) -> None:
         """Record discovery's spend and arm the gate on budget pressure.
@@ -1201,7 +1230,31 @@ def _apply_aliases(
             # not blank what was already resolved.
             out.setdefault(key, _fallback_pulls(pending[key]))
             continue
-        truncated, conn = _owned_connection(client, key, conn)
+        # The digest tier resolves ownership for the SAME destination and branch
+        # moments earlier in this tick, and discovery's answer depends only on
+        # those, not on which document carried the nodes. A completed run is
+        # therefore already authoritative here, so a promotion reuses it instead
+        # of paying a second serial lookup (#129). A truncated run proved
+        # nothing and is never handed over. Per-tick scratch, never persisted.
+        proved = pending[key].pop("digest_owned", None)
+        if proved is not None:
+            owned_numbers = {node.get("number") for node in proved.get("nodes") or [] if isinstance(node, dict)}
+            kept = [
+                node
+                for node in conn.get("nodes") or []
+                if isinstance(node, dict) and node.get("number") in owned_numbers
+            ]
+            # A crowded page can leave an owned PR off the node list entirely
+            # (foreign same-name PRs fill ``first: 3``). Discovery already proved
+            # those exist, so fetch them by number instead of reporting them
+            # absent, matching what ``_owned_connection`` does for its own page.
+            missing = owned_numbers - {node.get("number") for node in kept}
+            if missing:
+                kept.extend(_fetch_details(client, key[0], key[1], missing, key))
+            conn = {**conn, "nodes": kept, "pageInfo": {"hasNextPage": False, "endCursor": None}}
+            truncated = False
+        else:
+            truncated, conn = _owned_connection(client, key, conn)
         if truncated:
             # The single page was exhausted by foreign same-name PRs, so it
             # cannot prove the checkout's own PR is absent. The owner-scoped
@@ -1331,6 +1384,12 @@ def _apply_digest_aliases(
                 rich["validated_at"] = now
             out[key] = _pulls_result(rich["pulls"], fresh=True)
         else:
+            # A mismatch promotes to the full query. Its ownership answer depends
+            # only on destination and branch, which this tick just resolved the
+            # same way, so hand over the completed set and let the promotion skip
+            # a duplicate lookup. A truncated run proved nothing; store None so
+            # the promoted page resolves ownership for itself.
+            pending[key]["digest_owned"] = owned if not truncated else None
             promoted.append(key)
     return promoted
 
@@ -1557,7 +1616,11 @@ def _fetch_all(
     by_checkout: dict[CheckoutKey, list[RepoKey]] = {}
     with GitHubClient(token=token, transport=transport) as client:
         for key in sorted(destinations):
-            by_checkout[key] = lookup.pull_keys(destinations[key], key[2])
+            # ``key[:2]`` IS this checkout's origin, so anchoring here is exact
+            # even when the remote read returns nothing: ``pull_keys`` on an
+            # empty list yields no candidate to index, and an ``IndexError``
+            # would abort every session's snapshot instead of searching origin.
+            by_checkout[key] = lookup.pull_keys(lookup.repositories(key[:2], destinations[key]), key[2])
         ordered = sorted({candidate for candidates in by_checkout.values() for candidate in candidates})
         if present:
             fetched = _fetch_rich(client, ordered, force=force, required_checks_only=required_checks_only)

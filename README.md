@@ -158,7 +158,11 @@ session-less `github.refresh` cover every session and prune vanished ones:
    Rich and digest queries fetch a single page per branch and filter it to the
    checkout's own head. When a single page cannot prove the branch's PR set
    (more than one hundred same-name PRs, e.g. a busy `main`), the owner-scoped
-   REST result is served instead rather than caching a false empty.
+   REST result is served instead rather than caching a false empty. A page that
+   *is* final already proves the set, so the per-key ownership discovery query is
+   skipped entirely; when a digest query later promotes that same key to a full
+   query, the proof is carried across, so a key costs one full query rather than
+   a full query plus a separate ownership-discovery query.
 4. Push one global `sort-key`, six global `filter-facet`s (below), and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
    chip sequence per open PR: a clickable PR icon, a merge-conflict chip when the
    PR conflicts with its base, a merge-queue status/position chip when queued, then

@@ -16,8 +16,10 @@ import httpx
 import pytest
 
 from aoe_github_plugin import lookup
+from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
 from aoe_github_plugin.auth import TokenEnvironment
+from aoe_github_plugin.utils.gitctx import remote_owner_repos
 
 
 class _Env(TokenEnvironment):
@@ -72,9 +74,10 @@ def _clear_cache(monkeypatch):
     # Polling fixtures model a plain origin-only checkout; test_lookup exercises
     # the real resolver against real remotes.
     def _plain(path):
-        found = refresh.remote_owner_repos(path)
-        # Model an origin-only checkout: the first GitHub remote is the only one.
-        return found[:1]
+        # Refresh reads remotes through its own timed ``_git`` now, so the
+        # resolver it used to call is no longer a refresh attribute. Use the
+        # gitctx resolver directly: it returns the real configured remotes.
+        return remote_owner_repos(path)[:1]
 
     monkeypatch.setattr(refresh, "_remote_repos", _plain)
 
@@ -154,14 +157,14 @@ def _transport(pulls, etag='W/"v1"', capture=None):
     return httpx.MockTransport(handler)
 
 
-def _pull(number=12, draft=False, branch="feature", repo="r"):
+def _pull(number=12, draft=False, branch="feature", repo="r", owner="o"):
     return {
         "number": number,
-        "html_url": f"https://github.com/o/r/pull/{number}",
+        "html_url": f"https://github.com/{owner}/{repo}/pull/{number}",
         "title": "t",
         "state": "open",
         "draft": draft,
-        "head": {"ref": branch, "repo": {"name": repo, "owner": {"login": "o"}}},
+        "head": {"ref": branch, "repo": {"name": repo, "owner": {"login": owner}}},
     }
 
 
@@ -328,6 +331,11 @@ def _graphql_kind(request):
 def _is_graphql(request):
     """True for any GraphQL request (discovery, detail, rich or digest)."""
     return _graphql_kind(request) is not None
+
+
+def _detail_number(request) -> int:
+    """The PR number a DETAIL_QUERY asks for, so a transport can answer it."""
+    return json.loads(request.content)["variables"]["number"]
 
 
 def _owned(*numbers, branch="feature", head=("o", "r")):
@@ -2258,3 +2266,390 @@ def test_failed_query_keeps_rich_result_while_only_merged_pulls_differ(tmp_path)
     # The REST probe only lists open PR 1; PR 9 survives solely because the
     # rich cache was served instead of the basic fallback.
     assert [p["number"] for p in pulls] == [1, 9]
+
+
+# --- Review regressions: page-proved completeness, bounded remotes, detail ----
+
+
+def test_final_page_skips_discovery(tmp_path):
+    """``hasNextPage: false`` is the server proving the page final, so head
+    filtering is the whole answer. Discovery costs a serial round trip per key
+    per tick, so it must not run here: a digest tick for a short page goes from
+    ~11 requests (1 batch + 10 discoveries) back to 1, and stays exact."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    kinds: list[str] = []
+
+    def handler(request):
+        if not _is_graphql(request):
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7)])
+        kind = _graphql_kind(request)
+        kinds.append(kind)
+        if kind in {"rich", "digest"}:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                        "repository": {"b0": {"nodes": [_gql_node(number=7)], "pageInfo": {"hasNextPage": False}}},
+                    }
+                },
+            )
+        raise AssertionError(f"unexpected graphql document: {kind}")
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler), force=True)
+
+    assert "discover" not in kinds  # the final page already proved ownership
+    assert [p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]] == [7]
+
+
+def test_crowded_page_still_runs_discovery(tmp_path):
+    """The complement: a page that is NOT final cannot prove ownership, so the
+    short-circuit must not swallow discovery."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    kinds: list[str] = []
+
+    def handler(request):
+        if not _is_graphql(request):
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7)])
+        kind = _graphql_kind(request)
+        kinds.append(kind)
+        if kind == "discover":
+            return _owned(7)
+        if kind in {"rich", "digest"}:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                        "repository": {"b0": {"nodes": [_gql_node(number=7)], "pageInfo": {"hasNextPage": True}}},
+                    }
+                },
+            )
+        raise AssertionError(f"unexpected graphql document: {kind}")
+
+    refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler), force=True)
+
+    assert "discover" in kinds
+
+
+def test_remotes_unreadable_falls_back_to_origin(monkeypatch, tmp_path):
+    """An unreadable remote list must still search origin, not raise: the origin
+    is ``key[:2]``, so there is always a destination to query."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r", remote="https://github.com/solo/only.git")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    probed: list[str] = []
+
+    # Undo the autouse origin-only patch so refresh asks the real resolver.
+    monkeypatch.undo()
+    monkeypatch.setattr(refresh, "_remote_repos", lambda _path: [])  # the read that failed
+
+    def handler(request):
+        probed.append(request.url.path)
+        return httpx.Response(200, json=[_pull(number=5, repo="only", owner="solo")])
+
+    snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=httpx.MockTransport(handler))
+
+    assert probed
+    assert "/repos/solo/only/pulls" in probed[0]
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 5
+
+
+def test_remote_read_uses_the_timed_git_helper(monkeypatch, tmp_path):
+    """Refresh must read remotes through its bounded ``_git``: a checkout on a
+    stalled mount cannot be allowed to block a refresh worker indefinitely."""
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(path, *args):
+        calls.append(args)
+        if args == ("remote",):
+            return "origin\nupstream"
+        if args == ("remote", "get-url", "origin"):
+            return "https://github.com/me/fork.git"
+        if args == ("remote", "get-url", "upstream"):
+            return "https://github.com/up/stream.git"
+        return None
+
+    # Restore the real resolver first: the autouse fixture stubs it out for the
+    # origin-only polling fixtures, which would bypass ``_git`` entirely.
+    monkeypatch.undo()
+    monkeypatch.setattr(refresh, "_git", fake_git)
+
+    assert refresh._remote_repos(str(tmp_path)) == [("me", "fork"), ("up", "stream")]
+    assert calls[0] == ("remote",)  # the bounded helper, not gitctx's untimed one
+
+
+def _node_with_stale_block():
+    node = _gql_node(number=7, decision="CHANGES_REQUESTED")
+    node["headRefOid"] = "newhead"
+    node["latestReviews"] = {
+        "nodes": [{"state": "CHANGES_REQUESTED", "author": {"login": "rev"}, "commit": {"oid": "oldhead"}}]
+    }
+    node["decidedReviews"] = {
+        "nodes": [{"state": "CHANGES_REQUESTED", "author": {"login": "rev"}, "commit": {"oid": "oldhead"}}]
+    }
+    return node
+
+
+def test_detail_query_normalises_the_same_rich_fields_as_the_branch_page():
+    """A PR fetched by number must not be normalised from partial data. Both
+    documents select the shared ``PRNode`` fragment, so a stale blocking review
+    reads ``changes-pushed`` exactly as it does on the branch page."""
+    from_page = graphql.normalize_connection({"nodes": [_node_with_stale_block()]})[0]
+    assert from_page["review_state"] == "changes-pushed"
+    assert [r["name"] for r in from_page["reviewers"]] == ["rev"]
+
+    # The drift the review caught: every one of these is read by the normaliser
+    # and was absent from the hand-copied detail body.
+    assert "...PRNode" in graphql.DETAIL_QUERY
+    for field in ("latestReviews", "decidedReviews", "closingIssuesReferences", "workflowRun", "PullRequestCommit"):
+        assert field in graphql.DETAIL_QUERY
+
+
+def _final_page(nodes):
+    return httpx.Response(
+        200,
+        json={
+            "data": {
+                "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                "repository": {"b0": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}},
+            }
+        },
+    )
+
+
+def _branch_page_transport(head_oid, *, log, fail_full=False, promoted_crowded=False, digest_crowded=False):
+    """A key whose rich entry moves its head, so the aged digest genuinely
+    mismatches and promotes to the full query: the only path that can re-spend
+    a discovery request the digest already made.
+
+    ``promoted_crowded`` makes the FULL page non-final while the digest page
+    stays final. Only the proven-ownership handoff can then skip discovery:
+    ``_needs_discovery`` on the full page alone would say yes.
+    """
+
+    def page(nodes, crowded):
+        info = {"hasNextPage": crowded, "endCursor": "c" if crowded else None}
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                    "repository": {"b0": {"nodes": nodes, "pageInfo": info}},
+                }
+            },
+        )
+
+    def handler(request):
+        if not _is_graphql(request):
+            if request.headers.get("If-None-Match") == 'W/"v1"':
+                return httpx.Response(304)
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7)])
+        kind = _graphql_kind(request)
+        full = _is_full_query(request)
+        log.append(("full" if full else "digest", kind))
+        if kind == "discover":
+            return _owned(7)
+        node = {**_gql_node(number=7), "headRefOid": head_oid}
+        if full:
+            if fail_full:
+                return httpx.Response(500, text="boom")
+            return page([node], promoted_crowded)
+        return page([node], digest_crowded)
+
+    return httpx.MockTransport(handler)
+
+
+def test_promoted_crowded_page_reuses_digest_ownership(tmp_path):
+    """A final digest page proves the owned set without a lookup, so a promotion
+    to a CROWDED rich page reuses it rather than paying a serial discovery the
+    digest tier already made unnecessary. Rich detail still comes from the full
+    document, never from the digest's signature-only nodes."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    refresh.build_snapshot(sessions, env=_Env(), transport=_branch_page_transport("old", log=[]))
+    _expire_graphql_cache()  # digest clock only: the entry re-classifies as a digest
+
+    log = []
+    snap = refresh.build_snapshot(
+        sessions, env=_Env(), transport=_branch_page_transport("moved", log=log, promoted_crowded=True)
+    )
+
+    assert log == [("digest", "rich"), ("full", "rich")]  # no discovery at all
+    pull = snap["sessions"][0]["repos"][0]["pulls"][0]
+    # The rich document, not the digest's signature-only nodes, supplies detail.
+    assert pull["review_state"] == "approved"
+    assert [run["name"] for run in pull["checks"]["runs"]] == ["test"]
+    assert pull["comments"]["items"][0]["path"] == "a.py"
+
+
+def test_reused_ownership_fetches_owned_pr_absent_from_crowded_page(tmp_path):
+    """Reuse must not equate "not on this page" with "not owned". Discovery proves
+    PR 8 exists; the crowded rich page's ``first: 3`` carries only PR 7. The
+    promotion fetches 8 by number rather than silently dropping a real PR."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    log = []
+    detail_numbers = []
+    phase = {"head": "old"}
+
+    def page(nodes):
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                    "repository": {"b0": {"nodes": nodes, "pageInfo": {"hasNextPage": True, "endCursor": "c"}}},
+                }
+            },
+        )
+
+    def handler(request):
+        if not _is_graphql(request):
+            if request.headers.get("If-None-Match") == 'W/"v1"':
+                return httpx.Response(304)
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7), _pull(number=8)])
+        kind = _graphql_kind(request)
+        log.append(("full" if _is_full_query(request) else "digest", kind))
+        if kind == "discover":
+            return _owned(7, 8)  # proves PR 8, which the branch page never carries
+        if kind == "detail":
+            number = _detail_number(request)
+            detail_numbers.append(number)
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                        "repository": {"pullRequest": _gql_node(number=number)},
+                    }
+                },
+            )
+        return page([{**_gql_node(number=7), "headRefOid": phase["head"]}])
+
+    transport = httpx.MockTransport(handler)
+    seeded = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert 7 in [p["number"] for p in seeded["sessions"][0]["repos"][0]["pulls"]]
+
+    _expire_graphql_cache()  # digest clock only: the entry re-classifies as a digest
+    log.clear()
+    detail_numbers.clear()  # the seed may already have fetched 8; measure only this tick
+    phase["head"] = "moved"  # genuine mismatch, so the key promotes
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+
+    # The digest page was crowded, so it discovered 7 AND 8. The promotion reuses
+    # that completed set: one lookup for the tick, and PR 8 still arrives.
+    assert log.count(("digest", "discover")) == 1
+    assert ("full", "rich") in log
+    assert 8 in detail_numbers
+    assert sorted(p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]) == [7, 8]
+
+
+def test_unproved_crowded_promotion_still_discovers(tmp_path):
+    """Control for the test above: same crowded promoted page, but the digest
+    page was itself crowded, so no proof exists and discovery must run."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    refresh.build_snapshot(sessions, env=_Env(), transport=_branch_page_transport("old", log=[]))
+    _expire_graphql_cache()
+
+    log = []
+    snap = refresh.build_snapshot(
+        sessions,
+        env=_Env(),
+        transport=_branch_page_transport("moved", log=log, promoted_crowded=True, digest_crowded=True),
+    )
+
+    # The digest page was crowded, so IT must discover. That run is complete, so
+    # the promotion reuses it: exactly one lookup for the tick, never two.
+    assert log.count(("digest", "discover")) == 1
+    assert ("full", "rich") in log
+    assert [p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]] == [7]
+
+
+def test_failed_promoted_query_serves_stale_without_respending_discovery(tmp_path):
+    """A promoted full query that fails changes nothing: the tick already
+    resolved ownership from the digest's final page, so the failure serves the
+    last-good result and spends no discovery request re-deriving it.
+
+    Scope note: this asserts ONE tick. The proof is carried by the in-memory key
+    entry, not a persistent store, and the next tick's digest re-establishes it,
+    so there is no cross-tick saving to observe at the transport."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    refresh.build_snapshot(sessions, env=_Env(), transport=_branch_page_transport("old", log=[]))
+    _expire_graphql_cache()
+
+    # The digest page is final (so it records the proof) while the promoted rich
+    # page is crowded, so only that proof can skip discovery. The full query
+    # then fails: nothing is published and the retry cooldown arms.
+    log = []
+    transport = _branch_page_transport("moved", log=log, fail_full=True, promoted_crowded=True)
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+
+    assert [state for state, _kind in log if state == "full"] == ["full"]  # it did promote
+    assert not any(state == "discover" for state, _kind in log)  # proof reused, not re-bought
+    assert [p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]] == [7]  # stale served
+    assert refresh._retry_cooldown, "the failed full query must have armed a cooldown"
+
+
+def test_every_key_searched_when_destinations_are_empty(monkeypatch, tmp_path):
+    """``pull_keys`` seeds the origin itself, so an empty destination list can
+    never leave a key with no candidate to index (the ``IndexError`` that would
+    abort every session's snapshot). Both a token and tokenless tick must still
+    return the origin PR, and the shared key is fetched once."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r", remote="https://github.com/me/fork.git")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    # Directly: no remotes still yields exactly the origin key, no duplicates.
+    keys = lookup.pull_keys(lookup.repositories(("me", "fork"), []), "feature")
+    assert keys == [("me", "fork", "feature", "me", "fork")]
+    assert lookup.pull_keys(lookup.repositories(("me", "fork"), [("up", "stream"), ("up", "stream")]), "feature") == [
+        ("me", "fork", "feature", "me", "fork"),
+        ("up", "stream", "feature", "me", "fork"),
+    ]
+
+    monkeypatch.setattr(refresh, "_remote_repos", lambda _path: [])  # every destination read fails
+
+    for env in (_NoToken(), _Env()):
+        probed: list[tuple[str, str]] = []
+
+        def handler(request, _probed=probed):
+            _probed.append((request.method, request.url.path))
+            if request.url.path == "/graphql":
+                node = {
+                    **_gql_node(number=7),
+                    "headRepository": {"name": "fork", "owner": {"login": "me"}},
+                    "headRepositoryOwner": {"login": "me"},
+                }
+                return _final_page([node])
+            if request.url.path.endswith("/stacks"):
+                return httpx.Response(200, json={"stacks": []})
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7, repo="fork", owner="me")])
+
+        snap = refresh.build_snapshot(sessions, env=env, transport=httpx.MockTransport(handler))
+        assert snap["sessions"][0]["repos"][0]["error"] is None
+        assert [p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]] == [7]
+        assert [path for _m, path in probed if path.endswith("/pulls")] == ["/repos/me/fork/pulls"]
