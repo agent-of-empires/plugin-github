@@ -97,3 +97,7 @@ def test_icon_requires_api_version_7():
     m = _manifest()
     if m.get("icon") or m.get("icon_asset"):
         assert m["api_version"] >= 7, "icon/icon_asset requires api_version >= 7"
+
+
+def test_suggestion_projects_setting_is_gone():
+    assert "suggestion_projects" not in {setting["key"] for setting in _manifest()["settings"]}
