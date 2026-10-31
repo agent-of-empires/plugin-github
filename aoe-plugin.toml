@@ -9,7 +9,7 @@
 # The host parses this strictly (deny_unknown_fields), so every key below must
 # match a field in that schema.
 
-id = "agent-of-empires.github"
+id = "aagent-of-empires.github"
 name = "GitHub"
 version = "2.3.0"
 # Manifest schema / host API version. api_version 5 added the [[screenshots]]
@@ -21,14 +21,15 @@ version = "2.3.0"
 # bodies on `section`, `disabled` / `variant` / `href` actions, and the
 # pane-level `footer`. A host older than 12 rejects this manifest outright,
 # which is the intent: it would render the pane as a bare list of rows with no
-# verdict, no diff, and no way to switch PRs.
-api_version = 12
+# verdict, no diff, and no way to switch PRs. 20 adds host-managed suggested
+# sessions (the `[suggestions]` block below).
+api_version = 20
 # Host-app compatibility range (different axis from api_version, which is the
 # manifest-schema version). The host refuses install/update outside this range
 # and skips loading if a later aoe upgrade moves out of it. Requires api_version
-# >= 4. The floor tracks the release that ships api_version 12; refuse an
+# >= 4. The floor tracks the release that ships api_version 20; refuse an
 # untested 2.0.
-aoe_version = ">=1.14.0, <2.0.0"
+aoe_version = ">=1.21.0, <2.0.0"
 description = "GitHub integration for Agent of Empires: surface PR and issue state for your sessions."
 
 # Identity icon (api_version 7): icon_asset is the actual GitHub mark, shown in
@@ -135,6 +136,64 @@ type = "integer"
 default = 120
 min = 0
 max = 86400
+advanced = true
+
+[[settings]]
+key = "suggestion_repositories"
+label = "GitHub suggestion repositories"
+description = "Optional comma-separated owner/repo allowlist. When both this and the organization allowlist are empty, searches cover every repository you can see and new issues come from your registered projects' repositories. When only organizations are set, searches cover those organizations, new issues included."
+type = "string"
+default = ""
+advanced = true
+
+[[settings]]
+key = "suggestion_organizations"
+label = "GitHub suggestion organizations"
+description = "Optional comma-separated organization allowlist, combined with the repository allowlist. When set, new issues come from these organizations instead of your registered projects' repositories."
+type = "string"
+default = ""
+advanced = true
+
+[[settings]]
+key = "suggestion_ignore"
+label = "Ignored GitHub suggestion sources"
+description = "Optional comma-separated list of organizations (acme) and repositories (acme/widgets) that never produce suggestions, for every criterion. Case-insensitive. Wins over both allowlists: an ignored repository stays hidden even when its organization or the repository itself is allowlisted."
+type = "string"
+default = ""
+advanced = true
+
+[[settings]]
+key = "suggestion_ref_org"
+label = "Show organization in suggestion references"
+description = "Include the owner in each suggestion's reference, as in acme/widgets#123. AoE shows the reference when its \"Show source reference\" setting is on."
+type = "boolean"
+default = true
+advanced = true
+
+[[settings]]
+key = "suggestion_ref_repo"
+label = "Show repository in suggestion references"
+description = "Include the repository name in each suggestion's reference."
+type = "boolean"
+default = true
+advanced = true
+
+[[settings]]
+key = "suggestion_ref_number"
+label = "Show number in suggestion references"
+description = "Include the issue or pull request number in each suggestion's reference. With all three off, the full reference is shown."
+type = "boolean"
+default = true
+advanced = true
+
+[[settings]]
+key = "suggestion_limit"
+label = "Maximum GitHub suggestions"
+description = "Maximum suggestions retained in the provider snapshot."
+type = "integer"
+default = 100
+min = 1
+max = 500
 advanced = true
 
 # Session-row chip toggles (#36). Each defaults on; turning one off hides that
@@ -287,3 +346,65 @@ platforms = ["linux", "macos"]
 [[runtime.build]]
 command = [".aoe-build/venv/bin/pip", "install", "."]
 platforms = ["linux", "macos"]
+
+# Suggested sessions (api_version 20). Each source is one criterion the host
+# can switch off per profile; the worker asks `suggestions.sources` before every
+# discovery and never queries GitHub for a criterion that is off. Variables are
+# the `{name}` placeholders a user can put in a prompt template for that
+# criterion; every item of that criterion carries all of them. Order here is
+# the provider's ranking order (mirrored by CRITERIA in suggestions.py).
+[suggestions]
+
+[[suggestions.sources]]
+criterion = "changes_requested"
+label = "Changes requested on your PRs"
+description = "Your open PRs where a reviewer's current verdict on the head commit is changes requested."
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "reviewer", "unresolved_threads", "failed_checks"]
+
+[[suggestions.sources]]
+criterion = "review_requested"
+label = "Review requests"
+description = "Open PRs where your review is requested."
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha"]
+
+[[suggestions.sources]]
+criterion = "re_review"
+label = "Re-reviews"
+description = "Open PRs you reviewed that got new commits since your last review, without a formal re-request."
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "reviewed_commit_sha"]
+
+[[suggestions.sources]]
+criterion = "review_thread_reply"
+label = "Review threads awaiting your reply"
+description = "Your open PRs with unresolved review threads where someone else commented last."
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "reviewer", "unresolved_threads", "failed_checks"]
+
+[[suggestions.sources]]
+criterion = "merge_conflict"
+label = "Merge conflicts on your PRs"
+description = "Your open PRs that conflict with their base branch."
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "reviewer", "unresolved_threads", "failed_checks"]
+
+[[suggestions.sources]]
+criterion = "ci_failed"
+label = "Failing checks on your PRs"
+description = "Your open PRs whose head commit has failed or errored checks."
+variables = ["repo", "org", "title", "url", "timestamp", "pr_number", "author", "branch", "base_branch", "commit_sha", "reviewer", "unresolved_threads", "failed_checks"]
+
+[[suggestions.sources]]
+criterion = "mentioned"
+label = "Mentions"
+description = "Unread issue and PR comments that mention you or your team. Dismissing here does not mark the GitHub thread read."
+variables = ["repo", "org", "title", "url", "timestamp", "number", "kind", "comment_url"]
+
+[[suggestions.sources]]
+criterion = "assigned_issues"
+label = "Issues assigned to you"
+description = "Open issues assigned to you."
+variables = ["repo", "org", "title", "url", "timestamp", "issue_number", "author", "labels"]
+
+[[suggestions.sources]]
+criterion = "new_issues"
+label = "New issues"
+description = "Issues opened by others in the last 7 days in your allowlisted repositories and organizations, or in your registered projects' repositories when neither allowlist is set."
+variables = ["repo", "org", "title", "url", "timestamp", "issue_number", "author", "labels"]

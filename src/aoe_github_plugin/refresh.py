@@ -727,6 +727,40 @@ def _set_backoff(api: str, reset_at: Any = None) -> None:
             gate["reset_known"] = gate["reset_known"] or new_known
 
 
+def backoff_until(api: str) -> float:
+    """Monotonic deadline of one budget's backoff gate (0 when idle). Shared with
+    the suggestions provider so one rate-limit hit pauses every GitHub caller."""
+    with _cache_lock:
+        return float(_backoff[api]["until"])
+
+
+def arm_backoff(api: str, reset_at: Any = None) -> None:
+    """Public face of ``_set_backoff`` for callers outside this module."""
+    _set_backoff(api, reset_at)
+
+
+def note_graphql_rate_limit(rate_info: dict[str, Any]) -> None:
+    """Record a ``rateLimit`` payload from a query that is not per-repo (the
+    suggestions searches), so budget-pressure pacing sees that spend too."""
+    _observe_rate_limit(rate_info, kind="suggestions", repo="-", aliases=1)
+
+
+def arm_if_graphql_rate_limited(envelope: dict[str, Any]) -> bool:
+    """Arm the GraphQL gate from a 200 envelope carrying a ``RATE_LIMITED`` error,
+    using its ``resetAt``; ``True`` when it was rate limited."""
+    if not _graphql_rate_limited(envelope):
+        return False
+    _set_backoff("graphql", ((envelope.get("data") or {}).get("rateLimit") or {}).get("resetAt"))
+    return True
+
+
+def checkout_repo(path: str) -> str | None:
+    """``owner/name`` of a checkout's github.com origin, or ``None``."""
+    remote = _git(path, "remote", "get-url", "origin")
+    owner_repo = parse_owner_repo(remote) if remote else None
+    return f"{owner_repo[0]}/{owner_repo[1]}" if owner_repo else None
+
+
 def _active_backoff_locked(now: float) -> dict[str, Any] | None:
     """The active gate that stays limited LONGEST (the point the whole plugin is
     clear again), as ``{"seconds", "reset_known", "budget"}``, or ``None`` when
