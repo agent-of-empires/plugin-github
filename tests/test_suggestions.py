@@ -155,7 +155,7 @@ def test_review_requested_builds_item_with_variables_and_untrusted_prompt():
     assert len(items) == 1
     item = items[0]
     assert item["criterion"] == "review_requested"
-    assert item["source_ref"] == "https://github.com/acme/widgets/pull/42"
+    assert item["source_ref"] == "acme/widgets#42"
     assert item["variables"] == {
         "repo": "acme/widgets",
         "org": "acme",
@@ -454,7 +454,7 @@ def test_mentions_come_from_unread_mention_notifications_with_comment_preview():
     assert len(items) == 1
     item = items[0]
     assert item["criterion"] == "mentioned"
-    assert item["source_ref"] == "https://github.com/acme/widgets/pull/42"
+    assert item["source_ref"] == "acme/widgets#42"
     assert item["preview"] == "@me look"
     assert item["variables"]["kind"] == "pr"
     assert item["variables"]["number"] == "42"
@@ -491,7 +491,7 @@ def test_assigned_issue_builds_issue_variables():
     client = FakeClient({"assignee:@me": [_issue()]})
     items = _discover(client, {"assigned_issues"})
     assert client.queries == ["is:open is:issue assignee:@me"]
-    assert items[0]["source_ref"] == "https://github.com/acme/widgets/issues/7"
+    assert items[0]["source_ref"] == "acme/widgets#7"
     assert items[0]["variables"]["issue_number"] == "7"
     assert items[0]["variables"]["labels"] == "bug, p1"
     assert items[0]["variables"]["author"] == "reporter"
@@ -553,7 +553,7 @@ def test_fetch_ranks_by_criterion_then_recency_and_dedups_by_source(monkeypatch)
         orgs_raw="",
         project_repos={"acme/widgets"},
     )
-    assert [(item["criterion"], item["source_ref"].rsplit("/", 1)[1]) for item in items] == [
+    assert [(item["criterion"], item["source_ref"].rsplit("#", 1)[1]) for item in items] == [
         ("assigned_issues", "7"),
         ("new_issues", "8"),
         ("new_issues", "9"),
@@ -812,7 +812,7 @@ def test_worker_round_trip_queries_only_enabled_sources(monkeypatch, tmp_path):
     snapshots = [message["params"]["items"] for message in sent if message.get("method") == "suggestions.set"]
     assert len(snapshots) == 1
     assert [item["criterion"] for item in snapshots[0]] == ["assigned_issues"]
-    assert snapshots[0][0]["source_ref"] == "https://github.com/acme/widgets/issues/7"
+    assert snapshots[0][0]["source_ref"] == "acme/widgets#7"
     assert queries == ["is:open is:issue assignee:@me repo:acme/widgets"]
     assert not [message for message in sent if message.get("method") == "suggestions.error"]
 
@@ -1264,3 +1264,19 @@ def test_startup_publishes_checks_once(monkeypatch):
     monkeypatch.setattr(runtime, "resolve_interval", lambda: 0)
     runtime.run()
     assert published == [True]
+
+
+@pytest.mark.parametrize(
+    ("parts", "expected"),
+    [
+        ((True, True, True), "acme/widgets#7"),
+        ((None, None, None), "acme/widgets#7"),
+        ((False, True, True), "widgets#7"),
+        ((True, False, True), "acme#7"),
+        ((True, True, False), "acme/widgets"),
+        ((False, False, True), "#7"),
+        ((False, False, False), "acme/widgets#7"),
+    ],
+)
+def test_short_ref_keeps_the_parts_the_user_shows(parts, expected):
+    assert suggestions.short_ref("acme/widgets#7", *parts) == expected

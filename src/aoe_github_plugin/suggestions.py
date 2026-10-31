@@ -484,22 +484,22 @@ def _item(  # noqa: PLR0913 - one call site per criterion, keyword-only
     draft_title: str,
     prompt: str,
 ) -> dict[str, Any]:
-    source_ref = clamp(f"https://github.com/{repo}/{'pull' if kind == 'pr' else 'issues'}/{number}", STRING_BYTES)
+    url = clamp(f"https://github.com/{repo}/{'pull' if kind == 'pr' else 'issues'}/{number}", STRING_BYTES)
     all_variables = {
         "repo": repo,
         "org": repo.split("/", 1)[0],
         "title": title,
-        "url": source_ref,
+        "url": url,
         "timestamp": str(timestamp or ""),
         **variables,
     }
     # The host rejects the whole snapshot when one string exceeds its byte cap, so clamp them all.
     item: dict[str, Any] = {
-        "id": hashlib.sha256(f"{criterion}:{source_ref}".encode()).hexdigest()[:24],
+        "id": hashlib.sha256(f"{criterion}:{url}".encode()).hexdigest()[:24],
         "title": clamp(title, TITLE_BYTES),
         "reason": clamp(reason, STRING_BYTES),
-        "source_url": source_ref,
-        "source_ref": source_ref,
+        "source_url": url,
+        "source_ref": clamp(f"{repo}#{number}", STRING_BYTES),
         "preview": clamp(" ".join(str(body or "").split())[:400], PREVIEW_BYTES),
         # Opaque key core maps to registered projects (the user's mapping, not this plugin, picks the project).
         "mapping_key": clamp(repo.lower(), MAPPING_KEY_BYTES),
@@ -803,6 +803,7 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
     repos_raw: Any,
     orgs_raw: Any,
     limit_raw: Any = None,
+    ref_parts: tuple[Any, Any, Any] = (True, True, True),
     project_repos: set[str] | None = None,
     env: TokenEnvironment | None = None,
 ) -> list[dict[str, Any]]:
@@ -839,5 +840,19 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
     items.sort(key=lambda item: CRITERIA.index(item["criterion"]))
     unique: dict[str, dict[str, Any]] = {}
     for item in items:
-        unique.setdefault(item["source_ref"], item)
-    return list(unique.values())[:limit]
+        unique.setdefault(item["source_url"], item)
+    kept = list(unique.values())[:limit]
+    for item in kept:
+        item["source_ref"] = short_ref(item["source_ref"], *ref_parts)
+    return kept
+
+
+def short_ref(ref: str, show_org: Any, show_repo: Any, show_number: Any) -> str:
+    """``owner/repo#123`` trimmed to the parts the user shows; every part when none is."""
+    owner_repo, number = ref.rsplit("#", 1)
+    owner, repo = owner_repo.split("/", 1)
+    show = [part is not False for part in (show_org, show_repo, show_number)]
+    if not any(show):
+        return ref
+    name = "/".join(part for part, on in ((owner, show[0]), (repo, show[1])) if on)
+    return f"{name}#{number}" if show[2] else name
