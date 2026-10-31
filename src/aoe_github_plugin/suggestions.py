@@ -45,6 +45,8 @@ ERROR_BYTES = 4096
 # Allowlist grammar, so a setting can never smuggle extra search qualifiers.
 REPO_RE = re.compile(r"^[a-z0-9][a-z0-9-]*/[a-z0-9._-]+$")
 ORG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# Denylist grammar: an organization or an owner/repo.
+IGNORE_RE = re.compile(r"^[a-z0-9][a-z0-9-]*(/[a-z0-9._-]+)?$")
 # Only comment URLs under this prefix are fetched: the client sends the bearer token with them.
 API_REPOS_PREFIX = "https://api.github.com/repos/"
 # Mention previews cost one REST call each; bound the fan-out per refresh.
@@ -192,8 +194,21 @@ def _scope_terms(repos: set[str], orgs: set[str]) -> list[str]:
     return [f"repo:{repo}" for repo in sorted(repos)] + [f"org:{org}" for org in sorted(orgs)]
 
 
-def _queries(base: str, terms: list[str]) -> list[str]:
-    """``base`` plus the scope terms, split into queries that each fit GitHub's length limit."""
+def _exclusion_terms(ignored: set[str]) -> tuple[str, ...]:
+    return tuple(f"-repo:{entry}" if "/" in entry else f"-org:{entry}" for entry in sorted(ignored))
+
+
+def _queries(base: str, terms: list[str], excludes: tuple[str, ...] = ()) -> list[str]:
+    """``base`` plus the scope terms, split into queries that each fit GitHub's length limit.
+
+    Every query carries as many ``excludes`` as fit beside the longest scope term; the
+    rest are dropped, since the client-side ``_in_scope`` filter is the source of truth.
+    """
+    reserve = max((len(term) + 1 for term in terms), default=0)
+    for term in excludes:
+        if len(base) + 1 + len(term) + reserve > MAX_QUERY_CHARS:
+            break
+        base += " " + term
     if not terms:
         return [base]
     queries: list[str] = []
@@ -208,10 +223,15 @@ def _queries(base: str, terms: list[str]) -> list[str]:
     return queries
 
 
-def _in_scope(repo: str, repos: set[str], orgs: set[str]) -> bool:
+def _in_scope(repo: str, repos: set[str], orgs: set[str], ignored: set[str] | None = None) -> bool:
+    """Allowlisted (or no allowlist) and not ignored; an ignored org or repo always wins."""
+    repo = repo.lower()
+    owner = repo.split("/", 1)[0]
+    if ignored and (repo in ignored or owner in ignored):
+        return False
     if not repos and not orgs:
         return True
-    return repo.lower() in repos or repo.split("/", 1)[0].lower() in orgs
+    return repo in repos or owner in orgs
 
 
 def _login(actor: Any) -> str:
@@ -263,10 +283,12 @@ def _search(client: GitHubClient, document: str, query: str) -> list[dict[str, A
     raise RuntimeError("GitHub search exceeded the complete pagination limit")
 
 
-def _search_scoped(client: GitHubClient, document: str, base: str, terms: list[str]) -> list[dict[str, Any]]:
+def _search_scoped(
+    client: GitHubClient, document: str, base: str, terms: list[str], excludes: tuple[str, ...] = ()
+) -> list[dict[str, Any]]:
     """``_search`` over every length-bounded chunk of the scope, one node per URL."""
     unique: dict[str, dict[str, Any]] = {}
-    for query in _queries(base, terms):
+    for query in _queries(base, terms, excludes):
         for node in _search(client, document, query):
             unique.setdefault(node["url"], node)
     return list(unique.values())
@@ -520,11 +542,13 @@ def _viewer_login(client: GitHubClient) -> str:
     return login
 
 
-def _review_side(client: GitHubClient, enabled: set[str], terms: list[str]) -> list[dict[str, Any]]:
+def _review_side(
+    client: GitHubClient, enabled: set[str], terms: list[str], excludes: tuple[str, ...] = ()
+) -> list[dict[str, Any]]:
     """``review_requested`` and ``re_review``; a formal request wins over a re-review."""
     items: dict[str, dict[str, Any]] = {}
     if "review_requested" in enabled:
-        for pr in _search_scoped(client, _REVIEW_PR_QUERY, "is:open is:pr review-requested:@me", terms):
+        for pr in _search_scoped(client, _REVIEW_PR_QUERY, "is:open is:pr review-requested:@me", terms, excludes):
             identity = _identity(pr)
             if identity is None:
                 continue
@@ -546,7 +570,7 @@ def _review_side(client: GitHubClient, enabled: set[str], terms: list[str]) -> l
     if "re_review" in enabled:
         login = _viewer_login(client)
         query = "is:open is:pr reviewed-by:@me -author:@me -review-requested:@me"
-        for pr in _search_scoped(client, _REVIEW_PR_QUERY, query, terms):
+        for pr in _search_scoped(client, _REVIEW_PR_QUERY, query, terms, excludes):
             identity = _identity(pr)
             if identity is None or pr["url"] in items:
                 continue
@@ -608,13 +632,15 @@ def _authored_matches(pr: dict[str, Any], wanted: list[str]) -> tuple[list[tuple
     return matched, extra
 
 
-def _authored(client: GitHubClient, enabled: set[str], terms: list[str]) -> list[dict[str, Any]]:
+def _authored(
+    client: GitHubClient, enabled: set[str], terms: list[str], excludes: tuple[str, ...] = ()
+) -> list[dict[str, Any]]:
     """One search for every criterion about the user's own open PRs; one item per PR."""
     wanted = [criterion for criterion in AUTHORED_CRITERIA if criterion in enabled]
     if not wanted:
         return []
     items: list[dict[str, Any]] = []
-    for pr in _search_scoped(client, _AUTHORED_PR_QUERY, "is:open is:pr author:@me", terms):
+    for pr in _search_scoped(client, _AUTHORED_PR_QUERY, "is:open is:pr author:@me", terms, excludes):
         identity = _identity(pr)
         if identity is None:
             continue
@@ -671,7 +697,9 @@ def _notifications(client: GitHubClient) -> list[dict[str, Any]]:
     return notifications
 
 
-def _mentions(client: GitHubClient, repos: set[str], orgs: set[str]) -> list[dict[str, Any]]:
+def _mentions(
+    client: GitHubClient, repos: set[str], orgs: set[str], ignored: set[str] | None = None
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     previews = 0
     seen: set[str] = set()
@@ -685,7 +713,7 @@ def _mentions(client: GitHubClient, repos: set[str], orgs: set[str]) -> list[dic
         repo = str((notification.get("repository") or {}).get("full_name") or "")
         api_url = str(subject.get("url") or "")
         number_text = api_url.rsplit("/", 1)[-1]
-        if not kind or not repo or not _in_scope(repo, repos, orgs) or not number_text.isdigit():
+        if not kind or not repo or not _in_scope(repo, repos, orgs, ignored) or not number_text.isdigit():
             continue
         body, comment_url = "", ""
         latest = subject.get("latest_comment_url")
@@ -752,39 +780,45 @@ def _issue_items(criterion: str, issues: list[dict[str, Any]], *, reason: str, v
     return items
 
 
-def _new_issues(client: GitHubClient, terms: list[str]) -> list[dict[str, Any]]:
+def _new_issues(client: GitHubClient, terms: list[str], excludes: tuple[str, ...] = ()) -> list[dict[str, Any]]:
     since = (datetime.now(timezone.utc) - timedelta(days=NEW_ISSUES_WINDOW_DAYS)).strftime("%Y-%m-%d")
-    issues = _search_scoped(client, _ISSUE_QUERY, f"is:open is:issue -author:@me created:>={since}", terms)
+    issues = _search_scoped(client, _ISSUE_QUERY, f"is:open is:issue -author:@me created:>={since}", terms, excludes)
     return _issue_items(
         "new_issues", issues, reason=f"Opened in the last {NEW_ISSUES_WINDOW_DAYS} days", verb="Investigate"
     )
 
 
-def _discover(
+def _discover(  # noqa: PLR0913 - keyword-only scope plumbing
     client: GitHubClient,
     *,
     enabled: set[str],
     repos: set[str],
     orgs: set[str],
     project_repos: set[str],
+    ignored: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     terms = _scope_terms(repos, orgs)
-    items = _authored(client, enabled, terms)
-    items += _review_side(client, enabled, terms)
+    excludes = _exclusion_terms(ignored or set())
+    items = _authored(client, enabled, terms, excludes)
+    items += _review_side(client, enabled, terms, excludes)
     if "mentioned" in enabled:
         try:
-            items += _mentions(client, repos, orgs)
+            items += _mentions(client, repos, orgs, ignored)
         except RateLimitedError as exc:
             # /notifications is REST; the searches draw on the separate GraphQL budget.
             refresh.arm_backoff("rest")
             raise RuntimeError(str(exc)) from exc
     if "assigned_issues" in enabled:
-        issues = _search_scoped(client, _ISSUE_QUERY, "is:open is:issue assignee:@me", terms)
+        issues = _search_scoped(client, _ISSUE_QUERY, "is:open is:issue assignee:@me", terms, excludes)
         items += _issue_items("assigned_issues", issues, reason="Assigned to you", verb="Work on")
     if "new_issues" in enabled:
-        new_terms = terms or [f"repo:{repo}" for repo in sorted(project_repos) if REPO_RE.match(repo)]
+        new_terms = terms or [
+            f"repo:{repo}"
+            for repo in sorted(project_repos)
+            if REPO_RE.match(repo) and _in_scope(repo, set(), set(), ignored)
+        ]
         if new_terms:
-            items += _new_issues(client, new_terms)
+            items += _new_issues(client, new_terms, excludes)
     return items
 
 
@@ -802,6 +836,7 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
     enabled: set[str],
     repos_raw: Any,
     orgs_raw: Any,
+    ignore_raw: Any = None,
     limit_raw: Any = None,
     ref_parts: tuple[Any, Any, Any] = (True, True, True),
     project_repos: set[str] | None = None,
@@ -819,6 +854,7 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
         return []
     repos = parse_csv(repos_raw, REPO_RE)
     orgs = parse_csv(orgs_raw, ORG_RE)
+    ignored = parse_csv(ignore_raw, IGNORE_RE)
     limit = (
         limit_raw if isinstance(limit_raw, int) and not isinstance(limit_raw, bool) and 1 <= limit_raw <= 500 else 100
     )
@@ -829,13 +865,20 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
         raise RuntimeError(str(exc)) from exc
     try:
         with GitHubClient(token) as client:
-            items = _discover(client, enabled=enabled, repos=repos, orgs=orgs, project_repos=project_repos or set())
+            items = _discover(
+                client,
+                enabled=enabled,
+                repos=repos,
+                orgs=orgs,
+                project_repos=project_repos or set(),
+                ignored=ignored,
+            )
     except RateLimitedError as exc:
         # A GraphQL rate-limit envelope already armed the gate with its exact reset; never shorten it.
         if time.monotonic() >= refresh.backoff_until("graphql"):
             refresh.arm_backoff("graphql")
         raise RuntimeError(str(exc)) from exc
-    items = [item for item in items if _in_scope(item["variables"]["repo"], repos, orgs)]
+    items = [item for item in items if _in_scope(item["variables"]["repo"], repos, orgs, ignored)]
     items.sort(key=lambda item: item["variables"]["timestamp"], reverse=True)
     items.sort(key=lambda item: CRITERIA.index(item["criterion"]))
     unique: dict[str, dict[str, Any]] = {}

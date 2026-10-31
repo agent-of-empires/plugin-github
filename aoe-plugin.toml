@@ -155,6 +155,14 @@ default = ""
 advanced = true
 
 [[settings]]
+key = "suggestion_ignore"
+label = "Ignored GitHub suggestion sources"
+description = "Optional comma-separated list of organizations (acme) and repositories (acme/widgets) that never produce suggestions, for every criterion. Case-insensitive. Wins over both allowlists: an ignored repository stays hidden even when its organization or the repository itself is allowlisted."
+type = "string"
+default = ""
+advanced = true
+
+[[settings]]
 key = "suggestion_ref_org"
 label = "Show organization in suggestion references"
 description = "Include the owner in each suggestion's reference, as in acme/widgets#123. AoE shows the reference when its \"Show source reference\" setting is on."
