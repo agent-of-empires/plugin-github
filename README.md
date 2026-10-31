@@ -88,6 +88,10 @@ Each item carries a `mapping_key` (the lowercased `owner/repo`); the project an
 item starts in comes from the mapping you set in AoE's suggestion mappings, not
 from this plugin.
 `suggestion_limit` caps the published snapshot (1-500) after a complete fetch.
+Each item's `source_ref` is a short reference such as `acme/widgets#123`, which
+AoE shows on suggestion rows when its "Show source reference" setting is on.
+`suggestion_ref_org`, `suggestion_ref_repo` and `suggestion_ref_number` choose
+its parts (`widgets#123` without the owner); with all three off it stays whole.
 A long allowlist is split across several searches, each within GitHub's 256-character query limit.
 
 Discovery runs at startup, on the host's `suggestions.refresh`, and on the
