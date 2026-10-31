@@ -84,14 +84,16 @@ Scope: `suggestion_repositories` (comma-separated `owner/repo`) and
 the token can see. `new_issues` needs a repository list: the allowlist or
 organizations when set, else the repositories of your registered AoE projects
 (read from each project's `origin` remote via the host's `projects.list`).
-Those same projects give each item its `project`; `suggestion_projects`
-(`owner/repo=project name or path`, one per line) overrides that mapping.
+Each item carries a `mapping_key` (the lowercased `owner/repo`); the project an
+item starts in comes from the mapping you set in AoE's suggestion mappings, not
+from this plugin.
 `suggestion_limit` caps the published snapshot (1-500) after a complete fetch.
 A long allowlist is split across several searches, each within GitHub's 256-character query limit.
 
 Discovery runs at startup, on the host's `suggestions.refresh`, and on the
 `ui_refresh_secs` tick. Searches and review histories are fetched to
-completion (10 pages of 50, 10 pages of 100 reviews per PR); exceeding a cap, a
+completion (10 pages of 50, 10 pages of 100 reviews, review threads and check
+contexts per PR); exceeding a cap, a
 GraphQL error, or a rate limit reports `suggestions.error`, and the host keeps
 its last good snapshot. The notification inbox is read newest first and stops
 after 500 entries. A rate limit arms the plugin's shared backoff gate for the
@@ -113,7 +115,10 @@ is sent to GitHub, and a probe skipped by the rate-limit backoff reports
 `warn`. The checks are not repeated on the `ui_refresh_secs` tick.
 
 Suggestion text from GitHub is source material, not trusted instructions. The
-provider proposes a task prompt but never creates sessions.
+provider proposes a task prompt but never creates sessions. Each draft prompt is
+fixed text that names only the PR or issue URL and starts with an untrusted-content
+notice; GitHub-controlled strings (titles, logins, check names, SHAs) live in
+`reason` and `variables`, never in the prompt prose.
 
 `open_pr` is the command-palette / shortcut way to open the active session's PR
 (requires a host on api_version 6+). It is a client action, not a worker call:
