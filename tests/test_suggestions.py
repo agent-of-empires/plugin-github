@@ -1280,3 +1280,98 @@ def test_startup_publishes_checks_once(monkeypatch):
 )
 def test_short_ref_keeps_the_parts_the_user_shows(parts, expected):
     assert suggestions.short_ref("acme/widgets#7", *parts) == expected
+
+
+# --- ignore list --------------------------------------------------------------------
+
+
+def _repo_issue(repo, number):
+    return _issue(number=number, url=f"https://github.com/{repo}/issues/{number}", repository={"nameWithOwner": repo})
+
+
+@pytest.mark.parametrize(
+    ("ignore", "repos", "orgs", "kept"),
+    [
+        pytest.param("acme", "", "", {"other/thing"}, id="org-entry"),
+        pytest.param("acme/widgets", "", "", {"acme/gears", "other/thing"}, id="repo-entry"),
+        pytest.param(" ACME/Widgets , Other ", "", "", {"acme/gears"}, id="case-insensitive"),
+        pytest.param("acme/widgets", "acme/widgets, acme/gears", "", {"acme/gears"}, id="repo-beats-repo-allowlist"),
+        pytest.param("acme", "acme/widgets", "", set(), id="org-beats-repo-allowlist"),
+        pytest.param("acme/gears", "", "acme", {"acme/widgets"}, id="repo-beats-org-allowlist"),
+        pytest.param("bad entry, a/b/c, repo:x", "", "", {"acme/widgets", "acme/gears", "other/thing"}, id="invalid"),
+    ],
+)
+def test_fetch_drops_ignored_orgs_and_repos(monkeypatch, ignore, repos, orgs, kept):
+    issues = [_repo_issue("Acme/Widgets", 1), _repo_issue("acme/gears", 2), _repo_issue("other/thing", 3)]
+    client = FakeClient({"assignee:@me": issues})
+    monkeypatch.setattr(suggestions, "GitHubClient", lambda _token: _Ctx(client))
+    monkeypatch.setattr(suggestions, "resolve_token", lambda _env: ("t", "env"))
+    items = suggestions.fetch_suggestions(
+        enabled={"assigned_issues"}, repos_raw=repos, orgs_raw=orgs, ignore_raw=ignore
+    )
+    assert {item["variables"]["repo"].lower() for item in items} == kept
+
+
+@pytest.mark.parametrize(
+    "base", ["is:pr author:@me", "is:pr reviewed-by:@me", "is:pr review-requested:@me", "assignee:@me", "created:>="]
+)
+def test_search_queries_carry_ignore_qualifiers(base):
+    client = FakeClient()
+    suggestions._discover(
+        client,
+        enabled=ALL - {"mentioned"},
+        repos=set(),
+        orgs={"acme"},
+        project_repos=set(),
+        ignored=suggestions.parse_csv("Spam, acme/Legacy", suggestions.IGNORE_RE),
+    )
+    [query] = [query for query in client.queries if base in query]
+    assert query.split()[-3:-1] == ["-repo:acme/legacy", "-org:spam"]
+    assert query.endswith(" org:acme")
+
+
+def test_ignore_qualifiers_never_push_a_query_past_the_length_limit():
+    repos = {f"some-owner/repository-{i:02d}" for i in range(10)}
+    ignored = {f"ignored-organization-{i:02d}" for i in range(20)}
+    client = FakeClient()
+    suggestions._discover(
+        client, enabled={"assigned_issues"}, repos=repos, orgs=set(), project_repos=set(), ignored=ignored
+    )
+    assert all(len(query) <= suggestions.MAX_QUERY_CHARS for query in client.queries)
+    assert {t for q in client.queries for t in q.split() if t.startswith("repo:")} == {f"repo:{r}" for r in repos}
+    assert all("-org:ignored-organization-00" in query for query in client.queries)
+
+
+def test_new_issues_skip_ignored_project_repos():
+    client = FakeClient()
+    suggestions._discover(
+        client,
+        enabled={"new_issues"},
+        repos=set(),
+        orgs=set(),
+        project_repos={"acme/widgets", "acme/x"},
+        ignored={"acme/x"},
+    )
+    [query] = client.queries
+    assert query.endswith(" -repo:acme/x repo:acme/widgets")
+
+
+def test_mentions_in_ignored_repos_skip_the_comment_preview():
+    client = FakeClient(notifications=[_notification(repository={"full_name": "Acme/Widgets"})])
+    items = suggestions._discover(
+        client, enabled={"mentioned"}, repos=set(), orgs=set(), project_repos=set(), ignored={"acme"}
+    )
+    assert items == []
+    assert [path for path, _, _ in client.rest] == ["/notifications"]
+
+
+def test_runtime_passes_the_ignore_setting(monkeypatch):
+    runtime = main.Runtime(send=lambda _m: None)
+    runtime.call_host = _host(
+        sources={"sources": [{"criterion": "assigned_issues", "enabled": True}]},
+        settings={"suggestion_ignore": "acme, other/thing"},
+    )
+    captured = {}
+    monkeypatch.setattr(main.suggestions, "fetch_suggestions", lambda **kwargs: captured.update(kwargs) or [])
+    runtime._refresh_suggestions()
+    assert captured["ignore_raw"] == "acme, other/thing"
