@@ -41,6 +41,7 @@ from datetime import datetime
 from datetime import timedelta
 from collections.abc import Callable
 
+from aoe_github_plugin import checks
 from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
 from aoe_github_plugin import uistate
@@ -53,6 +54,8 @@ SUGGESTIONS_SET = "suggestions.set"
 SUGGESTIONS_ERROR = "suggestions.error"
 SUGGESTIONS_REFRESH = "suggestions.refresh"
 SUGGESTIONS_SOURCES = "suggestions.sources"
+SUGGESTIONS_CHECKS_SET = "suggestions.checks.set"
+SUGGESTIONS_CHECKS_RUN = "suggestions.checks.run"
 PROJECTS_LIST = "projects.list"
 SUGGESTION_SETTING_KEYS = (
     "suggestion_repositories",
@@ -239,6 +242,7 @@ class Runtime:
         self._next_network: float | None = None
         self._next_poll: float | None = None
         self._suggestions_refresh_due = False
+        self._checks_due = False
 
     def _read_stdin(self) -> None:
         """Reader thread: drain stdin into the queue, then post ``_EOF``."""
@@ -290,6 +294,10 @@ class Runtime:
         if method == SUGGESTIONS_REFRESH:
             # A host notification: flag a rediscovery for the loop, nothing to answer.
             self._suggestions_refresh_due = True
+            return
+        if method == SUGGESTIONS_CHECKS_RUN:
+            # Also a notification: the host only sends it when the user asks to recheck.
+            self._checks_due = True
             return
         try:
             result = dispatch(method, params)
@@ -666,10 +674,38 @@ class Runtime:
             logging.getLogger(__name__).warning("host did not accept the suggestions snapshot: %r", result)
             self._send_suggestions(SUGGESTIONS_ERROR, {"message": "The host rejected the suggestions snapshot"})
 
+    def _publish_checks(self) -> None:
+        """Evaluate the setup checks and replace the host's list; if the
+        evaluation itself breaks, publish one failing check instead of nothing."""
+        if self.stopped:
+            return
+        try:
+            enabled = self._enabled_criteria()
+            settings = self._suggestion_settings()
+            report = checks.run_checks(
+                mentioned_enabled=None if enabled is None else "mentioned" in enabled,
+                repos_raw=settings["suggestion_repositories"],
+                orgs_raw=settings["suggestion_organizations"],
+            )
+        except Exception as exc:  # noqa: BLE001 - a broken check run must still tell the user
+            logging.getLogger(__name__).warning("setup checks failed", exc_info=True)
+            detail = str(exc) or type(exc).__name__
+            report = [checks.check("checks_error", "Setup checks could not run", "fail", detail, "See the worker log.")]
+        result = self.call_host(SUGGESTIONS_CHECKS_SET, {"checks": report})
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            logging.getLogger(__name__).warning("host did not accept the setup checks: %r", result)
+
     def _service_ticks(self) -> None:
         """Run whichever refresh is due: an inbound github.refresh, a fast local
         tick that noticed a session change, or the slower network tick."""
         suggestions_ran = False
+        if self._suggestions_refresh_due:
+            # A refresh or a sources change: the checks depend on both the enabled
+            # sources and the scope settings, so they must not outlive them.
+            self._checks_due = True
+        if self._checks_due:
+            self._checks_due = False
+            self._publish_checks()
         if self._suggestions_refresh_due:
             self._suggestions_refresh_due = False
             suggestions_ran = True
@@ -713,6 +749,8 @@ class Runtime:
             self.run_refresh()
         # Suggestions do not depend on AoE sessions, so they run even with none.
         self._refresh_suggestions()
+        # Checks run here, on the host's checks.run and on suggestions.refresh; no timer repeats them.
+        self._publish_checks()
         self._interval = self.resolve_interval()
         # interval 0 disables all background polling (startup + on github.refresh
         # still push); otherwise a fast local tick notices session changes and a
