@@ -84,6 +84,11 @@ Scope: `suggestion_repositories` (comma-separated `owner/repo`) and
 the token can see. `new_issues` needs a repository list: the allowlist or
 organizations when set, else the repositories of your registered AoE projects
 (read from each project's `origin` remote via the host's `projects.list`).
+`suggestion_ignore` (comma-separated organizations such as `acme` and
+repositories such as `acme/widgets`, case-insensitive) hides those sources from
+every criterion and wins over both allowlists. Searches also carry matching
+`-org:`/`-repo:` qualifiers, as many as fit GitHub's query limit, so ignored
+results do not use up the search budget.
 Each item carries a `mapping_key` (the lowercased `owner/repo`); the project an
 item starts in comes from the mapping you set in AoE's suggestion mappings, not
 from this plugin.
