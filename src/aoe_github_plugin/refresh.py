@@ -809,7 +809,9 @@ def arm_if_graphql_rate_limited(envelope: dict[str, Any]) -> bool:
 
 def checkout_repo(path: str) -> str | None:
     """``owner/name`` of a checkout's github.com origin, or ``None``."""
-    return _identify(path, {"github.com": GitHubHost.dotcom()})[1]
+    remote = _git(path, "remote", "get-url", "origin")
+    owner_repo = parse_owner_repo(remote, {"github.com": GitHubHost.dotcom()}) if remote else None
+    return f"{owner_repo[1]}/{owner_repo[2]}" if owner_repo else None
 
 
 def _active_backoff_locked(now: float, *, host: str) -> dict[str, Any] | None:
