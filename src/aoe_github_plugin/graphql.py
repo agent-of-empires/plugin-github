@@ -787,7 +787,7 @@ def reviewers(pr: dict[str, Any], *, ignore_bot_approval_recommendations: bool =
     re-request after a review) keeps their submitted state, since that is the
     position still on record. Totals: malformed nodes are skipped, never raised.
     A bot approval recommendation is dropped only when that exclusion is on and
-    the bot otherwise drives no ``commented`` signal — an unresolved thread or a
+    the bot otherwise drives no ``commented`` signal: an unresolved thread or a
     genuine (non-recommendation) COMMENTED review keeps it a ``commented``
     reviewer, matching ``commenters``/``review_state``.
     """
