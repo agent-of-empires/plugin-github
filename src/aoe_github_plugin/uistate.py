@@ -66,8 +66,8 @@ import json
 from typing import Any
 from datetime import datetime
 from datetime import timezone
-from urllib.parse import urlsplit
 
+from aoe_github_plugin import lookup
 from aoe_github_plugin.graphql import MERGED_COLOR
 
 ROW_BADGE_SLOT = ("row-badge", "github_pr_badge")
@@ -508,13 +508,12 @@ SELECT_METHOD = "github.select_pr"
 def _pull_key(repo: dict[str, Any], pull: dict[str, Any]) -> str:
     """Stable id for one PR within a session. Round-trips through the selector
     row's ``params`` and back as the worker's remembered selection, so it has to
-    be derived from the snapshot alone (no index into a list that reorders)."""
-    destination = repo.get("repo") or repo.get("name") or "?"
-    url = pull.get("url")
-    if isinstance(url, str):
-        parts = urlsplit(url).path.strip("/").split("/")
-        if len(parts) == 4 and parts[2] == "pull":
-            destination = f"{parts[0]}/{parts[1]}"
+    be derived from the snapshot alone (no index into a list that reorders).
+    The URL wins over the snapshot's repo, since an upstream PR carries the
+    fork's head but belongs to upstream."""
+    name = repo.get("repo") or repo.get("name") or "?"
+    fallback = tuple(name.split("/", 1)) if "/" in name else (name, "")
+    destination = "/".join(lookup.destination_of(pull.get("url"), fallback))
     return f"{destination}#{pull.get('number', '?')}"
 
 

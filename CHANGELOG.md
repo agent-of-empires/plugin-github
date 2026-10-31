@@ -14,6 +14,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 - **discovery:** Find upstream-targeting PRs from fork checkouts in web snapshots and direct-worker status/open handlers, using the GitHub remotes each checkout configures (no metadata or fork-lineage calls). The permitted head is always the checkout's own repo (upstream is only a destination), so unrelated same-name branches are rejected; caches, PR selection, and stack navigation stay destination-aware, and destination GraphQL pages are bounded to a single page with owner-scoped REST fallback (#129).
 - **refresh:** Cool down failed cold stack lookups, isolate stack retry cooldowns from primary REST backoff, evict departed members, mark fallback data stale, and exclude stack-only PRs from session status.
+- **discovery:** Treat an error-envelope discovery response as unknown rather than an empty census: a 200 carrying `RATE_LIMITED` or any other `errors`, or a missing repository connection, now serves the fallback instead of caching "no owned PRs". Discovery's `rateLimit` spend is recorded and a rate-limited envelope arms the shared GraphQL gate.
 - **pane:** Keep advisory stack states out of hard readiness blocks and omit footer verdicts for stack-only PRs.
 
 ## [2.3.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.3.0) - 2026-10-21

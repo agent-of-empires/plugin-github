@@ -117,7 +117,7 @@ fragment PRConnection on PullRequestConnection {
 # GraphQL literals that survive ``str.format``. rateLimit.cost (one per batched
 # query) lets the per-query budget be verified (#23).
 _ALIAS_FIELD = """    b{i}: pullRequests(
-      headRefName: $b{i}, states: [OPEN, MERGED], first: 100,
+      headRefName: $b{i}, states: [OPEN, MERGED], first: 3,
       orderBy: {{field: UPDATED_AT, direction: DESC}}
     ) {{ ...PRConnection }}"""
 
@@ -141,6 +141,64 @@ query({params}) {{
 {_PR_CONNECTION_FRAGMENT}"""
 
 
+# PRs the identity discovery knows are ours but the bounded branch page did not
+# carry (it was crowded with foreign same-name PRs). One document per missing PR,
+# by number: the same rich fragment, but a single node, so the nested
+# connections cost a fraction of a full branch page.
+DETAIL_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      id number title url state isDraft merged mergeable mergeStateStatus reviewDecision updatedAt headRefOid
+      headRefName headRepository { name owner { login } }
+      mergeQueueEntry { position state }
+      mergeQueue { url }
+      baseRefName additions deletions changedFiles
+      author { login }
+      baseRef { branchProtectionRule {
+        requiresStatusChecks
+        requiredStatusCheckContexts
+        requiredStatusChecks { context app { databaseId slug name } }
+      } }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { totalCount nodes {
+        __typename
+        ... on CheckRun {
+          name status conclusion detailsUrl startedAt completedAt
+          checkSuite { app { databaseId slug name } }
+        }
+        ... on StatusContext { context description targetUrl state creator { login } }
+      } } } } } }
+      reviews(last: 20, states: [COMMENTED]) { nodes { author { login } state outdated } }
+      reviewThreads(first: 100) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          isResolved path line
+          comments(first: 1) { nodes { author { login } bodyText url } }
+        }
+      }
+      reviewRequests(first: 20) { nodes { requestedReviewer {
+        __typename
+        ... on User { login }
+        ... on Team { slug }
+      } } }
+      timelineItems(last: 30, itemTypes: [
+        REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT, HEAD_REF_FORCE_PUSHED_EVENT, MERGED_EVENT
+      ]) {
+        nodes {
+          __typename
+          ... on ReviewRequestedEvent { createdAt actor { login } }
+          ... on ReviewRequestRemovedEvent { createdAt actor { login } }
+          ... on HeadRefForcePushedEvent { createdAt actor { login } }
+          ... on MergedEvent { createdAt actor { login } }
+        }
+      }
+    }
+  }
+}"""
+
+
 # The cheap change-detection tier (#69). Scalars plus the top-level check rollup
 # and the review-thread count only: no contexts, no thread nodes, no comments, so
 # a batched digest costs ~1 point where the rich query costs ~25-30. The fields
@@ -148,7 +206,7 @@ query({params}) {{
 # selected both here and in ``_PR_CONNECTION_FRAGMENT`` so a signature computed
 # from a full response compares equal to one computed from a digest response.
 _DIGEST_ALIAS_FIELD = """    b{i}: pullRequests(
-      headRefName: $b{i}, states: [OPEN, MERGED], first: 100,
+      headRefName: $b{i}, states: [OPEN, MERGED], first: 3,
       orderBy: {{field: UPDATED_AT, direction: DESC}}
     ) {{ pageInfo {{ hasNextPage endCursor }} nodes {{
       number state isDraft merged mergeable mergeStateStatus reviewDecision updatedAt headRefOid

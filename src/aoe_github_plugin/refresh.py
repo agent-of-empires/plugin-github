@@ -1082,20 +1082,97 @@ def _resolve_null_repository(
             out[key] = _pulls_result([], fresh=True)
 
 
-def _owned_connection(key: RepoKey, conn: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
-    """Filter one queried page down to the checkout's own PRs.
+def _fetch_details(
+    client: GitHubClient, owner: str, repo: str, numbers: set[Any], key: RepoKey
+) -> list[dict[str, Any]]:
+    """Fetch the rich node for each owned PR the bounded branch page omitted.
 
-    Returns ``(truncated, owned_conn)``. ``truncated`` is True when the source
-    connection still has more same-name PRs than the single page fetched, so the
-    page cannot prove the checkout's PR is absent. The caller then serves the
-    owner-scoped REST list instead of caching a false empty, and never arms the
-    per-key cooldown (a collision is not a failure to retry later). No follow-up
-    GraphQL paging: full queries per page would burn the shared point budget on
-    busy branch names, including same-repo ``main``.
+    Bounded by what discovery already proved belongs to this checkout, so this
+    is normally empty or a single PR. A failed fetch drops that PR from this
+    tick's result rather than failing the whole repo, matching the fail-soft
+    contract of the surrounding chunk.
     """
-    owned = lookup.filter_connection(conn, key)
-    truncated = bool((conn.get("pageInfo") or {}).get("hasNextPage"))
-    return truncated, owned
+    found: list[dict[str, Any]] = []
+    for number in sorted(n for n in numbers if isinstance(n, int)):
+        try:
+            data = client.post_graphql(graphql.DETAIL_QUERY, {"owner": owner, "repo": repo, "number": number})
+        except RateLimitedError:
+            _set_backoff("graphql")
+            break
+        except GitHubError:
+            continue
+        rate_info = (data.get("data") or {}).get("rateLimit") or {}
+        _observe_rate_limit(rate_info, kind="detail", repo=f"{owner}/{repo}", aliases=1)
+        if _graphql_rate_limited(data):
+            _set_backoff("graphql", rate_info.get("resetAt"))
+            break
+        node = ((data.get("data") or {}).get("repository") or {}).get("pullRequest")
+        if isinstance(node, dict) and lookup.matches_head(lookup.graphql_head(node), key):
+            found.append(node)
+    return found
+
+
+def _owned_connection(client: GitHubClient, key: RepoKey, conn: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """Resolve one chunk's page down to the checkout's own PRs.
+
+    Returns ``(truncated, owned_conn)``. Ownership is decided by the
+    item-per-page identity discovery (``lookup.discover_pages``), not by the
+    rich page: the aliased full/digest documents carry nested connections, so
+    paging THEM costs multiples of a small page, while discovery resolves a
+    busy branch name for a few scalars per page and stops early once every
+    owned PR is known.
+
+    When discovery cannot prove the answer (its page bound was exhausted while
+    the server still reported more PRs, so ours may lie past it, or the request
+    failed), ``truncated`` is True: the caller serves the owner-scoped REST list
+    instead of trusting the rich page. A REST-only collision still never arms
+    the per-key cooldown, because a collision is not a failure to retry.
+    """
+    owner, repo, branch = key[:3]
+
+    def observe(rate_info: dict[str, Any]) -> None:
+        """Record discovery's spend and arm the gate on budget pressure.
+
+        A ``RATE_LIMITED`` envelope is handled by the caller: ``discover_pages``
+        reports it as incomplete and flags it, so the REST fallback serves this
+        tick and the backoff gate stops the next one from retrying into it.
+        """
+        _observe_rate_limit(rate_info, kind="discover", repo=f"{owner}/{repo}", aliases=1)
+        remaining = rate_info.get("remaining")
+        if isinstance(remaining, int) and remaining < RATELIMIT_FLOOR:
+            _set_backoff("graphql", rate_info.get("resetAt"))
+
+    try:
+        nodes, complete, rate_limited = lookup.discover_pages(client, owner, repo, branch, observe=observe)
+        if rate_limited:
+            _set_backoff("graphql")
+    except RateLimitedError:
+        raise
+    except GitHubError:
+        return True, lookup.filter_connection(conn, key)
+    if not complete:
+        # The page bound was reached with the server still reporting more PRs, so
+        # which of them are ours is unknown: the rich page proves nothing either
+        # way. Serve the owner-scoped REST list instead.
+        return True, lookup.filter_connection(conn, key)
+    # Discovery supplies membership only: the rich page's own nodes are the ones
+    # normalised, so CI/review/comment fields are never replaced by the identity
+    # records. A PR discovery proved ours but this bounded page did not carry
+    # (foreign same-name PRs filled ``first: 3``) is fetched by number rather
+    # than reported absent, which would hide a real PR behind an empty result.
+    owned_numbers = {node.get("number") for node in nodes if lookup.matches_head(lookup.graphql_head(node), key)}
+    kept = [
+        node
+        for node in conn.get("nodes") or []
+        if isinstance(node, dict)
+        and node.get("number") in owned_numbers
+        and lookup.matches_head(lookup.graphql_head(node), key)
+    ]
+    missing = owned_numbers - {node.get("number") for node in kept}
+    kept.extend(_fetch_details(client, owner, repo, missing, key))
+    # A complete discovery is authoritative whatever the rich page truncated at,
+    # so nothing is withheld; pagination is off for the promoted thread fetch.
+    return False, {**conn, "pageInfo": {"hasNextPage": False}, "nodes": kept}
 
 
 def _apply_aliases(
@@ -1119,9 +1196,12 @@ def _apply_aliases(
         conn = repository.get(f"b{i}")
         if f"b{i}" in failed or not isinstance(conn, dict):
             _arm_retry_cooldown([key], pending, now)
-            out[key] = _fallback_pulls(pending[key])
+            # Serve this key's last-good answer. The digest tier may already have
+            # published an owned PR for this key this tick; a failed alias must
+            # not blank what was already resolved.
+            out.setdefault(key, _fallback_pulls(pending[key]))
             continue
-        truncated, conn = _owned_connection(key, conn)
+        truncated, conn = _owned_connection(client, key, conn)
         if truncated:
             # The single page was exhausted by foreign same-name PRs, so it
             # cannot prove the checkout's own PR is absent. The owner-scoped
@@ -1212,6 +1292,7 @@ def _fetch_chunk(
 
 
 def _apply_digest_aliases(
+    client: GitHubClient,
     chunk: list[RepoKey],
     pending: dict[RepoKey, dict[str, Any]],
     data: dict[str, Any],
@@ -1229,16 +1310,14 @@ def _apply_digest_aliases(
         conn = repository.get(f"b{i}")
         signature = None
         if f"b{i}" not in failed and isinstance(conn, dict):
-            truncated, owned = _owned_connection(key, conn)
+            truncated, owned = _owned_connection(client, key, conn)
             if truncated:
-                # Cannot verify the owned set from a truncated page: promote to
-                # the full query (which will itself fall back to REST if also
-                # truncated). Serve the fail-soft cache-shaped result meanwhile
-                # so the key is never left unset if the promoted fetch declines
-                # to write. The digest proved nothing, so it must report stale,
-                # never fresh. A collision is not a failure, so no cooldown.
+                # Discovery could not prove the owned set (its page bound was
+                # exhausted, or the request itself failed), so this page proves
+                # nothing. Serve the stale cache, like the other digest-tier
+                # failures: promoting here would spend a full-query point after
+                # every failed discovery, which is the burn this tier prevents.
                 out[key] = _fallback_pulls(pending[key])
-                promoted.append(key)
                 continue
             signature = graphql.digest_signature(owned)
         rich = pending[key]["rich"]  # never None on the digest path (classification requires a cache)
@@ -1305,7 +1384,7 @@ def _fetch_digest_chunk(
         _chunk_fallback(chunk, pending, out)
         return
 
-    for key in _apply_digest_aliases(chunk, pending, data, out):
+    for key in _apply_digest_aliases(client, chunk, pending, data, out):
         full_pending[key] = pending[key]
 
 

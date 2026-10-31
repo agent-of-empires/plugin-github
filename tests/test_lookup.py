@@ -68,6 +68,11 @@ def _node(destination, head_repo, number, branch="feature"):
     }
 
 
+# Mirrors ``first: 3`` in the aliased full/digest documents: those pages carry
+# nested connections, so the query stays one small page per branch.
+RICH_PAGE_SIZE = 3
+
+
 def _rest(node):
     return {
         "number": node["number"],
@@ -80,27 +85,73 @@ def _rest(node):
 
 
 class _API:
-    def __init__(self, nodes):
+    def __init__(self, nodes, *, capped=False):
         self.nodes = nodes
         self.requests = []
+        self.capped = capped
+
+    def _discover(self, variables):
+        """Answer the identity-only discovery query the way GitHub would: real
+        pages of ``DISCOVER_PAGE_SIZE`` nodes with a truthful ``hasNextPage``.
+        ``capped`` makes the server keep reporting more past the page bound, so
+        discovery cannot prove completeness."""
+        branch = variables["branch"]
+        matching = [
+            n for n in self.nodes.get(f"{variables['owner']}/{variables['repo']}", []) if n["headRefName"] == branch
+        ]
+        identity = [{k: n.get(k) for k in ("number", "headRefName", "headRepository")} for n in matching]
+        offset = int(variables.get("cursor") or 0)
+        size = lookup.DISCOVER_PAGE_SIZE
+        page = identity[offset : offset + size]
+        has_next = offset + size < len(identity) or (self.capped and offset + size >= len(identity) > 0)
+        return {"nodes": page, "pageInfo": {"hasNextPage": has_next, "endCursor": str(offset + size)}}
 
     def __call__(self, request):
         self.requests.append(request)
         parts = request.url.path.strip("/").split("/")
         if request.url.path == "/graphql":
             variables = json.loads(request.content)["variables"]
+            if "number" in variables:
+                destination = f"{variables['owner']}/{variables['repo']}"
+                by_number = {
+                    n["number"]: _node(
+                        destination,
+                        f"{n['headRepository']['owner']['login']}/{n['headRepository']['name']}",
+                        n["number"],
+                        n["headRefName"],
+                    )
+                    for n in self.nodes.get(destination, [])
+                }
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "rateLimit": {"remaining": 5000},
+                            "repository": {"pullRequest": by_number.get(variables["number"])},
+                        }
+                    },
+                )
+            if "cursor" in variables and "b0" not in variables:
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "rateLimit": {"remaining": 5000},
+                            "repository": {"pullRequests": self._discover(variables)},
+                        }
+                    },
+                )
             destination = f"{variables['owner']}/{variables['repo']}"
             aliases = {}
             for alias, branch in variables.items():
                 if not alias.startswith("b"):
                     continue
                 nodes = [n for n in self.nodes.get(destination, []) if n["headRefName"] == branch]
-                # Rich/digest queries fetch a single page; flag truncation only
-                # beyond the query's first:100 cap so tests with fewer nodes see
-                # a clean page.
+                # The rich/digest documents request ``first: 3``, so the server
+                # really does truncate: a crowded branch reports hasNextPage.
                 aliases[alias] = {
-                    "nodes": nodes,
-                    "pageInfo": {"hasNextPage": len(nodes) > 100, "endCursor": "101"},
+                    "nodes": nodes[:RICH_PAGE_SIZE],
+                    "pageInfo": {"hasNextPage": len(nodes) > RICH_PAGE_SIZE, "endCursor": str(RICH_PAGE_SIZE)},
                 }
             return httpx.Response(200, json={"data": {"rateLimit": {"remaining": 5000}, "repository": aliases}})
         destination = "/".join(parts[1:3])
@@ -333,10 +384,14 @@ def test_truncated_page_serves_rest_without_cooldown_on_busy_branch(tmp_path):
     api = _API({"team/r": [*foreign, team_pull]})
     graphql_queries = []
     served_pages = []
+    discovery_queries = []
 
     def handler(request):
         if request.url.path == "/graphql":
             variables = json.loads(request.content)["variables"]
+            if "b0" not in variables:
+                discovery_queries.append(variables)
+                return api(request)
             graphql_queries.append(variables)
             destination = f"{variables['owner']}/{variables['repo']}"
             matching = [n for n in api.nodes.get(destination, []) if n["headRefName"] == variables["b0"]]
@@ -377,6 +432,12 @@ def test_truncated_page_serves_rest_without_cooldown_on_busy_branch(tmp_path):
     # The truncation is remembered so the next tick cannot re-spend a full query
     # that is certain to truncate identically.
     assert refresh._truncated_until != {}
+
+    # The premise of this test: discovery really was exhausted by foreign
+    # same-name PRs, so completeness was unprovable rather than merely slow.
+    assert len(discovery_queries) == lookup.MAX_PULL_PAGES
+    assert all(q.get("cursor") for q in discovery_queries[1:])
+    assert len(foreign) > lookup.MAX_PULL_PAGES * lookup.DISCOVER_PAGE_SIZE
 
     # Second tick: no new GraphQL query, and the same owned PR is still shown.
     second = refresh.build_snapshot(
@@ -474,6 +535,8 @@ def test_truncated_key_reports_probe_freshness_not_fresh(tmp_path):
     def handler(request):
         if request.url.path == "/graphql":
             variables = json.loads(request.content)["variables"]
+            if "b0" not in variables:
+                return api(request)
             queries.append(variables)
             matching = [n for n in api.nodes.get("team/r", []) if n["headRefName"] == variables["b0"]]
             page = matching[:100]
@@ -564,6 +627,8 @@ def test_truncated_window_with_rest_backoff_keeps_freshness_stamp(tmp_path):
     def handler(request):
         if request.url.path == "/graphql":
             variables = json.loads(request.content)["variables"]
+            if "b0" not in variables:
+                return api(request)
             queries.append(variables)
             matching = [n for n in api.nodes.get("team/r", []) if n["headRefName"] == variables["b0"]]
             page = matching[:100]
@@ -614,3 +679,31 @@ def test_origin_empty_upstream_error_keeps_status_failsoft(tmp_path):
     assert repo["pulls"] == []
     assert repo["error"] is None
     assert repo.get("freshness") is None or repo["freshness"]["stale"] is False
+
+
+def test_owned_pr_past_bounded_rich_page_is_fetched_by_number(tmp_path):
+    # The rich documents request first: 3, so a branch crowded with foreign
+    # same-name PRs can leave an owned PR off the page. Discovery already proved
+    # it belongs to this checkout, so it must be fetched by number instead of
+    # vanishing into an empty (and cacheable) result.
+    path = _checkout(tmp_path / "fork", "alice/r", "upstream/r")
+    foreign = [_node("upstream/r", f"stranger{i}/r", i) for i in range(1, 5)]
+    api = _API({"upstream/r": [*foreign, _node("upstream/r", "alice/r", 8)]})
+    details = []
+
+    def handler(request):
+        response = api(request)
+        if request.url.path == "/graphql":
+            variables = json.loads(request.content)["variables"]
+            if "number" in variables:
+                details.append(variables)
+        return response
+
+    repo = refresh.build_snapshot(
+        [{"id": "s", "project_path": str(path)}], env=_Env(token=True), transport=httpx.MockTransport(handler)
+    )["sessions"][0]["repos"][0]
+    assert [p["number"] for p in repo["pulls"]] == [8]
+    assert [p["head"]["repo"]["owner"]["login"] for p in repo["pulls"]] == ["alice"]
+    # Exactly the missing PR was fetched: no extra spend for the ones the page
+    # already carried, and foreign heads never trigger a fetch.
+    assert [(d["owner"], d["repo"], d["number"]) for d in details] == [("upstream", "r", 8)]

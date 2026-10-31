@@ -74,7 +74,8 @@ def github_status(
             pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         result["pulls"] = pulls
         if pulls:
-            result["summary"] = f"{owner}/{repo}: PR #{pulls[0]['number']} open for {branch}"
+            where = "/".join(lookup.destination_of(pulls[0].get("url"), owner_repo))
+            result["summary"] = f"{where}: PR #{pulls[0]['number']} open for {branch}"
         else:
             result["summary"] = f"{owner}/{repo}: no open PR for {branch}"
     except GitHubError as exc:

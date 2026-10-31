@@ -16,6 +16,8 @@ binds to this checkout.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit
+from collections.abc import Callable
 
 from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import GitHubError
@@ -27,6 +29,19 @@ PullKey = tuple[str, str, str, str, str]
 # A ``head=owner:branch`` filter can span several repositories of one
 # destination; five pages is far past any realistic case and bounds the loop.
 MAX_PULL_PAGES = 5
+
+# The identity-only connection that resolves a branch to its PRs before any rich
+# query runs: ten tiny nodes per page bounded by ``MAX_PULL_PAGES``.
+DISCOVER_PAGE_SIZE = 10
+DISCOVER_QUERY = f"""query($owner: String!, $repo: String!, $branch: String!, $cursor: String) {{
+  rateLimit {{ cost remaining resetAt }}
+  repository(owner: $owner, name: $repo) {{
+    pullRequests(headRefName: $branch, states: [OPEN, MERGED], first: {DISCOVER_PAGE_SIZE}, after: $cursor) {{
+      pageInfo {{ hasNextPage endCursor }}
+      nodes {{ number headRefOid headRefName headRepository {{ name owner {{ login }} }} }}
+    }}
+  }}
+}}"""
 
 
 def repositories(origin: Repository, remotes: list[Repository]) -> list[Repository]:
@@ -81,11 +96,95 @@ def graphql_head(node: dict[str, Any]) -> dict[str, Any]:
     return {"ref": node.get("headRefName"), "repo": node.get("headRepository")}
 
 
+def discover_pages(
+    client: GitHubClient,
+    owner: str,
+    repo: str,
+    branch: str,
+    observe: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[list[dict[str, Any]], bool, bool]:
+    """Every OPEN/MERGED PR with this branch name in one destination, paged
+    through the identity-only connection.
+
+    Returns ``(nodes, complete, rate_limited)``. ``complete`` is True only when
+    the server itself reported the last page (``hasNextPage`` false). It is
+    False whenever the answer cannot be proven: the page bound was reached with
+    another page still pending, the cursor was unusable, or the response was an
+    error envelope (a 200 carrying ``errors``, e.g. ``RATE_LIMITED``, or a
+    missing ``repository``/connection). The caller then falls back to the
+    owner-scoped REST list instead of caching an empty result as authoritative
+    ownership. A final page that happens to be exactly full is still complete,
+    because the server's own ``hasNextPage`` is the authority, not the node
+    count.
+
+    ``rate_limited`` is True when an envelope reported a ``RATE_LIMITED`` error,
+    so the caller arms the shared GraphQL backoff instead of retrying into it.
+    ``observe`` receives each envelope's ``rateLimit`` payload: discovery's spend
+    is real budget, so it is recorded like every other query rather than
+    silently unaccounted.
+
+    This runs BEFORE any rich query: the aliased full and digest documents cost
+    30-110 points per document, so paging them would burn budget on a busy
+    branch name. Here a page is a handful of scalars, and the caller keeps only
+    the owned nodes and asks for their rich fields by number.
+    """
+    nodes: list[dict[str, Any]] = []
+    cursor: str | None = None
+    for _ in range(MAX_PULL_PAGES):
+        data = client.post_graphql(
+            DISCOVER_QUERY,
+            {"owner": owner, "repo": repo, "branch": branch, "cursor": cursor},
+        )
+        rate_info = (data.get("data") or {}).get("rateLimit")
+        if observe is not None and isinstance(rate_info, dict):
+            observe(rate_info)
+        errors = data.get("errors")
+        rate_limited = _is_rate_limited_envelope(errors)
+        repository = (data.get("data") or {}).get("repository")
+        if errors or not isinstance(repository, dict):
+            # An error envelope is not an empty census: it proves nothing about
+            # which PRs exist, so it must never be cached as "no owned PRs".
+            return nodes, False, rate_limited
+        pull_requests = repository.get("pullRequests")
+        if not isinstance(pull_requests, dict):
+            return nodes, False, rate_limited
+        page = pull_requests.get("pageInfo")
+        if not isinstance(page, dict):
+            return nodes, False, rate_limited
+        nodes.extend(node for node in pull_requests.get("nodes") or [] if isinstance(node, dict))
+        if not page.get("hasNextPage"):
+            return nodes, True, rate_limited
+        cursor = page.get("endCursor")
+        if not isinstance(cursor, str):
+            return nodes, False, rate_limited
+    return nodes, False, False
+
+
+def _is_rate_limited_envelope(errors: Any) -> bool:
+    """GitHub signals a GraphQL secondary rate limit as a 200 carrying an error
+    of type ``RATE_LIMITED`` (not an HTTP 4xx), so read it from the envelope."""
+    return isinstance(errors, list) and any(isinstance(e, dict) and e.get("type") == "RATE_LIMITED" for e in errors)
+
+
 def filter_connection(conn: Any, key: PullKey) -> Any:
     if not isinstance(conn, dict):
         return conn
     nodes = [n for n in conn.get("nodes") or [] if isinstance(n, dict) and matches_head(graphql_head(n), key)]
     return {**conn, "nodes": nodes}
+
+
+def destination_of(url: Any, fallback: Repository) -> Repository:
+    """The repository a PR lives in, parsed from its URL.
+
+    A PR's head may be the fork while it belongs to upstream, so labelling it
+    with the checkout's origin misnames both the repo and the number. Mirrors
+    the selector id in ``uistate._pull_key`` so a row and its summary agree.
+    """
+    if isinstance(url, str):
+        parts = urlsplit(url).path.strip("/").split("/")
+        if len(parts) == 4 and parts[2] == "pull":
+            return parts[0], parts[1]
+    return fallback
 
 
 def trim_pull(pr: dict[str, Any]) -> dict[str, Any]:
@@ -125,7 +224,10 @@ def open_pulls(client: GitHubClient, keys: list[PullKey]) -> list[dict[str, Any]
     """Open PRs matching every key, deduplicated by URL.
 
     Origin (``keys[0]``) is authoritative: a failing optional upstream must never
-    hide a healthy origin result, so only the origin's own failure surfaces.
+    hide a healthy origin result, so only the origin's own failure surfaces. It
+    surfaces only when nothing else found the PR either: an upstream hit is a
+    real answer, and raising over it would send ``github.open`` to a compare URL
+    that claims no PR exists.
     """
     pulls: dict[str, dict[str, Any]] = {}
     origin_error: GitHubError | None = None
@@ -141,6 +243,6 @@ def open_pulls(client: GitHubClient, keys: list[PullKey]) -> list[dict[str, Any]
             if isinstance(pr, dict) and matches_head(pr.get("head"), key):
                 pull = trim_pull(pr)
                 pulls[pull["url"]] = pull
-    if origin_error is not None:
+    if origin_error is not None and not pulls:
         raise origin_error
     return list(pulls.values())
