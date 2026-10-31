@@ -73,8 +73,9 @@ _RATE = "rateLimit { cost remaining resetAt }"
 _PAGE_INFO = "pageInfo { hasNextPage endCursor }"
 _THREAD_FIELDS = f"nodes {{ isResolved comments(last: 1) {{ nodes {{ author {{ login }} }} }} }} {_PAGE_INFO}"
 _CONTEXT_FIELDS = f"""nodes {{
-          ... on CheckRun {{ __typename name status conclusion }}
-          ... on StatusContext {{ __typename context state }}
+          ... on CheckRun {{ __typename name status conclusion startedAt completedAt
+            checkSuite {{ app {{ databaseId slug name }} }} }}
+          ... on StatusContext {{ __typename context state createdAt }}
         }} {_PAGE_INFO}"""
 _PR_FIELDS = """
         id number title body url updatedAt headRefName baseRefName
@@ -425,11 +426,9 @@ def _unresolved_threads_awaiting(pr: dict[str, Any]) -> int:
 
 
 def _failed_checks(pr: dict[str, Any]) -> list[str]:
-    return [
-        str(context.get("name") or context.get("context") or "check")
-        for context in _nodes(_head_commit(pr).get("statusCheckRollup"), "contexts")
-        if isinstance(context, dict) and graphql.context_state(context) == "failing"
-    ]
+    # check_summary keeps the latest run per name, so a check re-run green is not failing (#98).
+    summary = graphql.check_summary({"commits": {"nodes": [{"commit": _head_commit(pr)}]}})
+    return [str(run["name"]) for run in (summary or {}).get("runs", []) if run["state"] == "failing"]
 
 
 def _identity(node: dict[str, Any]) -> tuple[str, int] | None:

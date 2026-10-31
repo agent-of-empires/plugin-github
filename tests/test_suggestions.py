@@ -1032,6 +1032,28 @@ def test_cancelled_and_action_required_checks_count_as_failing_but_running_ones_
     assert item["variables"]["failed_checks"] == "a, b, c"
 
 
+def test_a_check_re_run_green_is_not_reported_as_failing():
+    contexts = [
+        {**_check_run("lint", "FAILURE"), "completedAt": "2026-01-01T00:00:00Z"},
+        {**_check_run("lint", "SUCCESS"), "completedAt": "2026-01-01T01:00:00Z"},
+        {**_check_run("test", "FAILURE"), "completedAt": "2026-01-01T00:00:00Z"},
+    ]
+    pr = _authored_pr(
+        commits={
+            "nodes": [
+                {
+                    "commit": {
+                        "oid": "head",
+                        "statusCheckRollup": {"contexts": {"nodes": contexts, "pageInfo": PAGE_DONE}},
+                    }
+                }
+            ]
+        }
+    )
+    [item] = _discover(FakeClient({" author:@me": [pr]}), {"ci_failed"})
+    assert item["variables"]["failed_checks"] == "test"
+
+
 def test_mention_previews_are_cached_across_a_304():
     comment_url = "https://api.github.com/repos/acme/widgets/issues/comments/9"
     client = FakeClient(
