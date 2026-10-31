@@ -108,7 +108,7 @@ query($query: String!, $after: String) {{
       ... on PullRequest {{
         {_PR_FIELDS}
         mergeable
-        commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{
+        commits(last: 1) {{ nodes {{ commit {{ id oid statusCheckRollup {{
           contexts(first: 100) {{ {_CONTEXT_FIELDS} }}
         }} }} }} }}
         reviewThreads(first: 100) {{ {_THREAD_FIELDS} }}
@@ -156,14 +156,13 @@ query($id: ID!, $after: String) {{
   }}
 }}
 """
+# Paged by commit node, not by PR: a push between pages must not splice two commits' contexts together.
 _CHECK_CONTEXTS_QUERY = f"""
 query($id: ID!, $after: String) {{
   {_RATE}
   node(id: $id) {{
-    ... on PullRequest {{
-      commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{
-        contexts(first: 100, after: $after) {{ {_CONTEXT_FIELDS} }}
-      }} }} }} }}
+    ... on Commit {{
+      statusCheckRollup {{ contexts(first: 100, after: $after) {{ {_CONTEXT_FIELDS} }} }}
     }}
   }}
 }}
@@ -303,37 +302,43 @@ def _complete_review_history(client: GitHubClient, pull_request: dict[str, Any])
     return {**pull_request, "reviews": {"nodes": reviews}}
 
 
+def _page_info(connection: dict[str, Any]) -> dict[str, Any]:
+    info = connection.get("pageInfo")
+    if not isinstance(info, dict) or not isinstance(info.get("hasNextPage"), bool):
+        raise TypeError("GitHub returned an invalid pull request connection")
+    return info
+
+
 def _drain_connection(
     client: GitHubClient,
     document: str,
-    pull_request: dict[str, Any],
+    node_id: Any,
     first: Any,
     pick: Callable[[Any], Any],
 ) -> list[Any]:
-    """Every node of a PR connection whose first page is ``first``; raise on a partial result.
+    """Every node of a connection whose first page is ``first``; raise on a partial result.
 
-    ``pick`` extracts the connection from a ``node(id:)`` page of ``document``. A missing
-    ``pageInfo`` means a single page.
+    ``pick`` extracts the connection from a ``node(id: node_id)`` page of ``document``.
     """
     if first is None:
         return []
     if not isinstance(first, dict) or not isinstance(first.get("nodes"), list):
         raise TypeError("GitHub returned an invalid pull request connection")
     nodes = list(first["nodes"])
-    info = first.get("pageInfo") or {}
+    info = _page_info(first)
     pages = 1
-    while info.get("hasNextPage"):
+    while info["hasNextPage"]:
         if pages >= MAX_PAGES:
             raise RuntimeError("GitHub pull request data exceeded the complete pagination limit")
-        cursor, pull_request_id = info.get("endCursor"), pull_request.get("id")
-        if not isinstance(pull_request_id, str) or not isinstance(cursor, str):
+        cursor = info.get("endCursor")
+        if not isinstance(node_id, str) or not isinstance(cursor, str):
             raise TypeError("GitHub returned an invalid pull request connection cursor")
-        node = _data(client.post_graphql(document, {"id": pull_request_id, "after": cursor})).get("node")
+        node = _data(client.post_graphql(document, {"id": node_id, "after": cursor})).get("node")
         page = pick(node)
         if not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
             raise TypeError("GitHub returned an invalid pull request connection")
         nodes.extend(page["nodes"])
-        info = page.get("pageInfo") or {}
+        info = _page_info(page)
         pages += 1
     return nodes
 
@@ -345,7 +350,7 @@ def _complete_signals(client: GitHubClient, pull_request: dict[str, Any], wanted
         threads = _drain_connection(
             client,
             _REVIEW_THREADS_QUERY,
-            pull_request,
+            pull_request.get("id"),
             pull_request.get("reviewThreads"),
             lambda node: node.get("reviewThreads") if isinstance(node, dict) else None,
         )
@@ -357,13 +362,9 @@ def _complete_signals(client: GitHubClient, pull_request: dict[str, Any], wanted
             contexts = _drain_connection(
                 client,
                 _CHECK_CONTEXTS_QUERY,
-                pull_request,
+                head.get("id"),
                 rollup.get("contexts"),
-                lambda node: (
-                    (_head_commit(node).get("statusCheckRollup") or {}).get("contexts")
-                    if isinstance(node, dict)
-                    else None
-                ),
+                lambda node: (node.get("statusCheckRollup") or {}).get("contexts") if isinstance(node, dict) else None,
             )
             complete = {
                 **complete,

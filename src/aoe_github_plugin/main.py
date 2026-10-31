@@ -648,7 +648,7 @@ class Runtime:
                     repos_raw=settings["suggestion_repositories"],
                     orgs_raw=settings["suggestion_organizations"],
                     limit_raw=settings["suggestion_limit"],
-                    project_repos=self._project_repos(),
+                    project_repos=self._project_repos() if "new_issues" in enabled else set(),
                 )
         except Exception as exc:  # noqa: BLE001 - report failure, keep the host's last good snapshot
             self._send_suggestions(
