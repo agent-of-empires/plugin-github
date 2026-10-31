@@ -60,7 +60,6 @@ PROJECTS_LIST = "projects.list"
 SUGGESTION_SETTING_KEYS = (
     "suggestion_repositories",
     "suggestion_organizations",
-    "suggestion_projects",
     "suggestion_limit",
 )
 
@@ -612,20 +611,18 @@ class Runtime:
             if isinstance(source, dict) and source.get("enabled") is True and isinstance(source.get("criterion"), str)
         }
 
-    def _project_repos(self) -> dict[str, str]:
-        """``owner/repo`` -> registered project path, from the host's project
-        list and each checkout's origin. Fail-soft: no host answer, no mapping."""
+    def _project_repos(self) -> set[str]:
+        """``owner/repo`` of each registered project, from the host's project
+        list and each checkout's origin. Fail-soft: no host answer, no repos."""
         result = self.call_host(PROJECTS_LIST, {})
         projects = result.get("projects") if isinstance(result, dict) else None
-        mapping: dict[str, str] = {}
+        repos: set[str] = set()
         for project in projects if isinstance(projects, list) else []:
             path = project.get("path") if isinstance(project, dict) else None
-            if not isinstance(path, str) or not path:
-                continue
-            repo = refresh.checkout_repo(path)
+            repo = refresh.checkout_repo(path) if isinstance(path, str) and path else None
             if repo:
-                mapping.setdefault(repo.lower(), path)
-        return mapping
+                repos.add(repo.lower())
+        return repos
 
     def _suggestion_settings(self) -> dict[str, Any]:
         settings: dict[str, Any] = {}
@@ -658,9 +655,8 @@ class Runtime:
                     enabled=enabled,
                     repos_raw=settings["suggestion_repositories"],
                     orgs_raw=settings["suggestion_organizations"],
-                    mapping_raw=settings["suggestion_projects"],
                     limit_raw=settings["suggestion_limit"],
-                    project_repos=self._project_repos(),
+                    project_repos=self._project_repos() if "new_issues" in enabled else set(),
                 )
         except Exception as exc:  # noqa: BLE001 - report failure, keep the host's last good snapshot
             self._send_suggestions(

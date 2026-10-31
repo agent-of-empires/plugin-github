@@ -9,12 +9,14 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 ### Features
 
 - **suggestions:** Publish host-managed suggested sessions for nine GitHub criteria (changes requested, review requested, re-review, review thread replies, merge conflicts, failing checks, mentions, assigned issues, new issues). The worker asks the host which criteria are on and makes no GitHub request for a disabled one. Requires AoE 1.21.0+ (SDK API 20).
-- **suggestions:** Add the `suggestion_repositories`, `suggestion_organizations`, `suggestion_projects` and `suggestion_limit` settings; map repositories to registered projects from `projects.list`.
+- **suggestions:** Add the `suggestion_repositories`, `suggestion_organizations` and `suggestion_limit` settings; `new_issues` falls back to the repositories of your registered projects from `projects.list`. Items carry a `mapping_key` (the lowercased `owner/repo`) and AoE's suggestion mappings (agent-of-empires#4912) choose the project, so there is no plugin-side project setting.
 - **suggestions:** Report setup checks to the host (`gh` installed, signed in, repositories readable, notifications scope) at startup, on the host's recheck and on every suggestions refresh, with a one-line fix for each failing check.
 - **pane:** Show GitHub-native pull request stacks, layer navigation, and readiness through the selected PR.
 
 ### Bug Fixes
 
+- **suggestions:** Follow `hasNextPage` for review threads and status check contexts on authored PRs (up to 10 pages of 100 each) so `review_thread_reply` and `ci_failed` no longer miss matches past the first page; a larger PR reports `suggestions.error` instead of a partial result.
+- **suggestions:** Build each draft prompt from fixed text and lead it with the untrusted-content notice; reviewer logins, check names and commit SHAs stay in `reason` and `variables`, never in the prompt prose.
 - **refresh:** Cool down failed cold stack lookups, isolate stack retry cooldowns from primary REST backoff, evict departed members, mark fallback data stale, and exclude stack-only PRs from session status.
 - **pane:** Keep advisory stack states out of hard readiness blocks and omit footer verdicts for stack-only PRs.
 
