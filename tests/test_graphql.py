@@ -220,6 +220,23 @@ def test_bot_approval_recommendation_is_opt_in():
     ]
 
 
+def test_standing_block_outranks_retained_bot_comment():
+    # A standing CHANGES_REQUESTED outranks a retained comment: a bot that
+    # blocked, then commented, then recommended approval must still show the
+    # block in reviewers (a comment does not dismiss the earlier block).
+    rec = _approval_recommendation()
+    prior_comment = {**rec, "body": "Please update this section."}
+    blocked = _pr(decision="CHANGES_REQUESTED")
+    blocked["reviews"] = {"nodes": [prior_comment, rec]}
+    blocked["latestReviews"] = {"nodes": [rec]}
+    blocked["decidedReviews"] = {"nodes": [_latest("CHANGES_REQUESTED", "head", "reviewbot")]}
+    blocked["headRefOid"] = "head"
+    assert graphql.review_state(blocked, ignore_bot_approval_recommendations=True) == "changes-requested"
+    assert graphql.reviewers(blocked, ignore_bot_approval_recommendations=True) == [
+        {"name": "reviewbot", "state": "changes-requested"}
+    ]
+
+
 def test_ignored_commenters_only_downgrade_bot_only_commented():
     ignored = graphql.parse_ignored_commenters("CodeRabbitAI, codecov[bot]")
     assert ignored == {"coderabbitai", "codecov"}

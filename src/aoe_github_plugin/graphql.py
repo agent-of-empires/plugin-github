@@ -803,6 +803,11 @@ def reviewers(pr: dict[str, Any], *, ignore_bot_approval_recommendations: bool =
         if r.get("state") == "COMMENTED" and not _is_bot_approval_recommendation(r)
     }
     genuine_commenters |= _thread_openers(pr)
+    # A reviewer's standing CHANGES_REQUESTED outranks a later comment: a comment
+    # does not dismiss the earlier block, so the pane must keep showing it (e.g.
+    # a bot that blocked, then commented, then recommended approval). Keyed by
+    # name so the retained reviewer below reports the block, not the comment.
+    blocking_by_name = {_reviewer_name(n.get("author")): n for n in _blocking_reviews(pr)}
     for node in _nodes(pr, "latestReviews"):
         name = _reviewer_name(node.get("author"))
         is_excluded_recommendation = (
@@ -816,9 +821,14 @@ def reviewers(pr: dict[str, Any], *, ignore_bot_approval_recommendations: bool =
         if name is None or name in seen:
             continue
         seen.add(name)
-        state = _REVIEW_NODE_STATE.get(node.get("state") or "", "pending")
-        if state == "changes-requested" and _review_is_stale(pr, node):
-            state = "changes-pushed"
+        block = blocking_by_name.get(name)
+        if block is not None:
+            stale = _review_is_stale(pr, block)
+            state = "changes-pushed" if stale else "changes-requested"
+        else:
+            state = _REVIEW_NODE_STATE.get(node.get("state") or "", "pending")
+            if state == "changes-requested" and _review_is_stale(pr, node):
+                state = "changes-pushed"
         out.append({"name": name, "state": state})
     # A re-requested reviewer is gone from `latestReviews` but their block stands.
     for node in _blocking_reviews(pr):
