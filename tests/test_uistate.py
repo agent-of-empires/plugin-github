@@ -543,8 +543,12 @@ def test_pane_keeps_no_pr_repos_direct_when_nothing_is_actionable():
 def test_pane_selector_ranks_open_prs_above_merged_ones():
     session = _session(
         repos=[
-            _repo(name="merged", repo="o/merged", pulls=[_rich_pull(state="MERGED", merged=True)]),
-            _repo(name="open", repo="o/open", pulls=[_pull(number=1)]),
+            _repo(
+                name="merged",
+                repo="o/merged",
+                pulls=[{**_rich_pull(state="MERGED", merged=True), "url": "https://github.com/o/merged/pull/5"}],
+            ),
+            _repo(name="open", repo="o/open", pulls=[{**_pull(number=1), "url": "https://github.com/o/open/pull/1"}]),
         ]
     )
     blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(session)))["payload"]["blocks"]
@@ -1255,3 +1259,19 @@ def test_multi_repo_selector_disambiguates_equal_pr_numbers_and_targets_selectio
         "https://github.com/o/second/pull/7",
     ]
     assert all(repo["repo"] in row["sublabel"] for repo, row in zip(repos, rows, strict=True))
+
+
+def test_upstream_stack_navigation_uses_destination_not_checkout_origin():
+    pull = {
+        **_pull(),
+        "url": "https://github.com/upstream/r/pull/7",
+        "stack": [{"number": n, "url": f"https://github.com/upstream/r/pull/{n}", "state": "open"} for n in (6, 7)],
+    }
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(repo="alice/r", pulls=[pull])])))
+    stack = next(b for b in _pane(params)["payload"]["blocks"] if b.get("title") == "Stack · PR 2 of 2")
+    rows = [row for row in stack["children"] if row.get("method") == "github.select_pr"]
+    assert [row["params"]["pr"] for row in rows] == ["upstream/r#6", "upstream/r#7"]
+    assert [row["href"] for row in rows] == [
+        "https://github.com/upstream/r/pull/6",
+        "https://github.com/upstream/r/pull/7",
+    ]

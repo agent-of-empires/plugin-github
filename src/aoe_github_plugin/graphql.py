@@ -46,10 +46,18 @@ from datetime import timezone
 # check_summary), so truncating the connection could drop a failing check past the
 # cap and render a PR falsely green. A PR with 50+ checks is routine, and
 # check_summary keeps the raw rollup whenever the page is still truncated.
-_PR_CONNECTION_FRAGMENT = """
-fragment PRConnection on PullRequestConnection {
-  nodes {
+#
+# The node body is its own fragment because TWO documents select it: the aliased
+# branch connection below, and DETAIL_QUERY by number. They had drifted apart
+# once (DETAIL_QUERY was missing ``latestReviews``/``decidedReviews``,
+# ``closingIssuesReferences``, the workflow name, and the commit/review/comment
+# timeline types), so a PR recovered by number was silently normalised from
+# partial data: no reviewers, ``head_approved`` false, "changes requested"
+# instead of "changes-pushed". A shared fragment makes that unrepresentable.
+_PR_NODE_FRAGMENT = """
+fragment PRNode on PullRequest {
     id number title url state isDraft merged mergeable mergeStateStatus reviewDecision updatedAt headRefOid
+    headRefName headRepository { name owner { login } }
     mergeQueueEntry { position state }
     mergeQueue { url }
     baseRefName additions deletions changedFiles
@@ -107,9 +115,18 @@ fragment PRConnection on PullRequestConnection {
         comments(first: 1) { nodes { author { login } bodyText url } }
       }
     }
-  }
 }
 """
+
+_PR_CONNECTION_FRAGMENT = (
+    _PR_NODE_FRAGMENT
+    + """
+fragment PRConnection on PullRequestConnection {
+  pageInfo { hasNextPage endCursor }
+  nodes { ...PRNode }
+}
+"""
+)
 
 # One aliased ``pullRequests`` field. ``{i}`` is the index; the doubled braces are
 # GraphQL literals that survive ``str.format``. rateLimit.cost (one per batched
@@ -139,6 +156,23 @@ query({params}) {{
 {_PR_CONNECTION_FRAGMENT}"""
 
 
+# PRs the identity discovery knows are ours but the bounded branch page did not
+# carry (it was crowded with foreign same-name PRs). One document per missing PR,
+# by number: the same rich fragment, but a single node, so the nested
+# connections cost a fraction of a full branch page.
+DETAIL_QUERY = (
+    """
+query($owner: String!, $repo: String!, $number: Int!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) { ...PRNode }
+  }
+}
+"""
+    + _PR_NODE_FRAGMENT
+)
+
+
 # The cheap change-detection tier (#69). Scalars plus the top-level check rollup
 # and the review-thread count only: no contexts, no thread nodes, no comments, so
 # a batched digest costs ~1 point where the rich query costs ~25-30. The fields
@@ -148,8 +182,9 @@ query({params}) {{
 _DIGEST_ALIAS_FIELD = """    b{i}: pullRequests(
       headRefName: $b{i}, states: [OPEN, MERGED], first: 3,
       orderBy: {{field: UPDATED_AT, direction: DESC}}
-    ) {{ nodes {{
+    ) {{ pageInfo {{ hasNextPage endCursor }} nodes {{
       number state isDraft merged mergeable mergeStateStatus reviewDecision updatedAt headRefOid
+      headRefName headRepository {{ name owner {{ login }} }}
       mergeQueueEntry {{ position state }}
       commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }}
       reviewThreads(first: 1) {{ totalCount }}
@@ -915,6 +950,7 @@ def _normalize_pull(pr: dict[str, Any], *, required_checks_only: bool = False) -
         "title": pr.get("title") or "",
         "state": pr.get("state"),
         "draft": bool(pr.get("isDraft", False)),
+        "head": {"ref": pr.get("headRefName"), "repo": pr.get("headRepository")},
         "merged": bool(pr.get("merged", False)),
         "merge_state": merge_state(pr),
         "merge_queue": _merge_queue(pr),

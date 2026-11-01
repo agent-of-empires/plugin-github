@@ -67,6 +67,7 @@ from typing import Any
 from datetime import datetime
 from datetime import timezone
 
+from aoe_github_plugin import lookup
 from aoe_github_plugin.graphql import MERGED_COLOR
 
 ROW_BADGE_SLOT = ("row-badge", "github_pr_badge")
@@ -507,8 +508,13 @@ SELECT_METHOD = "github.select_pr"
 def _pull_key(repo: dict[str, Any], pull: dict[str, Any]) -> str:
     """Stable id for one PR within a session. Round-trips through the selector
     row's ``params`` and back as the worker's remembered selection, so it has to
-    be derived from the snapshot alone (no index into a list that reorders)."""
-    return f"{repo.get('repo') or repo.get('name') or '?'}#{pull.get('number', '?')}"
+    be derived from the snapshot alone (no index into a list that reorders).
+    The URL wins over the snapshot's repo, since an upstream PR carries the
+    fork's head but belongs to upstream."""
+    name = repo.get("repo") or repo.get("name") or "?"
+    fallback = tuple(name.split("/", 1)) if "/" in name else (name, "")
+    destination = "/".join(lookup.destination_of(pull.get("url"), fallback))
+    return f"{destination}#{pull.get('number', '?')}"
 
 
 def _session_pulls(repos: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -612,7 +618,13 @@ def _pr_row(repo: dict[str, Any], pull: dict[str, Any], *, selected: bool, show_
         "selected": selected,
     }
     sublabel = " · ".join(
-        str(x) for x in ((repo.get("repo") if show_repo else None), repo.get("branch"), pull.get("author")) if x
+        str(x)
+        for x in (
+            _pull_key(repo, pull).rsplit("#", 1)[0] if show_repo else None,
+            repo.get("branch"),
+            pull.get("author"),
+        )
+        if x
     )
 
     if sublabel:
@@ -1168,7 +1180,7 @@ def _stack_rows(repo: dict[str, Any], stack: list[Any], position: int) -> tuple[
             "value": status,
             "value_tone": tone,
             "method": SELECT_METHOD,
-            "params": {"pr": f"{repo.get('repo') or '?'}#{member_number}"},
+            "params": {"pr": _pull_key(repo, member)},
             "selected": index == position,
         }
         if member.get("url"):
@@ -1407,7 +1419,7 @@ def _pane_blocks(
                         repo,
                         pull,
                         selected=_pull_key(repo, pull) == chosen_key,
-                        show_repo=len({item.get("repo") for item, _ in pulls}) > 1,
+                        show_repo=len({_pull_key(item, pr).rsplit("#", 1)[0] for item, pr in pulls}) > 1,
                     )
                     for repo, pull in pulls
                 ],

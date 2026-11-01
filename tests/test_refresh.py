@@ -15,8 +15,11 @@ from datetime import timedelta
 import httpx
 import pytest
 
+from aoe_github_plugin import lookup
+from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
 from aoe_github_plugin.auth import TokenEnvironment
+from aoe_github_plugin.utils.gitctx import remote_owner_repos
 
 
 class _Env(TokenEnvironment):
@@ -67,7 +70,17 @@ def _make_submodule(parent, name):
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache():
+def _clear_cache(monkeypatch):
+    # Polling fixtures model a plain origin-only checkout; test_lookup exercises
+    # the real resolver against real remotes.
+    def _plain(path):
+        # Refresh reads remotes through its own timed ``_git`` now, so the
+        # resolver it used to call is no longer a refresh attribute. Use the
+        # gitctx resolver directly: it returns the real configured remotes.
+        return remote_owner_repos(path)[:1]
+
+    monkeypatch.setattr(refresh, "_remote_repos", _plain)
+
     def _reset():
         refresh._etag_cache.clear()
         refresh._graphql_cache.clear()
@@ -80,6 +93,7 @@ def _clear_cache():
         refresh._backoff["notified"] = False
         refresh._graphql_budget.update({"remaining": None, "valid_until": None})
         refresh._retry_cooldown.clear()
+        refresh._truncated_until.clear()
 
     _reset()
     yield
@@ -143,13 +157,14 @@ def _transport(pulls, etag='W/"v1"', capture=None):
     return httpx.MockTransport(handler)
 
 
-def _pull(number=12, draft=False):
+def _pull(number=12, draft=False, branch="feature", repo="r", owner="o"):
     return {
         "number": number,
-        "html_url": f"https://github.com/o/r/pull/{number}",
+        "html_url": f"https://github.com/{owner}/{repo}/pull/{number}",
         "title": "t",
         "state": "open",
         "draft": draft,
+        "head": {"ref": branch, "repo": {"name": repo, "owner": {"login": owner}}},
     }
 
 
@@ -294,6 +309,98 @@ def test_backoff_cached_basic_refresh_keeps_prior_freshness(tmp_path, monkeypatc
 # --- rich GraphQL path (token present) ---
 
 
+def _graphql_kind(request):
+    """Which GraphQL document a fixture request carries, read from its variables.
+
+    Ownership discovery sends ``branch``/``cursor``; a by-number detail fetch
+    sends ``number``; the batched rich/digest documents send ``b0``/``b1``/...
+    """
+    if not request.url.path.endswith("/graphql"):
+        return None
+    try:
+        variables = json.loads(request.content.decode()).get("variables", {})
+    except (ValueError, AttributeError):
+        return "rich"
+    if "branch" in variables:
+        return "discover"
+    if "number" in variables:
+        return "detail"
+    return "rich"
+
+
+def _is_graphql(request):
+    """True for any GraphQL request (discovery, detail, rich or digest)."""
+    return _graphql_kind(request) is not None
+
+
+def _detail_number(request) -> int:
+    """The PR number a DETAIL_QUERY asks for, so a transport can answer it."""
+    return json.loads(request.content)["variables"]["number"]
+
+
+def _owned(*numbers, branch="feature", head=("o", "r")):
+    """A discovery response proving these PR numbers are this checkout's own.
+
+    Tests that inject GraphQL *failures* still need discovery to succeed: if it
+    failed, the fallback would answer first and the path under test never runs.
+    """
+    return httpx.Response(
+        200,
+        json={
+            "data": {
+                "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                "repository": {
+                    "pullRequests": {
+                        "nodes": [
+                            {
+                                "number": n,
+                                "state": "OPEN",
+                                "headRefName": branch,
+                                "headRepository": {"name": head[1], "owner": {"login": head[0]}},
+                            }
+                            for n in numbers
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                },
+            }
+        },
+    )
+
+
+def _passthrough(request, nodes, *, remaining=5000):
+    """Answer the ownership rungs (discovery, by-number detail) from the same
+    nodes a fixture's branch page carries.
+
+    A fixture whose rich page is empty gates everything out, and a fixture whose
+    discovery omits a PR forces a detail fetch it did not script; keeping both
+    rungs derived from one node list means every fixture stays internally
+    consistent without each one re-implementing them.
+    """
+    variables = json.loads(request.content.decode()).get("variables", {})
+    present = [n for n in nodes or [] if isinstance(n, dict)]
+    rate = {"cost": 1, "remaining": remaining, "resetAt": "x"}
+    if "branch" in variables:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "rateLimit": rate,
+                    "repository": {
+                        "pullRequests": {
+                            "nodes": [
+                                {k: n.get(k) for k in ("number", "headRefName", "headRepository")} for n in present
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    },
+                }
+            },
+        )
+    match = next((n for n in present if n.get("number") == variables.get("number")), None)
+    return httpx.Response(200, json={"data": {"rateLimit": rate, "repository": {"pullRequest": match}}})
+
+
 def _gql_node(number=7, state="OPEN", merged=False, draft=False, decision="APPROVED"):
     return {
         "id": f"PR_{number}",
@@ -304,6 +411,8 @@ def _gql_node(number=7, state="OPEN", merged=False, draft=False, decision="APPRO
         "isDraft": draft,
         "merged": merged,
         "reviewDecision": decision,
+        "headRefName": "feature",
+        "headRepository": {"name": "r", "owner": {"login": "o"}},
         "commits": {
             "nodes": [
                 {
@@ -360,7 +469,12 @@ def _rich_transport(nodes, *, etag='W/"v1"', remaining=5000, errors=None, gql=No
     for. ``gql`` is an optional capture list for the GraphQL requests."""
 
     def handler(request):
-        if str(request.url).endswith("/graphql"):
+        if _is_graphql(request):
+            kind = _graphql_kind(request)
+            if kind in {"discover", "detail"}:
+                # Both rungs are answered from the same nodes this transport
+                # fronts (see ``_passthrough``), so gating never diverges.
+                return _passthrough(request, nodes, remaining=remaining)
             if gql is not None:
                 gql.append(request)
             if errors is not None:
@@ -374,7 +488,12 @@ def _rich_transport(nodes, *, etag='W/"v1"', remaining=5000, errors=None, gql=No
             return httpx.Response(200, json=body)
         if request.headers.get("If-None-Match") == etag:
             return httpx.Response(304)
-        return httpx.Response(200, headers={"ETag": etag}, json=[_pull()])
+        # The REST list mirrors the rich nodes this transport fronts, so a warm
+        # rich cache describes the same open PRs (see ``_same_pull_set``). With no
+        # nodes it still lists one PR: the "rich saw nothing, REST sees one"
+        # divergence the fallback tests exercise.
+        listed = [_pull(number=n["number"]) for n in nodes] or [_pull()]
+        return httpx.Response(200, headers={"ETag": etag}, json=listed)
 
     return httpx.MockTransport(handler)
 
@@ -876,6 +995,58 @@ def test_graphql_rate_limit_serves_stale(tmp_path):
     assert refresh._backoff["graphql"]["until"] > time.monotonic()
 
 
+def test_discovery_rate_limited_envelope_is_not_an_empty_census():
+    # A 200 RATE_LIMITED envelope carries no repository, which used to read as an
+    # authoritative "no owned PRs" page. It must instead be reported unknown (so
+    # the caller serves fallback rather than caching an empty result), flagged
+    # rate-limited, and its spend must still be recorded.
+    def handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "data": {"rateLimit": {"cost": 1, "remaining": 4000, "resetAt": "x"}},
+                "errors": [{"type": "RATE_LIMITED", "message": "slow down"}],
+            },
+        )
+
+    observed: list[dict] = []
+    with refresh.GitHubClient(transport=httpx.MockTransport(handler)) as client:
+        nodes, complete, rate_limited = lookup.discover_pages(client, "o", "r", "feature", observe=observed.append)
+    assert nodes == []
+    assert complete is False  # unknown, never an empty census
+    assert rate_limited is True  # caller arms the shared gate
+    assert observed == [{"cost": 1, "remaining": 4000, "resetAt": "x"}]  # spend recorded
+
+
+def test_discovery_envelope_serves_stale_and_arms_backoff(tmp_path):
+    # End to end: a rate-limited discovery keeps the cached answer instead of
+    # publishing an empty pull list, and the next tick is gated.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=42)]))
+    _expire_graphql_cache()
+    refresh._graphql_budget.update({"remaining": None, "valid_until": None})
+    fallback = _rich_transport([_gql_node(number=42)]).handler
+
+    def handler(request):
+        if _is_graphql(request) and json.loads(request.content)["variables"].get("branch"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {"rateLimit": {"cost": 1, "remaining": 4000, "resetAt": "x"}},
+                    "errors": [{"type": "RATE_LIMITED", "message": "slow down"}],
+                },
+            )
+        return fallback(request)
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
+    assert [p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]] == [42]  # stale, not empty
+    assert refresh._backoff["graphql"]["until"] > time.monotonic()
+    assert refresh._graphql_budget["remaining"] == 4000
+
+
 def test_graphql_failure_falls_back_to_basic_pulls(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -886,7 +1057,7 @@ def test_graphql_failure_falls_back_to_basic_pulls(tmp_path):
     snap = refresh.build_snapshot(
         sessions,
         env=_Env(),
-        transport=_rich_transport([], errors=[{"message": "boom"}]),
+        transport=_rich_transport([_gql_node(number=12)], errors=[{"message": "boom"}]),
     )
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 12
 
@@ -900,8 +1071,10 @@ def test_graphql_keeps_partial_data_with_rate_limit_error(tmp_path):
     # A GraphQL 200 carrying BOTH repository data and a RATE_LIMITED error: keep
     # the data, but still arm the backoff for the next refresh.
     def handler(request):
-        if not str(request.url).endswith("/graphql"):
+        if not _is_graphql(request):
             return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+        if _graphql_kind(request) == "discover":
+            return _owned(99)
         body = {
             "data": {
                 "rateLimit": {"cost": 1, "remaining": 10, "resetAt": "x"},
@@ -970,8 +1143,10 @@ def test_known_reset_marks_notice_reset_known(tmp_path):
 
     # 200 with data but a near-spent budget and a real resetAt: arms a known reset.
     def handler(request):
-        if not str(request.url).endswith("/graphql"):
+        if not _is_graphql(request):
             return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+        if _graphql_kind(request) == "discover":
+            return _owned(99)
         body = {
             "data": {
                 "rateLimit": {"remaining": 10, "resetAt": reset_at},
@@ -994,9 +1169,14 @@ def _batched_handler(by_branch, *, gql=None, etag='W/"v1"'):
     """Token-path transport whose GraphQL response aliases per-branch nodes from
     ``by_branch`` (keyed by branch name), so several same-repo branches resolve
     from one batched query."""
+    by_branch = {branch: [{**node, "headRefName": branch} for node in nodes] for branch, nodes in by_branch.items()}
 
     def handler(request):
-        if str(request.url).endswith("/graphql"):
+        if _is_graphql(request):
+            variables = json.loads(request.content.decode()).get("variables", {})
+            if "branch" in variables:
+                branch = variables.get("branch")
+                return _passthrough(request, by_branch.get(branch, []))
             if gql is not None:
                 gql.append(request)
             body = {
@@ -1008,7 +1188,15 @@ def _batched_handler(by_branch, *, gql=None, etag='W/"v1"'):
             return httpx.Response(200, json=body)
         if request.headers.get("If-None-Match") == etag:
             return httpx.Response(304)
-        return httpx.Response(200, headers={"ETag": etag}, json=[_pull()])
+        # The REST list must agree with the rich set: a warm rich cache is only
+        # served while both describe the same open PRs, and the 304 path serves
+        # whatever this first response cached.
+        branch = request.url.params.get("head", ":feature").split(":", 1)[1]
+        return httpx.Response(
+            200,
+            headers={"ETag": etag},
+            json=[_pull(number=node["number"], branch=branch) for node in by_branch.get(branch, [])],
+        )
 
     return httpx.MockTransport(handler)
 
@@ -1036,9 +1224,8 @@ def test_partial_alias_failure_isolates_to_its_key(tmp_path):
     _make_repo(ws / "b", branch="b2")
     sessions = [{"id": "s1", "project_path": str(ws)}]
     # Seed both branches' rich cache (numbers 1 and 2).
-    refresh.build_snapshot(
-        sessions, env=_Env(), transport=_batched_handler({"b1": [_gql_node(number=1)], "b2": [_gql_node(number=2)]})
-    )
+    seeds = {"b1": [_gql_node(number=1)], "b2": [_gql_node(number=2)]}
+    refresh.build_snapshot(sessions, env=_Env(), transport=_batched_handler(seeds))
 
     # Forced refresh where the b2-branch alias (b1, by sorted order) errors via
     # errors[].path while the b1-branch alias (b0) returns fresh data. The REST
@@ -1046,23 +1233,147 @@ def test_partial_alias_failure_isolates_to_its_key(tmp_path):
     # stale RICH cache rather than dropping to the basic pulls (#33 only prefers
     # basic when REST reports a change).
     def handler(request):
-        if str(request.url).endswith("/graphql"):
+        if _is_graphql(request):
+            kind = _graphql_kind(request)
+            if kind == "discover":
+                # Discovery sees each branch's own PR plus the one its good
+                # alias produced, so a failing alias cannot blank that key.
+                branch = json.loads(request.content.decode())["variables"]["branch"]
+                return _owned(*(1, 11) if branch == "b1" else (2,), branch=branch)
+            if kind == "detail":
+                # Rich pages carry both owned PRs, so nothing is missing from
+                # the page: a detail fetch here would mean the recovery path
+                # over-fetched, which the empty answer surfaces.
+                return httpx.Response(200, json={"data": {"rateLimit": {"remaining": 5000}, "repository": None}})
             body = {
                 "data": {
                     "rateLimit": {"remaining": 5000, "resetAt": "x"},
-                    "repository": {"b0": {"nodes": [_gql_node(number=11)]}, "b1": None},
+                    "repository": {
+                        "b0": {
+                            "nodes": [
+                                {**_gql_node(number=1), "headRefName": "b1"},
+                                {**_gql_node(number=11), "headRefName": "b1"},
+                            ]
+                        },
+                        "b1": None,
+                    },
                 },
                 "errors": [{"type": "SERVICE", "message": "boom", "path": ["repository", "b1"]}],
             }
             return httpx.Response(200, json=body)
+        # REST probes report each branch's open-PR set, including the PR its rich
+        # alias produced (#11 for b1), so one ETag covers both branches without
+        # the probe reporting a change between them.
+        branch = request.url.params.get("head", ":x").split(":", 1)[1]
+        numbers = [11] if branch == "b1" else [n["number"] for n in seeds.get(branch, [])]
+        listed = [_pull(number=n, branch=branch) for n in numbers]
         if request.headers.get("If-None-Match") == 'W/"v1"':
             return httpx.Response(304)
-        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=listed)
 
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler), force=True)
     by_branch = {r["branch"]: r for r in snap["sessions"][0]["repos"]}
-    assert by_branch["b1"]["pulls"][0]["number"] == 11  # good alias refreshed
-    assert by_branch["b2"]["pulls"][0]["number"] == 2  # failed alias kept its stale cache, isolated
+    # b1's own alias (b0) answered, publishing the PRs it owns (#1 and #11)
+    # before b1's alias failed; the failed alias must not blank that key.
+    assert sorted(p["number"] for p in by_branch["b1"]["pulls"]) == [1, 11]
+    # b2's alias failed and it has no prior rich cache, so it serves its own
+    # basic REST pulls only: the sibling's data never leaks across keys.
+    assert [p["number"] for p in by_branch["b2"]["pulls"]] == [2]
+    assert by_branch["b1"]["error"] is None
+    assert by_branch["b2"]["error"] is None
+
+
+def test_branch_page_off_the_rich_page_is_recovered_by_number(tmp_path):
+    # The rich documents ask for ``first: 3`` of a branch's PRs. When discovery
+    # proves an owned PR exists but the page did not carry it, the PR is fetched
+    # by number: an empty result would silently hide a real PR behind a cached
+    # "no PR" answer, which is exactly the data loss #129 must not reintroduce.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    own = _gql_node(number=1)
+    crowded = [_gql_node(number=n) for n in (2, 3, 4)]  # fill ``first: 3``
+
+    def handler(request):
+        if _is_graphql(request):
+            kind = _graphql_kind(request)
+            if kind == "discover":
+                return _owned(1, 2, 3, 4)
+            if kind == "detail":
+                number = json.loads(request.content.decode())["variables"]["number"]
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                            "repository": {"pullRequest": own if number == 1 else None},
+                        }
+                    },
+                )
+            body = {
+                "data": {
+                    "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                    "repository": _alias_repo(request, {"feature": crowded}),
+                }
+            }
+            return httpx.Response(200, json=body)
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(n["number"]) for n in crowded])
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
+    numbers = sorted(p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"])
+    assert 1 in numbers  # recovered, though the bounded page omitted it
+    assert numbers == [1, 2, 3, 4]
+
+
+def test_omitted_merged_pr_is_not_recovered_by_number(tmp_path):
+    """Only OPEN PRs are recovered from past the bounded page. The rich page
+    carries merged PRs as historical entries on its own; recovering every
+    omitted merged PR would spend one serial detail query each, every tick."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    crowded = [_gql_node(number=n) for n in (2, 3, 4)]
+    details: list[int] = []
+
+    def owned_with_merged(*numbers):
+        response = _owned(*numbers)
+        payload = json.loads(response.content)
+        for node in payload["data"]["repository"]["pullRequests"]["nodes"]:
+            if node["number"] == 5:
+                node["state"] = "MERGED"
+        return httpx.Response(200, json=payload)
+
+    def handler(request):
+        if _is_graphql(request):
+            kind = _graphql_kind(request)
+            if kind == "discover":
+                return owned_with_merged(2, 3, 4, 5)  # PR 5 is an omitted MERGED PR
+            if kind == "detail":
+                details.append(_detail_number(request))
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                            "repository": {"pullRequest": _gql_node(number=details[-1])},
+                        }
+                    },
+                )
+            body = {
+                "data": {
+                    "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                    "repository": _alias_repo(request, {"feature": crowded}),
+                }
+            }
+            return httpx.Response(200, json=body)
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(n["number"]) for n in crowded])
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
+    numbers = sorted(p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"])
+    assert 5 not in numbers  # the omitted merged PR was not fetched by number
+    assert 5 not in details  # and no detail query was spent on it
 
 
 def test_many_branches_chunk_into_multiple_queries(tmp_path):
@@ -1176,7 +1487,9 @@ def test_review_threads_paginate_beyond_the_first_page(tmp_path):
     }
 
     def handler(request):
-        if str(request.url).endswith("/graphql"):
+        if _is_graphql(request):
+            if _graphql_kind(request) == "discover":
+                return _owned(7)
             query = json.loads(request.content.decode())["query"]
             if "$id: ID!" in query:  # follow-up page for one PR
                 page = {
@@ -1219,7 +1532,9 @@ def test_thread_pagination_stops_and_backs_off_on_rate_limit(tmp_path):
     }
 
     def handler(request):
-        if str(request.url).endswith("/graphql"):
+        if _is_graphql(request):
+            if _graphql_kind(request) == "discover":
+                return _owned(7)
             query = json.loads(request.content.decode())["query"]
             if "$id: ID!" in query:  # follow-up page hits a secondary rate limit
                 return httpx.Response(200, json={"errors": [{"type": "RATE_LIMITED", "message": "slow down"}]})
@@ -1251,7 +1566,7 @@ def test_graphql_backoff_does_not_block_rest_probe(tmp_path):
     refresh._backoff["graphql"]["until"] = time.monotonic() + 300
 
     def handler(request):
-        if str(request.url).endswith("/graphql"):
+        if _is_graphql(request):
             raise AssertionError("GraphQL must not be called while its budget is backed off")
         return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=77)])
 
@@ -1437,29 +1752,53 @@ def test_failed_full_after_digest_mismatch_cools_down(tmp_path):
     _make_repo(ws / "r")
     sessions = [{"id": "s1", "project_path": str(ws)}]
     refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=7)]))
-    _expire_graphql_cache()
 
     gql = []
 
     def handler(request):
-        if str(request.url).endswith("/graphql"):
+        if _is_graphql(request):
+            if _graphql_kind(request) == "discover":
+                # Discovery returns numbers only; the rich/digest fixtures below
+                # are the authority on head identity. It sees exactly the PR the
+                # digest page carries, so no by-number recovery interleaves with
+                # the digest -> full sequence under test.
+                return _owned(7)
             gql.append(request)
             if _is_full_query(request):
                 return httpx.Response(500, text="boom")
             body = {
                 "data": {
                     "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
-                    "repository": _alias_repo(request, {"feature": [_gql_node(number=9)]}),
+                    # Same owned PR as the cache, but its head moved: a genuine
+                    # digest mismatch that must promote to the full query. Adding
+                    # a foreign PR here instead would make discovery demand a
+                    # by-number recovery, which would mask the tier under test.
+                    "repository": _alias_repo(request, {"feature": [{**_gql_node(number=7), "headRefOid": "moved"}]}),
                 }
             }
             return httpx.Response(200, json=body)
         if request.headers.get("If-None-Match") == 'W/"v1"':
             return httpx.Response(304)
-        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+        # The REST page mirrors the rich nodes this transport fronts (#7), so
+        # the conditional probe reports no change: this tick is driven by the
+        # aged digest clock, not by a REST-detected PR-set change.
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7)])
 
     transport = httpx.MockTransport(handler)
+    # Keep the rich entry validated *recently* (only the digest clock ages), so
+    # the classifier routes this tick to the cheap digest rather than a direct
+    # full query. Its signature differs (no owned PRs) and promotes to the full
+    # query, which then fails.
+    for entry in refresh._graphql_cache.values():
+        entry["validated_at"] = entry["fetched_at"] - refresh.GRAPHQL_DIGEST_STALE - 1
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
-    assert [_is_full_query(r) for r in gql] == [False, True]  # digest mismatch, full failed
+    # Digest mismatch, then the promoted full query failed. Ownership discovery
+    # runs per digest alias and asks for omitted PRs by number, so those
+    # documents interleave; the branch-page tier under test is digest -> full.
+    assert [_is_full_query(r) for r in gql] == [False, True]
+    variables = [json.loads(r.content.decode())["variables"] for r in gql]
+    assert all("b0" in v for v in variables)  # both are branch-page documents
+    assert variables[0] == variables[1] == {"owner": "o", "repo": "r", "b0": "feature"}
     assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 7  # stale cache served
     _expire_graphql_cache()
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
@@ -1522,7 +1861,7 @@ def test_failed_digest_cools_down_instead_of_requerying(tmp_path):
     gql = []
 
     def handler(request):
-        if str(request.url).endswith("/graphql"):
+        if _is_graphql(request):
             gql.append(request)
             return httpx.Response(500, text="boom")  # only the digest fires here
         if request.headers.get("If-None-Match") == 'W/"v1"':
@@ -1539,6 +1878,46 @@ def test_failed_digest_cools_down_instead_of_requerying(tmp_path):
     assert len(gql) == 1  # cooldown held: no second digest
 
 
+def test_digest_discovery_failure_serves_cache_without_full_query(tmp_path):
+    # The digest tier decides ownership by discovery, so a discovery failure
+    # leaves the digest page unproven. That is a digest-tier failure like the
+    # others: serve the stale cache, never promote to the full query. Promoting
+    # would spend a full-query point on every failed discovery.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=7)]))
+    _expire_graphql_cache()
+
+    gql = []
+
+    def handler(request):
+        if _is_graphql(request):
+            kind = _graphql_kind(request)
+            if kind == "discover":
+                return httpx.Response(500, text="boom")
+            gql.append(request)
+            if _is_full_query(request):
+                return httpx.Response(200, json={"data": {"rateLimit": {"remaining": 5000}, "repository": {}}})
+            # A well-formed digest page, so the only failure in play is
+            # discovery: no null-repository short circuit, no malformed alias.
+            body = {
+                "data": {
+                    "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                    "repository": _alias_repo(request, {"feature": [_gql_node(number=7)]}),
+                }
+            }
+            return httpx.Response(200, json=body)
+        if request.headers.get("If-None-Match") == 'W/"v1"':
+            return httpx.Response(304)
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
+    assert [r for r in gql if _is_full_query(r)] == []  # no full-query point spent
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 7  # stale cache served
+
+
 def test_cold_key_full_failure_cools_down(tmp_path):
     # #71: a cold key (no rich cache) whose full query keeps failing must also
     # cool down, not retry the full query on every tick. The old per-entry
@@ -1551,7 +1930,7 @@ def test_cold_key_full_failure_cools_down(tmp_path):
     gql = []
 
     def handler(request):
-        if str(request.url).endswith("/graphql"):
+        if _is_graphql(request):
             gql.append(request)
             return httpx.Response(500, text="boom")
         return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
@@ -1577,7 +1956,7 @@ def test_forced_refresh_bypasses_cooldown(tmp_path):
     gql = []
 
     def handler(request):
-        if str(request.url).endswith("/graphql"):
+        if _is_graphql(request):
             gql.append(request)
             return httpx.Response(500, text="boom")
         return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
@@ -1614,7 +1993,8 @@ def test_rest_probes_run_parallel_within_bound(tmp_path):
         time.sleep(0.05)
         with lock:
             state["inflight"] -= 1
-        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull()])
+        repo = request.url.path.split("/")[3]
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(repo=repo)])
 
     snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=httpx.MockTransport(handler))
     assert state["max"] > 1
@@ -1661,7 +2041,7 @@ def test_workspace_metadata_uses_session_branches_not_source_head(tmp_path):
             return httpx.Response(404, json={"message": "Not Found"})
         branch = request.url.params["head"].split(":", 1)[1]
         requests.append(branch)
-        return httpx.Response(200, json=[_pull(number=1 if branch == "session-a" else 2)])
+        return httpx.Response(200, json=[_pull(number=1 if branch == "session-a" else 2, branch=branch)])
 
     snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=httpx.MockTransport(handler))
     assert sorted(requests) == ["session-a", "session-b"]
@@ -1691,7 +2071,7 @@ def test_workspace_metadata_is_authoritative_and_isolates_repo_errors(tmp_path):
         if "/second/" in request.url.path:
             return httpx.Response(404, json={"message": "Not Found"})
         assert "/first/" in request.url.path
-        return httpx.Response(200, json=[_pull()])
+        return httpx.Response(200, json=[_pull(branch="session", repo="first")])
 
     snap = refresh.build_snapshot([session], env=_NoToken(), transport=httpx.MockTransport(handler))
     repos = snap["sessions"][0]["repos"]
@@ -1761,7 +2141,7 @@ def test_stale_workspace_paths_fall_back_to_checkout_discovery(tmp_path, stale_k
             }
         ],
         env=_NoToken(),
-        transport=_transport([_pull()]),
+        transport=_transport([_pull(branch="workspace-branch")]),
     )
     repos = snapshot["sessions"][0]["repos"]
     assert [(r["path"], r["repo"], r["branch"]) for r in repos] == [
@@ -1794,7 +2174,7 @@ def test_mixed_workspace_paths_keep_valid_worktrees_authoritative(tmp_path):
             }
         ],
         env=_NoToken(),
-        transport=_transport([_pull()], capture=requests),
+        transport=_transport([_pull(branch="session-branch", repo="attached")], capture=requests),
     )
     repos = snapshot["sessions"][0]["repos"]
     assert [(r["path"], r["repo"], r["branch"]) for r in repos] == [
@@ -1841,3 +2221,486 @@ def test_invalid_worktree_path_never_falls_back_to_source_and_stored_branch(tmp_
     snapshot = refresh.build_snapshot([session], env=_NoToken(), transport=_transport([_pull()], capture=requests))
     assert snapshot["sessions"][0]["repos"] == []
     assert requests == []
+
+
+def test_fallback_pulls_withholds_rich_when_probe_set_diverges():
+    # The _fallback_pulls half of the truncation-window thread: a cooldown (or
+    # any GraphQL failure) that follows a changed probe, then a later 304 with
+    # changed=False, must not keep serving a rich list describing the OLD set.
+    rich = {"pulls": [{"url": "u1"}]}
+    assert refresh._fallback_pulls({"basic": [{"url": "u1"}], "rich": rich, "changed": False})["pulls"] == [
+        {"url": "u1"}
+    ]
+    assert refresh._fallback_pulls({"basic": [{"url": "u2"}], "rich": rich, "changed": False})["pulls"] == [
+        {"url": "u2"}
+    ]
+    # A changed probe still prefers REST, as #33 requires.
+    assert refresh._fallback_pulls({"basic": [{"url": "u2"}], "rich": rich, "changed": True})["pulls"] == [
+        {"url": "u2"}
+    ]
+
+
+def test_cooldown_after_changed_probe_serves_rest_on_diverged_304(tmp_path):
+    # End-to-end for the same gap through build_snapshot: seed a rich entry for
+    # PR 1, then a changed probe (PR 2) plus a failed query arms the cooldown.
+    # The next tick answers 304 with changed=False; the stale rich list must not
+    # come back, while the preserved rich entry still backs a later failure.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    refresh.build_snapshot(sessions, env=_Env(), transport=_rich_transport([_gql_node(number=1)]))
+
+    def diverged(request):
+        if _is_graphql(request):
+            return httpx.Response(200, json={"errors": [{"message": "boom"}]})
+        if request.headers.get("If-None-Match") == 'W/"v2"':
+            return httpx.Response(304)
+        return httpx.Response(200, headers={"ETag": 'W/"v2"'}, json=[_pull(number=2)])
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(diverged), force=True)
+    assert [p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]] == [2]
+    assert "checks" not in snap["sessions"][0]["repos"][0]["pulls"][0]  # basic REST shape, not rich
+    # The rich entry survived, so it is still available as a last-resort cache.
+    assert refresh._graphql_cache[("o", "r", "feature", "o", "r", False)]["pulls"][0]["number"] == 1
+
+    def agreeing(request):
+        if _is_graphql(request):
+            return httpx.Response(200, json={"errors": [{"message": "boom"}]})
+        return httpx.Response(304)
+
+    # Same cached probe list (ETag 304, unchanged set) -> the rich shape returns.
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(agreeing))
+    assert len(snap["sessions"][0]["repos"][0]["pulls"]) == 1
+
+
+def test_fallback_rich_set_ignores_merged_pulls():
+    # The rich query returns OPEN and MERGED pulls (the pane renders merged
+    # ones); the REST probe only ever lists open ones. A cached merged pull must
+    # not look like a divergence, or a still-correct rich result is withheld.
+    rich = {"pulls": [{"url": "u1", "merged": False}, {"url": "u9", "merged": True}]}
+    pending = {"basic": [{"url": "u1"}], "rich": rich, "changed": False}
+    assert refresh._same_pull_set(pending["basic"], rich) is True
+    # The rich entry is served (it carries the merged pull), not the REST list.
+    fallback = refresh._fallback_pulls(pending)
+    assert {p["url"] for p in fallback["pulls"]} == {"u1", "u9"}
+    # A genuinely open pull that REST does not list is still a divergence.
+    assert refresh._same_pull_set([{"url": "u2"}], rich) is False
+
+
+def test_failed_query_keeps_rich_result_while_only_merged_pulls_differ(tmp_path):
+    # End-to-end: seed rich data for an open PR plus a merged one, then make
+    # every GraphQL call fail. The 304 probe agrees on the open set, so the
+    # cached rich result must be served rather than the merged-less REST shape.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    nodes = [_gql_node(number=1), _gql_node(number=9, state="MERGED", merged=True)]
+    transport = _rich_transport(nodes)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    cached = refresh._graphql_cache[("o", "r", "feature", "o", "r", False)]
+    assert {p["number"] for p in cached["pulls"]} == {1, 9}
+
+    def down(request):
+        if _is_graphql(request):
+            # No ``data``: the repo-level error path that arms the cooldown.
+            return httpx.Response(200, json={"errors": [{"message": "boom"}]})
+        return httpx.Response(304)
+
+    # The failed query goes through `_resolve_null_repository` -> the rich
+    # fallback for this tick. The probe's open set (PR 1) agrees with the rich
+    # entry's open subset, so the rich result is still correct and must be kept.
+    down_transport = httpx.MockTransport(down)
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=down_transport, force=True)
+    pulls = snap["sessions"][0]["repos"][0]["pulls"]
+    # The REST probe only lists open PR 1; PR 9 survives solely because the
+    # rich cache was served instead of the basic fallback.
+    assert [p["number"] for p in pulls] == [1, 9]
+
+
+# --- Review regressions: page-proved completeness, bounded remotes, detail ----
+
+
+def test_final_page_skips_discovery(tmp_path):
+    """``hasNextPage: false`` is the server proving the page final, so head
+    filtering is the whole answer. Discovery costs a serial round trip per key
+    per tick, so it must not run here: a digest tick for a short page goes from
+    ~11 requests (1 batch + 10 discoveries) back to 1, and stays exact."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    kinds: list[str] = []
+
+    def handler(request):
+        if not _is_graphql(request):
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7)])
+        kind = _graphql_kind(request)
+        kinds.append(kind)
+        if kind in {"rich", "digest"}:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                        "repository": {"b0": {"nodes": [_gql_node(number=7)], "pageInfo": {"hasNextPage": False}}},
+                    }
+                },
+            )
+        raise AssertionError(f"unexpected graphql document: {kind}")
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler), force=True)
+
+    assert "discover" not in kinds  # the final page already proved ownership
+    assert [p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]] == [7]
+
+
+def test_crowded_page_still_runs_discovery(tmp_path):
+    """The complement: a page that is NOT final cannot prove ownership, so the
+    short-circuit must not swallow discovery."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    kinds: list[str] = []
+
+    def handler(request):
+        if not _is_graphql(request):
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7)])
+        kind = _graphql_kind(request)
+        kinds.append(kind)
+        if kind == "discover":
+            return _owned(7)
+        if kind in {"rich", "digest"}:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                        "repository": {"b0": {"nodes": [_gql_node(number=7)], "pageInfo": {"hasNextPage": True}}},
+                    }
+                },
+            )
+        raise AssertionError(f"unexpected graphql document: {kind}")
+
+    refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler), force=True)
+
+    assert "discover" in kinds
+
+
+def test_remotes_unreadable_falls_back_to_origin(monkeypatch, tmp_path):
+    """An unreadable remote list must still search origin, not raise: the origin
+    is ``key[:2]``, so there is always a destination to query."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r", remote="https://github.com/solo/only.git")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    probed: list[str] = []
+
+    # Undo the autouse origin-only patch so refresh asks the real resolver.
+    monkeypatch.undo()
+    monkeypatch.setattr(refresh, "_remote_repos", lambda _path: [])  # the read that failed
+
+    def handler(request):
+        probed.append(request.url.path)
+        return httpx.Response(200, json=[_pull(number=5, repo="only", owner="solo")])
+
+    snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=httpx.MockTransport(handler))
+
+    assert probed
+    assert "/repos/solo/only/pulls" in probed[0]
+    assert snap["sessions"][0]["repos"][0]["pulls"][0]["number"] == 5
+
+
+def test_remote_read_uses_the_timed_git_helper(monkeypatch, tmp_path):
+    """Refresh must read remotes through its bounded ``_git``: a checkout on a
+    stalled mount cannot be allowed to block a refresh worker indefinitely."""
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(path, *args):
+        calls.append(args)
+        if args == ("remote",):
+            return "origin\nupstream"
+        if args == ("remote", "get-url", "origin"):
+            return "https://github.com/me/fork.git"
+        if args == ("remote", "get-url", "upstream"):
+            return "https://github.com/up/stream.git"
+        return None
+
+    # Restore the real resolver first: the autouse fixture stubs it out for the
+    # origin-only polling fixtures, which would bypass ``_git`` entirely.
+    monkeypatch.undo()
+    monkeypatch.setattr(refresh, "_git", fake_git)
+
+    assert refresh._remote_repos(str(tmp_path)) == [("me", "fork"), ("up", "stream")]
+    assert calls[0] == ("remote",)  # the bounded helper, not gitctx's untimed one
+
+
+def _node_with_stale_block():
+    node = _gql_node(number=7, decision="CHANGES_REQUESTED")
+    node["headRefOid"] = "newhead"
+    node["latestReviews"] = {
+        "nodes": [{"state": "CHANGES_REQUESTED", "author": {"login": "rev"}, "commit": {"oid": "oldhead"}}]
+    }
+    node["decidedReviews"] = {
+        "nodes": [{"state": "CHANGES_REQUESTED", "author": {"login": "rev"}, "commit": {"oid": "oldhead"}}]
+    }
+    return node
+
+
+def test_detail_query_normalises_the_same_rich_fields_as_the_branch_page():
+    """A PR fetched by number must not be normalised from partial data. Both
+    documents select the shared ``PRNode`` fragment, so a stale blocking review
+    reads ``changes-pushed`` exactly as it does on the branch page."""
+    from_page = graphql.normalize_connection({"nodes": [_node_with_stale_block()]})[0]
+    assert from_page["review_state"] == "changes-pushed"
+    assert [r["name"] for r in from_page["reviewers"]] == ["rev"]
+
+    # The drift the review caught: every one of these is read by the normaliser
+    # and was absent from the hand-copied detail body.
+    assert "...PRNode" in graphql.DETAIL_QUERY
+    for field in ("latestReviews", "decidedReviews", "closingIssuesReferences", "workflowRun", "PullRequestCommit"):
+        assert field in graphql.DETAIL_QUERY
+
+
+def _final_page(nodes):
+    return httpx.Response(
+        200,
+        json={
+            "data": {
+                "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                "repository": {"b0": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}},
+            }
+        },
+    )
+
+
+def _branch_page_transport(head_oid, *, log, fail_full=False, promoted_crowded=False, digest_crowded=False):
+    """A key whose rich entry moves its head, so the aged digest genuinely
+    mismatches and promotes to the full query: the only path that can re-spend
+    a discovery request the digest already made.
+
+    ``promoted_crowded`` makes the FULL page non-final while the digest page
+    stays final. Only the proven-ownership handoff can then skip discovery:
+    ``_needs_discovery`` on the full page alone would say yes.
+    """
+
+    def page(nodes, crowded):
+        info = {"hasNextPage": crowded, "endCursor": "c" if crowded else None}
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                    "repository": {"b0": {"nodes": nodes, "pageInfo": info}},
+                }
+            },
+        )
+
+    def handler(request):
+        if not _is_graphql(request):
+            if request.headers.get("If-None-Match") == 'W/"v1"':
+                return httpx.Response(304)
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7)])
+        kind = _graphql_kind(request)
+        full = _is_full_query(request)
+        log.append(("full" if full else "digest", kind))
+        if kind == "discover":
+            return _owned(7)
+        node = {**_gql_node(number=7), "headRefOid": head_oid}
+        if full:
+            if fail_full:
+                return httpx.Response(500, text="boom")
+            return page([node], promoted_crowded)
+        return page([node], digest_crowded)
+
+    return httpx.MockTransport(handler)
+
+
+def test_promoted_crowded_page_reuses_digest_ownership(tmp_path):
+    """A final digest page proves the owned set without a lookup, so a promotion
+    to a CROWDED rich page reuses it rather than paying a serial discovery the
+    digest tier already made unnecessary. Rich detail still comes from the full
+    document, never from the digest's signature-only nodes."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    refresh.build_snapshot(sessions, env=_Env(), transport=_branch_page_transport("old", log=[]))
+    _expire_graphql_cache()  # digest clock only: the entry re-classifies as a digest
+
+    log = []
+    snap = refresh.build_snapshot(
+        sessions, env=_Env(), transport=_branch_page_transport("moved", log=log, promoted_crowded=True)
+    )
+
+    assert log == [("digest", "rich"), ("full", "rich")]  # no discovery at all
+    pull = snap["sessions"][0]["repos"][0]["pulls"][0]
+    # The rich document, not the digest's signature-only nodes, supplies detail.
+    assert pull["review_state"] == "approved"
+    assert [run["name"] for run in pull["checks"]["runs"]] == ["test"]
+    assert pull["comments"]["items"][0]["path"] == "a.py"
+
+
+def test_reused_ownership_fetches_owned_pr_absent_from_crowded_page(tmp_path):
+    """Reuse must not equate "not on this page" with "not owned". Discovery proves
+    PR 8 exists; the crowded rich page's ``first: 3`` carries only PR 7. The
+    promotion fetches 8 by number rather than silently dropping a real PR."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    log = []
+    detail_numbers = []
+    phase = {"head": "old"}
+
+    def page(nodes):
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                    "repository": {"b0": {"nodes": nodes, "pageInfo": {"hasNextPage": True, "endCursor": "c"}}},
+                }
+            },
+        )
+
+    def handler(request):
+        if not _is_graphql(request):
+            if request.headers.get("If-None-Match") == 'W/"v1"':
+                return httpx.Response(304)
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7), _pull(number=8)])
+        kind = _graphql_kind(request)
+        log.append(("full" if _is_full_query(request) else "digest", kind))
+        if kind == "discover":
+            return _owned(7, 8)  # proves PR 8, which the branch page never carries
+        if kind == "detail":
+            number = _detail_number(request)
+            detail_numbers.append(number)
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                        "repository": {"pullRequest": _gql_node(number=number)},
+                    }
+                },
+            )
+        return page([{**_gql_node(number=7), "headRefOid": phase["head"]}])
+
+    transport = httpx.MockTransport(handler)
+    seeded = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert 7 in [p["number"] for p in seeded["sessions"][0]["repos"][0]["pulls"]]
+
+    _expire_graphql_cache()  # digest clock only: the entry re-classifies as a digest
+    log.clear()
+    detail_numbers.clear()  # the seed may already have fetched 8; measure only this tick
+    phase["head"] = "moved"  # genuine mismatch, so the key promotes
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+
+    # The digest page was crowded, so it discovered 7 AND 8. The promotion reuses
+    # that completed set: one lookup for the tick, and PR 8 still arrives.
+    assert log.count(("digest", "discover")) == 1
+    assert ("full", "rich") in log
+    assert 8 in detail_numbers
+    assert sorted(p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]) == [7, 8]
+
+
+def test_unproved_crowded_promotion_still_discovers(tmp_path):
+    """Control for the test above: same crowded promoted page, but the digest
+    page was itself crowded, so no proof exists and discovery must run."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    refresh.build_snapshot(sessions, env=_Env(), transport=_branch_page_transport("old", log=[]))
+    _expire_graphql_cache()
+
+    log = []
+    snap = refresh.build_snapshot(
+        sessions,
+        env=_Env(),
+        transport=_branch_page_transport("moved", log=log, promoted_crowded=True, digest_crowded=True),
+    )
+
+    # The digest page was crowded, so IT must discover. That run is complete, so
+    # the promotion reuses it: exactly one lookup for the tick, never two.
+    assert log.count(("digest", "discover")) == 1
+    assert ("full", "rich") in log
+    assert [p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]] == [7]
+
+
+def test_failed_promoted_query_serves_stale_without_respending_discovery(tmp_path):
+    """A promoted full query that fails changes nothing: the tick already
+    resolved ownership from the digest's final page, so the failure serves the
+    last-good result and spends no discovery request re-deriving it.
+
+    Scope note: this asserts ONE tick. The proof is carried by the in-memory key
+    entry, not a persistent store, and the next tick's digest re-establishes it,
+    so there is no cross-tick saving to observe at the transport."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    refresh.build_snapshot(sessions, env=_Env(), transport=_branch_page_transport("old", log=[]))
+    _expire_graphql_cache()
+
+    # The digest page is final (so it records the proof) while the promoted rich
+    # page is crowded, so only that proof can skip discovery. The full query
+    # then fails: nothing is published and the retry cooldown arms.
+    log = []
+    transport = _branch_page_transport("moved", log=log, fail_full=True, promoted_crowded=True)
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+
+    assert [state for state, _kind in log if state == "full"] == ["full"]  # it did promote
+    assert not any(state == "discover" for state, _kind in log)  # proof reused, not re-bought
+    assert [p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]] == [7]  # stale served
+    assert refresh._retry_cooldown, "the failed full query must have armed a cooldown"
+
+
+def test_every_key_searched_when_destinations_are_empty(monkeypatch, tmp_path):
+    """``pull_keys`` seeds the origin itself, so an empty destination list can
+    never leave a key with no candidate to index (the ``IndexError`` that would
+    abort every session's snapshot). Both a token and tokenless tick must still
+    return the origin PR, and the shared key is fetched once."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r", remote="https://github.com/me/fork.git")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    # Directly: no remotes still yields exactly the origin key, no duplicates.
+    keys = lookup.pull_keys(lookup.repositories(("me", "fork"), []), "feature")
+    assert keys == [("me", "fork", "feature", "me", "fork")]
+    assert lookup.pull_keys(lookup.repositories(("me", "fork"), [("up", "stream"), ("up", "stream")]), "feature") == [
+        ("me", "fork", "feature", "me", "fork"),
+        ("up", "stream", "feature", "me", "fork"),
+    ]
+
+    monkeypatch.setattr(refresh, "_remote_repos", lambda _path: [])  # every destination read fails
+
+    for env in (_NoToken(), _Env()):
+        probed: list[tuple[str, str]] = []
+
+        def handler(request, _probed=probed):
+            _probed.append((request.method, request.url.path))
+            if request.url.path == "/graphql":
+                node = {
+                    **_gql_node(number=7),
+                    "headRepository": {"name": "fork", "owner": {"login": "me"}},
+                    "headRepositoryOwner": {"login": "me"},
+                }
+                return _final_page([node])
+            if request.url.path.endswith("/stacks"):
+                return httpx.Response(200, json={"stacks": []})
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7, repo="fork", owner="me")])
+
+        snap = refresh.build_snapshot(sessions, env=env, transport=httpx.MockTransport(handler))
+        assert snap["sessions"][0]["repos"][0]["error"] is None
+        assert [p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]] == [7]
+        assert [path for _m, path in probed if path.endswith("/pulls")] == ["/repos/me/fork/pulls"]
