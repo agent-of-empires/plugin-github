@@ -1189,7 +1189,8 @@ def _owned_connection(client: GitHubClient, key: RepoKey, conn: dict[str, Any]) 
     # records. A PR discovery proved ours but this bounded page did not carry
     # (foreign same-name PRs filled ``first: 3``) is fetched by number rather
     # than reported absent, which would hide a real PR behind an empty result.
-    owned_numbers = {node.get("number") for node in nodes if lookup.matches_head(lookup.graphql_head(node), key)}
+    owned = [node for node in nodes if lookup.matches_head(lookup.graphql_head(node), key)]
+    owned_numbers = {node.get("number") for node in owned}
     kept = [
         node
         for node in conn.get("nodes") or []
@@ -1197,7 +1198,14 @@ def _owned_connection(client: GitHubClient, key: RepoKey, conn: dict[str, Any]) 
         and node.get("number") in owned_numbers
         and lookup.matches_head(lookup.graphql_head(node), key)
     ]
-    missing = owned_numbers - {node.get("number") for node in kept}
+    # Recover only OPEN PRs the page omitted. The rich page legitimately carries
+    # merged PRs as historical selector entries, so recovering every omitted
+    # merged PR would issue one serial detail query each, every tick. A hidden
+    # OPEN PR is still recovered on both tiers: skipping it in the digest tier
+    # would omit it from the signature and promote the key on every digest.
+    missing = {node.get("number") for node in owned if node.get("state") == "OPEN"} - {
+        node.get("number") for node in kept
+    }
     kept.extend(_fetch_details(client, owner, repo, missing, key))
     # A complete discovery is authoritative whatever the rich page truncated at,
     # so nothing is withheld; pagination is off for the promoted thread fetch.
@@ -1248,7 +1256,13 @@ def _apply_aliases(
             # (foreign same-name PRs fill ``first: 3``). Discovery already proved
             # those exist, so fetch them by number instead of reporting them
             # absent, matching what ``_owned_connection`` does for its own page.
-            missing = owned_numbers - {node.get("number") for node in kept}
+            # Only OPEN ones: merged PRs are historical entries the page carries
+            # on its own, and recovering every omitted one costs a serial query.
+            missing = {
+                node.get("number")
+                for node in proved.get("nodes") or []
+                if isinstance(node, dict) and node.get("state") == "OPEN"
+            } - {node.get("number") for node in kept}
             if missing:
                 kept.extend(_fetch_details(client, key[0], key[1], missing, key))
             conn = {**conn, "nodes": kept, "pageInfo": {"hasNextPage": False, "endCursor": None}}

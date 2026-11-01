@@ -354,6 +354,7 @@ def _owned(*numbers, branch="feature", head=("o", "r")):
                         "nodes": [
                             {
                                 "number": n,
+                                "state": "OPEN",
                                 "headRefName": branch,
                                 "headRepository": {"name": head[1], "owner": {"login": head[0]}},
                             }
@@ -1323,6 +1324,56 @@ def test_branch_page_off_the_rich_page_is_recovered_by_number(tmp_path):
     numbers = sorted(p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"])
     assert 1 in numbers  # recovered, though the bounded page omitted it
     assert numbers == [1, 2, 3, 4]
+
+
+def test_omitted_merged_pr_is_not_recovered_by_number(tmp_path):
+    """Only OPEN PRs are recovered from past the bounded page. The rich page
+    carries merged PRs as historical entries on its own; recovering every
+    omitted merged PR would spend one serial detail query each, every tick."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    crowded = [_gql_node(number=n) for n in (2, 3, 4)]
+    details: list[int] = []
+
+    def owned_with_merged(*numbers):
+        response = _owned(*numbers)
+        payload = json.loads(response.content)
+        for node in payload["data"]["repository"]["pullRequests"]["nodes"]:
+            if node["number"] == 5:
+                node["state"] = "MERGED"
+        return httpx.Response(200, json=payload)
+
+    def handler(request):
+        if _is_graphql(request):
+            kind = _graphql_kind(request)
+            if kind == "discover":
+                return owned_with_merged(2, 3, 4, 5)  # PR 5 is an omitted MERGED PR
+            if kind == "detail":
+                details.append(_detail_number(request))
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                            "repository": {"pullRequest": _gql_node(number=details[-1])},
+                        }
+                    },
+                )
+            body = {
+                "data": {
+                    "rateLimit": {"remaining": 5000, "resetAt": "x"},
+                    "repository": _alias_repo(request, {"feature": crowded}),
+                }
+            }
+            return httpx.Response(200, json=body)
+        return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(n["number"]) for n in crowded])
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
+    numbers = sorted(p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"])
+    assert 5 not in numbers  # the omitted merged PR was not fetched by number
+    assert 5 not in details  # and no detail query was spent on it
 
 
 def test_many_branches_chunk_into_multiple_queries(tmp_path):

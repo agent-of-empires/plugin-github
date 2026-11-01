@@ -99,7 +99,7 @@ class _API:
         matching = [
             n for n in self.nodes.get(f"{variables['owner']}/{variables['repo']}", []) if n["headRefName"] == branch
         ]
-        identity = [{k: n.get(k) for k in ("number", "headRefName", "headRepository")} for n in matching]
+        identity = [{k: n.get(k) for k in ("number", "state", "headRefName", "headRepository")} for n in matching]
         offset = int(variables.get("cursor") or 0)
         size = lookup.DISCOVER_PAGE_SIZE
         page = identity[offset : offset + size]

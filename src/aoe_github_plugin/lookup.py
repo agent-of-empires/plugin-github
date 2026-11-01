@@ -38,7 +38,7 @@ DISCOVER_QUERY = f"""query($owner: String!, $repo: String!, $branch: String!, $c
   repository(owner: $owner, name: $repo) {{
     pullRequests(headRefName: $branch, states: [OPEN, MERGED], first: {DISCOVER_PAGE_SIZE}, after: $cursor) {{
       pageInfo {{ hasNextPage endCursor }}
-      nodes {{ number headRefOid headRefName headRepository {{ name owner {{ login }} }} }}
+      nodes {{ number state headRefOid headRefName headRepository {{ name owner {{ login }} }} }}
     }}
   }}
 }}"""
