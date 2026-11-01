@@ -111,8 +111,11 @@ never prunes another session's slots); startup, background polls, and a
 session-less `github.refresh` cover every session and prune vanished ones:
 
 1. `sessions.list` (host RPC) -> every active session and its workspace
-   `project_path`. Archived and snoozed sessions are skipped: they are inactive,
-   so polling them would only spend GitHub quota for no UI change.
+   `project_path`. Archived and trashed sessions are skipped: they are inactive,
+   so polling them would only spend GitHub quota for no UI change. Snoozed
+   sessions are skipped too by default; turn on `include_snoozed_sessions` to
+   keep polling them, since snoozing only sinks the row in the TUI and the host
+   keeps serving its badge and status column.
 2. Prefer the host's explicit `workspace_repos` list: each entry supplies a
    source checkout path and the branch attached to this session. This branch
    is authoritative even when the source checkout's current branch differs.
@@ -369,6 +372,12 @@ bot's COMMENTED review whose body literally recommends approval (a
 "Recommendation: Approve" line) from making the PR read "commented", when
 enabled; the bot's unresolved threads still count. Off (the default), such a
 review counts like any other comment.
+
+The advanced `include_snoozed_sessions` setting keeps polling snoozed sessions.
+It is off by default: a snooze is the user setting that row aside, so the next
+full refresh clears its PR badge and status column (and it costs no GitHub
+quota) while it is parked. Turn it on to keep a parked row's PR badge and
+status column live for the moment you unsnooze it.
 
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol

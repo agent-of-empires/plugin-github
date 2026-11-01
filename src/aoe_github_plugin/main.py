@@ -66,6 +66,10 @@ CHIP_SETTING_KEYS = {
 # Toggle for the row-column status-text cell (the words summary). Off keeps the
 # badge icons but clears the text. Defaults on.
 STATUS_TEXT_SETTING_KEY = "show_status_text"
+# Opt-in: keep polling snoozed sessions so their row badge and status column keep
+# updating while the row is parked. Off by default -- snoozing is the user asking
+# the worker to stop spending GitHub quota on that session.
+INCLUDE_SNOOZED_SETTING_KEY = "include_snoozed_sessions"
 IGNORE_SUBMODULES_SETTING_KEY = "ignore_submodules"
 # Toggle for the CI rollup semantics. Defaults off so existing row attention
 # keeps treating every failing check as actionable unless the user opts in.
@@ -224,6 +228,9 @@ class Runtime:
         self._chip_flags: frozenset[str] = frozenset(CHIP_SETTING_KEYS.values())
         # Whether the row-column status text is shown; resolved in run(), on until.
         self._show_status_text = True
+        # Whether snoozed sessions are polled too; resolved in run(), off until then
+        # so a parked session is not refreshed before the user opted in.
+        self._include_snoozed = False
         self._ignore_submodules = True
         self._required_checks_only = False
         self._approved_overrides_stale_block = False
@@ -328,24 +335,31 @@ class Runtime:
         transient failure must never be read as "no sessions", which would prune
         every session's UI.
 
-        Archived, snoozed, and trashed sessions are dropped here, the single
-        chokepoint every consumer reads (#41): they are inactive by definition, so
-        polling them only burns the user's GitHub quota, and trashed sessions in
-        particular can pile up in the hundreds and exhaust the host's per-plugin
-        UI-state quota, starving live sessions' panes. Filtering at the source (not
-        just in the snapshot) keeps the fast local session tick consistent, it
-        compares these ids against the pushed set, so a snapshot-only filter would
-        diff the inactive session forever and refresh every tick. A previously-pushed
-        session that becomes inactive simply drops out of the list and the refresh
+        Archived and trashed sessions are dropped here, the single chokepoint every
+        consumer reads (#41): they are inactive by definition, so polling them only
+        burns the user's GitHub quota, and trashed sessions in particular can pile
+        up in the hundreds and exhaust the host's per-plugin UI-state quota,
+        starving live sessions' panes. Filtering at the source (not just in the
+        snapshot) keeps the fast local session tick consistent, it compares these
+        ids against the pushed set, so a snapshot-only filter would diff the dropped
+        session forever and refresh every tick. A previously-pushed session that
+        becomes archived or trashed simply drops out of the list and the refresh
         reconcile removes its UI slots, same path as a vanished session.
+
+        Snoozed sessions are dropped the same way unless ``include_snoozed_sessions``
+        opts in. The host keeps storing and serving ``row-badge``/``row-column`` for
+        a snoozed session -- the row is only sunk, not hidden -- so a user who wants
+        a parked row to keep tracking PR state can opt in; the default treats a
+        snooze as the "stop spending quota on this" signal it usually is.
 
         The ``exclude`` param filters server-side so the host never even
         enumerates those sessions; a host too old to honor it ignores the param and
-        returns everything, so the client-side filter below still drops archived
-        and snoozed sessions (trashed has no per-entry flag, so an old host cannot
-        drop those client-side, which is exactly the exhaustion the host-side
-        ``exclude`` fixes)."""
-        result = self.call_host(SESSIONS_LIST, {"exclude": ["archived", "snoozed", "trashed"]}, timeout=timeout)
+        returns everything, so the client-side filter below still drops them
+        (trashed has no per-entry flag, so an old host cannot drop those
+        client-side, which is exactly the exhaustion the host-side ``exclude``
+        fixes)."""
+        exclude = ["archived", "trashed"] if self._include_snoozed else ["archived", "snoozed", "trashed"]
+        result = self.call_host(SESSIONS_LIST, {"exclude": exclude}, timeout=timeout)
         sessions = result.get("sessions") if isinstance(result, dict) else None
         if not isinstance(sessions, list):
             return None
@@ -354,7 +368,10 @@ class Runtime:
         # pruning live UI; treat a garbage list as "no answer" instead.
         if not all(isinstance(s, dict) and isinstance(s.get("id"), str) for s in sessions):
             return None
-        # Fallback for a host that ignored `exclude`: still drop archived/snoozed.
+        # Fallback for a host that ignored `exclude`: drop archived, and snoozed
+        # too unless the user opted into keeping those parked rows live.
+        if self._include_snoozed:
+            return [s for s in sessions if not s.get("archived")]
         return [s for s in sessions if not s.get("archived") and not s.get("snoozed")]
 
     def _push_snapshot(self, snapshot: dict[str, Any]) -> set[str]:
@@ -537,6 +554,12 @@ class Runtime:
             category for key, category in CHIP_SETTING_KEYS.items() if self._setting_bool(key, default=True)
         )
 
+    def resolve_include_snoozed(self) -> bool:
+        """Whether snoozed sessions keep being polled (``include_snoozed_sessions``).
+        Off by default: a snoozed row is parked, so polling it spends the user's
+        GitHub quota on state they set aside."""
+        return self._setting_bool(INCLUDE_SNOOZED_SETTING_KEY, default=False)
+
     def resolve_ignore_submodules(self) -> bool:
         return self._setting_bool(IGNORE_SUBMODULES_SETTING_KEY, default=self._ignore_submodules)
 
@@ -608,6 +631,7 @@ class Runtime:
         # row reflects the user's choices, not the all-on default.
         self._chip_flags = self.resolve_chip_flags()
         self._show_status_text = self._setting_bool(STATUS_TEXT_SETTING_KEY, default=True)
+        self._include_snoozed = self.resolve_include_snoozed()
         self._ignore_submodules = self.resolve_ignore_submodules()
         self._required_checks_only = self.resolve_required_checks_only()
         # Paint last-known data instantly from the persisted snapshot, then run

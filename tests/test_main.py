@@ -151,6 +151,20 @@ def test_resolve_chip_flags_respects_disabled_setting():
     assert rt.resolve_chip_flags() == frozenset({"review", "comments"})
 
 
+def test_resolve_include_snoozed_defaults_off():
+    # Polling a parked row spends GitHub quota, so snoozed sessions are skipped
+    # unless the user opts in; an unset/unsupported setting keeps the default.
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: None
+    assert rt.resolve_include_snoozed() is False
+
+
+def test_resolve_include_snoozed_respects_the_setting():
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda _method, params, **_kw: {"value": params["key"] == main.INCLUDE_SNOOZED_SETTING_KEY}
+    assert rt.resolve_include_snoozed() is True
+
+
 def test_required_checks_setting_reaches_refresh(monkeypatch):
     seen = []
 
@@ -181,27 +195,41 @@ def test_ignore_bot_approval_recommendations_setting_reaches_refresh(monkeypatch
     assert seen == [True]
 
 
-# --- archived/snoozed sessions are skipped (issue #41) ---
+# --- archived/trashed sessions are skipped, snoozed only on request (#41) ---
 
 
-def _list_sessions_with(reply):
+def _list_sessions_with(reply, *, include_snoozed=False):
     """list_sessions over a stubbed host reply."""
     rt = main.Runtime(send=lambda _m: None)
+    rt._include_snoozed = include_snoozed
     rt.call_host = lambda *_a, **_kw: reply
     return rt.list_sessions()
 
 
-def test_list_sessions_drops_archived_and_snoozed():
-    # Archived and snoozed are inactive; only active sessions survive so the
-    # network refresh never spends GitHub quota on them.
-    reply = {
+def _flagged_sessions_reply():
+    return {
         "sessions": [
             {"id": "active", "project_path": "/a"},
             {"id": "arch", "project_path": "/b", "archived": True, "snoozed": False},
             {"id": "snoozed", "project_path": "/c", "archived": False, "snoozed": True},
         ]
     }
-    assert [s["id"] for s in _list_sessions_with(reply)] == ["active"]
+
+
+def test_list_sessions_drops_archived_and_snoozed_by_default():
+    # Archived and snoozed are inactive by default; only active sessions survive so
+    # the network refresh never spends GitHub quota on them.
+    assert [s["id"] for s in _list_sessions_with(_flagged_sessions_reply())] == ["active"]
+
+
+def test_list_sessions_keeps_snoozed_when_opted_in():
+    # A snoozed row is still on screen (sunk, not hidden) and the host keeps serving
+    # its badge/column, so opting in must keep it in the refresh set. Archived stays
+    # dropped either way.
+    assert [s["id"] for s in _list_sessions_with(_flagged_sessions_reply(), include_snoozed=True)] == [
+        "active",
+        "snoozed",
+    ]
 
 
 def test_list_sessions_keeps_sessions_when_flags_absent():
@@ -211,10 +239,8 @@ def test_list_sessions_keeps_sessions_when_flags_absent():
     assert [s["id"] for s in _list_sessions_with(reply)] == ["s1", "s2"]
 
 
-def test_list_sessions_requests_server_side_exclude():
-    # The worker asks the host to drop archived/snoozed/trashed server-side, so a
-    # workspace with hundreds of trashed sessions never enumerates them and cannot
-    # exhaust the host's per-plugin UI-state quota.
+def _requested_exclude(include_snoozed):
+    """The `exclude` list the worker sends the host for one list_sessions call."""
     captured = {}
 
     def fake_call_host(method, params, timeout=None):
@@ -223,10 +249,64 @@ def test_list_sessions_requests_server_side_exclude():
         return {"sessions": [{"id": "s1", "project_path": "/a"}]}
 
     rt = main.Runtime(send=lambda _m: None)
+    rt._include_snoozed = include_snoozed
     rt.call_host = fake_call_host
     rt.list_sessions()
     assert captured["method"] == main.SESSIONS_LIST
-    assert set(captured["params"]["exclude"]) == {"archived", "snoozed", "trashed"}
+    return set(captured["params"]["exclude"])
+
+
+def test_list_sessions_requests_server_side_exclude():
+    # The worker asks the host to drop archived/snoozed/trashed server-side, so a
+    # workspace with hundreds of trashed sessions never enumerates them and cannot
+    # exhaust the host's per-plugin UI-state quota.
+    assert _requested_exclude(include_snoozed=False) == {"archived", "snoozed", "trashed"}
+
+
+def test_list_sessions_drops_only_archived_server_side_when_opted_in():
+    # With snoozed sessions kept, the host must not filter them out before the
+    # worker sees them; archived/trashed stay excluded.
+    assert _requested_exclude(include_snoozed=True) == {"archived", "trashed"}
+
+
+def test_snoozed_session_keeps_its_row_badge_and_row_column_when_opted_in(monkeypatch):
+    # The host stores and serves row state for a snoozed session, so an opted-in
+    # refresh must still push both row slots for it instead of blanking a parked
+    # row's PR state.
+    sent: list = []
+    rt = main.Runtime(send=sent.append)
+    rt._include_snoozed = True
+    rt.call_host = lambda *_a, **_kw: {
+        "sessions": [{"id": "s1", "project_path": "/a", "archived": False, "snoozed": True}]
+    }
+    monkeypatch.setattr(main.refresh, "build_snapshot", lambda _sessions, **_k: _two_pr_snapshot())
+
+    rt.run_refresh(force=True)
+
+    slots = {
+        m["params"]["slot"] for m in sent if m["method"] == main.UI_STATE_SET and m["params"].get("session_id") == "s1"
+    }
+    assert {"row-badge", "row-column"} <= slots
+
+
+def test_snoozed_session_never_reaches_build_snapshot_by_default(monkeypatch):
+    # End-to-end: without the opt-in a snoozed session triggers no network work.
+    seen = []
+
+    def spy_build_snapshot(sessions, force=False, **_kwargs):
+        seen.append([s.get("id") for s in sessions])
+        return {"sessions": [], "auth": {"present": True}}
+
+    monkeypatch.setattr(main.refresh, "build_snapshot", spy_build_snapshot)
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: {
+        "sessions": [
+            {"id": "active", "project_path": "/a"},
+            {"id": "snoozed", "project_path": "/b", "snoozed": True},
+        ]
+    }
+    rt.run_refresh()
+    assert seen == [["active"]]
 
 
 def test_archived_session_never_reaches_build_snapshot(monkeypatch):
