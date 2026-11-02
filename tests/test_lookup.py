@@ -563,11 +563,11 @@ def test_truncated_key_reports_probe_freshness_not_fresh(tmp_path):
     # changed-nowhere probe whose own list came from the backoff-served cache.
     key = lookup.pull_keys([("team", "r")], "feature")[0]
     refresh._graphql_cache.clear()
-    refresh._truncated_until = {refresh._rich_cache_key(key, required_checks_only=False): float("inf")}
+    refresh._truncated_until = {refresh._rich_cache_key(key, flags=refresh.DEFAULT_NORMALIZE_FLAGS): float("inf")}
     refresh._etag_cache[key] = {"etag": '"etag"', "pulls": [_rest(team_pull)]}
     refresh._backoff["rest"]["until"] = float("inf")
     stub = _StubClient()
-    repo = refresh._fetch_rich(stub, [key], force=False, required_checks_only=False)[key]
+    repo = refresh._fetch_rich(stub, [key], force=False, flags=refresh.DEFAULT_NORMALIZE_FLAGS)[key]
     assert stub.asked == []  # the marker suppressed the full query entirely
     assert [p["number"] for p in repo["pulls"]] == [2]
     assert repo["_fresh"] is False  # a backoff-served probe is not reported fresh
@@ -581,7 +581,7 @@ def test_truncated_window_serves_rest_when_rich_set_diverged(tmp_path):
     # the meantime the rich entry no longer matches the REST set, and serving it
     # would hide the new PR for the whole window. Only a matching set may serve.
     key = lookup.pull_keys([("team", "r")], "feature")[0]
-    cache_key = refresh._rich_cache_key(key, required_checks_only=False)
+    cache_key = refresh._rich_cache_key(key, flags=refresh.DEFAULT_NORMALIZE_FLAGS)
     old = _rest(_node("team/r", "team/r", 2))
     new = _rest(_node("team/r", "team/r", 3, branch="feature"))
     refresh._graphql_cache[cache_key] = {
@@ -596,19 +596,19 @@ def test_truncated_window_serves_rest_when_rich_set_diverged(tmp_path):
 
     # A changed probe is the divergence signal; the rich list must not win.
     changed_stub = _StubClient(key, [old, new], changed=True)
-    repo = refresh._fetch_rich(changed_stub, [key], force=False, required_checks_only=False)[key]
+    repo = refresh._fetch_rich(changed_stub, [key], force=False, flags=refresh.DEFAULT_NORMALIZE_FLAGS)[key]
     assert [p["number"] for p in repo["pulls"]] == [2, 3]
     assert repo["_stale"] is False  # the fresh REST list does not claim stale
 
     # Even an unchanged probe must not serve a rich set that disagrees with REST.
     stub = _StubClient(key, [old, new])
-    diverged = refresh._fetch_rich(stub, [key], force=False, required_checks_only=False)[key]
+    diverged = refresh._fetch_rich(stub, [key], force=False, flags=refresh.DEFAULT_NORMALIZE_FLAGS)[key]
     assert [p["number"] for p in diverged["pulls"]] == [2, 3]
     assert diverged["_stale"] is False  # a 304 list is confirmed current
 
     # With the sets agreeing, the richer cached shape is still served.
     refresh._etag_cache[key] = {"etag": '"etag"', "pulls": [old]}
-    same = refresh._fetch_rich(_StubClient(key, [old]), [key], force=False, required_checks_only=False)[key]
+    same = refresh._fetch_rich(_StubClient(key, [old]), [key], force=False, flags=refresh.DEFAULT_NORMALIZE_FLAGS)[key]
     assert [p["number"] for p in same["pulls"]] == [2]
     assert same["_stale"] is True
 
