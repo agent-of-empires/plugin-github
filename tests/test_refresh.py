@@ -2610,6 +2610,84 @@ def test_reused_ownership_fetches_owned_pr_absent_from_crowded_page(tmp_path):
     assert sorted(p["number"] for p in snap["sessions"][0]["repos"][0]["pulls"]) == [7, 8]
 
 
+def test_reused_ownership_does_not_recover_omitted_merged_pr(tmp_path):
+    """The promotion's ``digest_owned`` reuse path filters omitted PRs on its
+    own, so pin it separately from ``_owned_connection``.
+
+    Discovery proves PR 8 is this checkout's and MERGED. The digest page lists
+    it, so it reaches the reuse branch's proven set; the promoted rich page has
+    moved on and lists only PR 7. Recovering PR 8 by number would spend a serial
+    detail query every tick on a PR the page itself never needed to show, while
+    keeping OPEN recovery for genuinely hidden PRs."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+
+    detail_numbers = []
+    phase = {"head": "old"}
+
+    def page(nodes, has_next=True):
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                    "repository": {"b0": {"nodes": nodes, "pageInfo": {"hasNextPage": has_next, "endCursor": "c"}}},
+                }
+            },
+        )
+
+    def handler(request):
+        if not _is_graphql(request):
+            if request.headers.get("If-None-Match") == 'W/"v1"':
+                return httpx.Response(304)
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7)])
+        kind = _graphql_kind(request)
+        if kind == "discover":
+            response = _owned(7, 8)
+            payload = json.loads(response.content)
+            for node in payload["data"]["repository"]["pullRequests"]["nodes"]:
+                if node["number"] == 8:
+                    node["state"] = "MERGED"
+            return httpx.Response(200, json=payload)
+        if kind == "detail":
+            detail_numbers.append(_detail_number(request))
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                        "repository": {"pullRequest": _gql_node(number=detail_numbers[-1])},
+                    }
+                },
+            )
+        # The digest tier always sees both PRs (PR 8 MERGED, head OID moved, so the
+        # signature mismatches and promotes). The full page lists both while
+        # seeding and only PR 7 after promotion, so the proven MERGED PR 8 is
+        # omitted from ``kept`` on the reuse path.
+        stale = [_gql_node(number=7), _gql_node(number=8, state="MERGED", merged=True)]
+        digest_nodes = [
+            {**_gql_node(number=7), "headRefOid": "moved"},
+            {**_gql_node(number=8, state="MERGED", merged=True), "headRefOid": "moved"},
+        ]
+        if _is_full_query(request):
+            return page(stale if phase["head"] == "old" else [_gql_node(number=7)])
+        return page(digest_nodes)
+
+    transport = httpx.MockTransport(handler)
+    seeded = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    assert sorted(p["number"] for p in seeded["sessions"][0]["repos"][0]["pulls"]) == [7, 8]
+
+    _expire_graphql_cache()
+    detail_numbers.clear()  # measure only the promoted tick
+    phase["head"] = "moved"  # genuine mismatch, so the key promotes
+
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+
+    assert 8 not in detail_numbers  # never fetched by number past the page
+
+
 def test_unproved_crowded_promotion_still_discovers(tmp_path):
     """Control for the test above: same crowded promoted page, but the digest
     page was itself crowded, so no proof exists and discovery must run."""
