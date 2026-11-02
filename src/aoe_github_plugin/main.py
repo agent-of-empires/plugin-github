@@ -77,6 +77,11 @@ DEFAULT_IGNORED_COMMENTERS = "coderabbitai, codecov"
 # Off by default: a stale CHANGES_REQUESTED still reads "pushed since review"
 # (with an approval hint) even when another reviewer approved the current head.
 APPROVED_OVERRIDES_STALE_BLOCK_SETTING_KEY = "approved_overrides_stale_block"
+# Off by default (opt-in): a bot's COMMENTED review whose body literally
+# recommends approval ("Recommendation: Approve") counts like any other comment
+# unless the user enables the setting, which stops such a review from making
+# the PR read "commented".
+IGNORE_BOT_APPROVAL_RECOMMENDATIONS_SETTING_KEY = "ignore_bot_approval_recommendations"
 # The pane's PR selector fires this with the clicked row's `params` (`{"pr": key}`);
 # `uistate.SELECT_METHOD` is the same name on the block-building side.
 SELECT_PR_METHOD = uistate.SELECT_METHOD
@@ -222,6 +227,7 @@ class Runtime:
         self._ignore_submodules = True
         self._required_checks_only = False
         self._approved_overrides_stale_block = False
+        self._ignore_bot_approval_recommendations = False
         self._ignored_commenters = graphql.parse_ignored_commenters(DEFAULT_IGNORED_COMMENTERS)
         self._next_network: float | None = None
         self._next_poll: float | None = None
@@ -437,6 +443,7 @@ class Runtime:
             self._required_checks_only = self.resolve_required_checks_only()
             self._ignored_commenters = self.resolve_ignored_commenters()
             self._approved_overrides_stale_block = self.resolve_approved_overrides_stale_block()
+            self._ignore_bot_approval_recommendations = self.resolve_ignore_bot_approval_recommendations()
             snapshot = refresh.build_snapshot(
                 sessions,
                 force=force,
@@ -445,6 +452,7 @@ class Runtime:
                     required_checks_only=self._required_checks_only,
                     ignored_commenters=self._ignored_commenters,
                     approved_overrides_stale_block=self._approved_overrides_stale_block,
+                    ignore_bot_approval_recommendations=self._ignore_bot_approval_recommendations,
                 ),
             )
             current_ids = self._push_snapshot(snapshot)
@@ -538,6 +546,11 @@ class Runtime:
     def resolve_approved_overrides_stale_block(self) -> bool:
         return self._setting_bool(
             APPROVED_OVERRIDES_STALE_BLOCK_SETTING_KEY, default=self._approved_overrides_stale_block
+        )
+
+    def resolve_ignore_bot_approval_recommendations(self) -> bool:
+        return self._setting_bool(
+            IGNORE_BOT_APPROVAL_RECOMMENDATIONS_SETTING_KEY, default=self._ignore_bot_approval_recommendations
         )
 
     def resolve_ignored_commenters(self) -> frozenset[str]:
