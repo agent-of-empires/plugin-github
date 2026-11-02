@@ -3,6 +3,7 @@
 import os
 import json
 import time
+import unicodedata
 
 import pytest
 
@@ -767,7 +768,7 @@ def test_badge_chips_use_single_character_marks():
         [_repo(name="a", pulls=[_rich_pull(review="changes-requested", checks=checks, comments=comments)])],
         dense_glyphs=True,
     )
-    assert [i["text"] for i in items] == ["⇄", "✗", "✗", "≡"]
+    assert [i["text"] for i in items] == ["⇄", "✗", "✘", "✉"]
     assert all(len(i["text"]) == 1 for i in items)
     assert all(not i["text"].isdigit() for i in items)
     assert items[0]["tooltip"] == "a: PR #5 T"
@@ -783,7 +784,7 @@ def test_badge_dense_marks_cover_queue_conflict_and_error():
     conflicted["merge_state"] = "conflicts"
     conflicted["merge_queue"] = queue
     marks = [i["text"] for i in _badge_items_for([_repo(pulls=[conflicted])], dense_glyphs=True)]
-    assert marks[:3] == ["⇄", "⇉", "▲"]
+    assert marks[:3] == ["⇄", "⇉", "⊘"]
     assert [i["text"] for i in _badge_items_for([_repo(error={"hint": "boom"})], dense_glyphs=True)] == ["!"]
 
 
@@ -811,12 +812,27 @@ def test_badge_payload_is_web_identical_by_default():
 
 def test_glyph_tables_cover_every_visual_state():
     # A state with no glyph would fall back to a mark; the tables are pinned to the
-    # visual ones so a new review/CI state cannot silently lose its mark, and every
-    # mark stays a single character so a row can never turn into words.
+    # visual ones so a new review/CI state cannot silently lose its mark.
     assert set(uistate._REVIEW_GLYPH) == set(uistate._REVIEW_VISUAL)
     assert set(uistate._CHECK_GLYPH) == set(uistate._CHECK_VISUAL)
-    marks = (*uistate._REVIEW_GLYPH.values(), *uistate._CHECK_GLYPH.values(), uistate._QUEUE_GLYPH)
-    assert all(len(mark) == 1 for mark in marks)
+    marks = (
+        uistate._PR_GLYPH,
+        uistate._DRAFT_GLYPH,
+        uistate._QUEUE_GLYPH,
+        uistate._CONFLICT_GLYPH,
+        uistate._COMMENT_GLYPH,
+        uistate._ERROR_GLYPH,
+        *uistate._REVIEW_GLYPH.values(),
+        *uistate._CHECK_GLYPH.values(),
+    )
+    # No two chips share a mark: the row paints text plus tone only, so with a chip
+    # category toggled off a lone mark has to name its own state.
+    assert len(set(marks)) == len(marks)
+    # Each is one narrow cell, so a mark cannot turn a row into words or break the
+    # alignment in a double-width locale (Ambiguous width renders two cells there).
+    for mark in marks:
+        assert len(mark) == 1
+        assert unicodedata.east_asian_width(mark) in {"N", "Na", "H"}, mark
 
 
 # --- chip-visibility settings (#36 follow-up): per-category toggles ---

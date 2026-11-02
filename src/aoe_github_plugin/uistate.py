@@ -23,7 +23,7 @@ sort option, six global filter facets, plus three pushes per session:
   is the GitHub glyph, tone and tooltip the web row already paints, and the
   ``row-column`` carries the words. With ``dense_row_badge_glyphs`` on, every chip
   also gains a one-character mark the terminal row paints where it has no icons
-  (``⇄``, ``✓``, ``✗``, ``≡``), colored by tone, and the ``row-column`` drops its
+  (``⇄``, ``✓``, ``✘``, ``✉``), colored by tone, and the ``row-column`` drops its
   words, so a row reads as marks rather than titles; the payload is shared, so the
   web chip paints the mark beside its icon (`SlotChrome.chipParts` renders both).
 - a ``row-column`` whose payload is ``{"text", "tone", "tooltip",
@@ -196,27 +196,34 @@ FILTER_FACETS: tuple[tuple[str, dict[str, Any]], ...] = (
 # `dense_row_badge_glyphs` is on. The payload is shared: the web chip paints its
 # lucide `icon` and this `text` together (`SlotChrome.chipParts`), while the
 # terminal row, which paints no icons, shows the mark alone (colored by tone).
-# Fallbacks stay one character so no state can turn a row into words.
+# Every state owns its own mark and no two chips share one: the terminal row paints
+# text plus tone only, so a mark reused for two states (``✓`` for an approved review
+# and for passing CI, both success) went unreadable the moment a chip toggle hid
+# its neighbour. Review keeps the light marks and CI the heavy ones, so a lone chip
+# still names its category. Every mark is a single narrow cell (East-Asian Neutral
+# or Narrow, never Ambiguous or Wide) so the marks stay one column in a CJK locale;
+# `test_glyph_tables_cover_every_visual_state` pins both properties.
 _REVIEW_GLYPH: dict[str, str] = {
     "approved": "✓",
-    "partially-approved": "◍",
+    "partially-approved": "◷",
     "changes-requested": "✗",
     "changes-pushed": "↻",
-    "commented": "≡",
-    "waiting": "◷",
+    "commented": "❝",
+    "waiting": "⧗",
 }
+# The heavy check/cross pair, so CI never reads as the review chip next to it.
 _CHECK_GLYPH: dict[str, str] = {
-    "succeeded": "✓",
-    "failing": "✗",
-    "running": "◐",
-    "queued": "◷",
+    "succeeded": "✔",
+    "failing": "✘",
+    "running": "~",
+    "queued": "⇨",
     "unknown": "?",
 }
 _QUEUE_GLYPH = "⇉"
 _PR_GLYPH = "⇄"
 _DRAFT_GLYPH = "◌"
-_CONFLICT_GLYPH = "▲"
-_COMMENT_GLYPH = "≡"
+_CONFLICT_GLYPH = "⊘"
+_COMMENT_GLYPH = "✉"
 _ERROR_GLYPH = "!"
 
 

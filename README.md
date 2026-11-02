@@ -247,7 +247,7 @@ Each push is `params: { slot, id, session_id, payload }`. A badge item is
 `{ icon, tone, href?, tooltip }` (`icon` is a lucide name, e.g.
 `git-pull-request-arrow`; `tone` colors it; `href` opens the PR; `tooltip` keeps
 the full repo, PR number and title line). `text` is present only when
-`dense_row_badge_glyphs` is on: one character (`⇄`, `✓`, `✗`, `≡`) the host's
+`dense_row_badge_glyphs` is on: one character (`⇄`, `✓`, `✘`, `✉`) the host's
 terminal row paints where it has no icons, and the row-column drops its words so
 the row is marks plus the sort scalar. Off (the default), a chip is exactly the
 icon/tone/tooltip/href shape main ships. A pane block
@@ -379,9 +379,14 @@ enabled; the bot's unresolved threads still count. Off (the default), such a
 review counts like any other comment.
 
 The `dense_row_badge_glyphs` setting (off by default) turns the row into marks:
-every badge chip gains a one-character mark (`⇄` open PR, `◌` draft, `▲` conflict,
-`✓`/`✗` review and CI, `⇉` merge queue, `≡` comments, `!` error) and the status
-words are dropped, so a session row reads as marks instead of titles. The badge
+every badge chip gains its own one-character mark (`⇄` open PR, `◌` draft, `⊘`
+conflict, `✓` approved, `◷` partially approved, `✗` changes requested, `↻` pushed
+since review, `❝` commented, `⧗` awaiting review, `✔`/`✘` CI passing/failing, `~`
+CI running, `⇨` CI queued, `?` CI unknown, `⇉` merge queue, `✉` unresolved
+comments, `!` error) and the status words are dropped, so a session row reads as
+marks instead of titles. No two chips share a mark, so a lone mark still names its
+state when a chip category is toggled off, and every mark is one narrow cell, so
+the marks stay aligned in a double-width locale. The badge
 payload is shared, so the web row renders the same mark beside its icon
 (`SlotChrome.chipParts` paints icon and text together). The tooltip keeps the
 full line on hover either way, but `chipParts` drops `aria-label` when `text` is
