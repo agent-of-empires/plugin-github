@@ -209,7 +209,7 @@ default = true
 [[settings]]
 key = "include_snoozed_sessions"
 label = "Keep polling snoozed sessions"
-description = "Snoozed sessions normally stop being refreshed, so their PR badge and status column freeze while parked. Enable to keep them updating (and spending GitHub quota), so the row is live the moment you unsnooze it."
+description = "Snoozed sessions normally stop being refreshed, so the next full refresh clears their PR badge and status column while parked. Enable to keep them updating (and spending GitHub quota), so the row is live the moment you unsnooze it."
 type = "boolean"
 default = false
 advanced = true

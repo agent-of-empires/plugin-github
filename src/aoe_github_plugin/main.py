@@ -66,9 +66,10 @@ CHIP_SETTING_KEYS = {
 # Toggle for the row-column status-text cell (the words summary). Off keeps the
 # badge icons but clears the text. Defaults on.
 STATUS_TEXT_SETTING_KEY = "show_status_text"
-# Opt-in: keep polling snoozed sessions so their row badge and status column keep
-# updating while the row is parked. Off by default -- snoozing is the user asking
-# the worker to stop spending GitHub quota on that session.
+# Opt-in: keep polling snoozed sessions so their row badge and status column stay
+# live while the row is parked. Off by default, where the next full refresh clears
+# those slots: snoozing is the user asking the worker to stop spending GitHub
+# quota on that session.
 INCLUDE_SNOOZED_SETTING_KEY = "include_snoozed_sessions"
 IGNORE_SUBMODULES_SETTING_KEY = "ignore_submodules"
 # Toggle for the CI rollup semantics. Defaults off so existing row attention
@@ -228,8 +229,9 @@ class Runtime:
         self._chip_flags: frozenset[str] = frozenset(CHIP_SETTING_KEYS.values())
         # Whether the row-column status text is shown; resolved in run(), on until.
         self._show_status_text = True
-        # Whether snoozed sessions are polled too; resolved in run(), off until then
-        # so a parked session is not refreshed before the user opted in.
+        # Whether snoozed sessions are polled too; re-resolved by every
+        # list_sessions() call, off until then so a parked session is not
+        # refreshed before the user opted in.
         self._include_snoozed = False
         self._ignore_submodules = True
         self._required_checks_only = False
@@ -348,16 +350,19 @@ class Runtime:
 
         Snoozed sessions are dropped the same way unless ``include_snoozed_sessions``
         opts in. The host keeps storing and serving ``row-badge``/``row-column`` for
-        a snoozed session -- the row is only sunk, not hidden -- so a user who wants
-        a parked row to keep tracking PR state can opt in; the default treats a
-        snooze as the "stop spending quota on this" signal it usually is.
+        a snoozed session (the row is only sunk, not hidden), so a user who wants a
+        parked row to keep tracking PR state can opt in; the default treats a snooze
+        as the "stop spending quota on this" signal it usually is.
 
         The ``exclude`` param filters server-side so the host never even
         enumerates those sessions; a host too old to honor it ignores the param and
-        returns everything, so the client-side filter below still drops them
-        (trashed has no per-entry flag, so an old host cannot drop those
-        client-side, which is exactly the exhaustion the host-side ``exclude``
-        fixes)."""
+        returns everything, so the client-side filter below still drops them (a
+        host that ignores ``exclude`` predates the per-entry ``trashed`` field, so
+        it cannot drop those client-side, which is exactly the exhaustion the
+        host-side ``exclude`` fixes)."""
+        # Re-read the opt-in on every call: the host writes settings without
+        # restarting the worker, so a value cached at startup would never flip.
+        self._include_snoozed = self.resolve_include_snoozed()
         exclude = ["archived", "trashed"] if self._include_snoozed else ["archived", "snoozed", "trashed"]
         result = self.call_host(SESSIONS_LIST, {"exclude": exclude}, timeout=timeout)
         sessions = result.get("sessions") if isinstance(result, dict) else None
@@ -631,7 +636,6 @@ class Runtime:
         # row reflects the user's choices, not the all-on default.
         self._chip_flags = self.resolve_chip_flags()
         self._show_status_text = self._setting_bool(STATUS_TEXT_SETTING_KEY, default=True)
-        self._include_snoozed = self.resolve_include_snoozed()
         self._ignore_submodules = self.resolve_ignore_submodules()
         self._required_checks_only = self.resolve_required_checks_only()
         # Paint last-known data instantly from the persisted snapshot, then run

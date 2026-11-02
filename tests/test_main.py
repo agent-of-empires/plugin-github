@@ -199,10 +199,15 @@ def test_ignore_bot_approval_recommendations_setting_reaches_refresh(monkeypatch
 
 
 def _list_sessions_with(reply, *, include_snoozed=False):
-    """list_sessions over a stubbed host reply."""
+    """list_sessions over a stubbed host reply and ``config.get`` answer."""
     rt = main.Runtime(send=lambda _m: None)
-    rt._include_snoozed = include_snoozed
-    rt.call_host = lambda *_a, **_kw: reply
+
+    def fake_call_host(method, params, **_kw):
+        if method == main.CONFIG_GET:
+            return {"value": include_snoozed}
+        return reply
+
+    rt.call_host = fake_call_host
     return rt.list_sessions()
 
 
@@ -239,17 +244,35 @@ def test_list_sessions_keeps_sessions_when_flags_absent():
     assert [s["id"] for s in _list_sessions_with(reply)] == ["s1", "s2"]
 
 
+def test_include_snoozed_is_re_resolved_on_every_list_sessions():
+    # The host writes settings without restarting the worker, so the opt-in must
+    # be re-read per call; a value pinned at startup would never flip.
+    flipped = {"on": False}
+
+    def fake_call_host(method, params, **_kw):
+        if method == main.CONFIG_GET:
+            return {"value": flipped["on"]}
+        return _flagged_sessions_reply()
+
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = fake_call_host
+    assert [s["id"] for s in rt.list_sessions()] == ["active"]
+    flipped["on"] = True
+    assert [s["id"] for s in rt.list_sessions()] == ["active", "snoozed"]
+
+
 def _requested_exclude(include_snoozed):
     """The `exclude` list the worker sends the host for one list_sessions call."""
     captured = {}
 
     def fake_call_host(method, params, timeout=None):
+        if method == main.CONFIG_GET:
+            return {"value": include_snoozed}
         captured["method"] = method
         captured["params"] = params
         return {"sessions": [{"id": "s1", "project_path": "/a"}]}
 
     rt = main.Runtime(send=lambda _m: None)
-    rt._include_snoozed = include_snoozed
     rt.call_host = fake_call_host
     rt.list_sessions()
     assert captured["method"] == main.SESSIONS_LIST
@@ -272,17 +295,29 @@ def test_list_sessions_drops_only_archived_server_side_when_opted_in():
 def test_snoozed_session_keeps_its_row_badge_and_row_column_when_opted_in(monkeypatch):
     # The host stores and serves row state for a snoozed session, so an opted-in
     # refresh must still push both row slots for it instead of blanking a parked
-    # row's PR state.
+    # row's PR state. The opt-in arrives through config.get, the way the host
+    # writes it, and the snoozed session must actually reach build_snapshot
+    # (otherwise the slot assertion below would pass with the feature off).
     sent: list = []
+    seen: list = []
     rt = main.Runtime(send=sent.append)
-    rt._include_snoozed = True
-    rt.call_host = lambda *_a, **_kw: {
-        "sessions": [{"id": "s1", "project_path": "/a", "archived": False, "snoozed": True}]
-    }
-    monkeypatch.setattr(main.refresh, "build_snapshot", lambda _sessions, **_k: _two_pr_snapshot())
+
+    def fake_call_host(method, params, **_kw):
+        if method == main.CONFIG_GET:
+            return {"value": True}
+        return {"sessions": [{"id": "s1", "project_path": "/a", "archived": False, "snoozed": True}]}
+
+    rt.call_host = fake_call_host
+
+    def spy_build_snapshot(sessions, **_kwargs):
+        seen.append([s.get("id") for s in sessions])
+        return _two_pr_snapshot()
+
+    monkeypatch.setattr(main.refresh, "build_snapshot", spy_build_snapshot)
 
     rt.run_refresh(force=True)
 
+    assert seen == [["s1"]]
     slots = {
         m["params"]["slot"] for m in sent if m["method"] == main.UI_STATE_SET and m["params"].get("session_id") == "s1"
     }
