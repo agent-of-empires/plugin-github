@@ -121,6 +121,36 @@ def test_open_raises_without_github_remote(monkeypatch):
         handlers.github_open(env=_NoTokenEnv())
 
 
+def test_open_returns_upstream_pull_when_origin_errors(monkeypatch):
+    # #130 review: an origin failure must not hide an upstream hit. `open_pulls`
+    # keeps the origin error only when nothing found the PR, so `github.open`
+    # resolves the upstream PR instead of falling back to the origin compare
+    # URL that would claim no PR exists.
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("alice", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repos", lambda _p: [("alice", "r"), ("upstream", "r")])
+    monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
+
+    def handler(request):
+        if request.url.path == "/repos/alice/r/pulls":
+            return httpx.Response(502, json={"message": "server error"})
+        if request.url.path == "/repos/upstream/r/pulls":
+            assert request.url.params["head"] == "alice:feature"
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        **_pr(),
+                        "html_url": "https://github.com/upstream/r/pull/9",
+                        "head": {"ref": "feature", "repo": {"name": "r", "owner": {"login": "alice"}}},
+                    }
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    result = handlers.github_open(env=_NoTokenEnv(), transport=_transport(handler))
+    assert result == {"url": "https://github.com/upstream/r/pull/9", "kind": "pull"}
+
+
 def test_status_discovers_fork_pull_targeting_configured_upstream(tmp_path):
     subprocess.run(["git", "init", "-q", "-b", "feature", str(tmp_path)], check=True)
     subprocess.run(

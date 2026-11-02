@@ -20,6 +20,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **refresh:** Read a checkout's remotes through the bounded git helper, so a stalled mount or held git lock cannot block a refresh worker and stall the whole tick.
 - **pane:** Keep advisory stack states out of hard readiness blocks and omit footer verdicts for stack-only PRs.
 - **graphql:** Opt-in `ignore_bot_approval_recommendations` setting (default off) to exclude bot approval recommendations from commented state.
+- **discovery:** Accept the head-filtered page without identity discovery whenever every open PR the owner-scoped REST probe lists sits on it, on both tiers, so a long-lived crowded branch name no longer discards the rich nodes it cannot re-prove. An owned OPEN PR whose detail fetch does not resolve now reports truncation instead of caching its absence, an HTTP rate limit during discovery arms the GraphQL gate and serves REST instead of escaping as an internal error, and a promotion reuses the digest pass's detail nodes instead of fetching the same PR twice in one tick (#130).
 
 ## [2.3.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.3.0) - 2026-10-21
 

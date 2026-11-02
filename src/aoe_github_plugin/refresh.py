@@ -357,8 +357,10 @@ def _remote_repos(path: str) -> list[tuple[str, str]]:
     """Destinations this checkout may target: its configured GitHub remotes.
 
     Read per checkout, not per session or origin: two worktrees of the same
-    origin can declare different remotes, so a shared list would search
-    destinations another checkout never configured.
+    origin can declare different remotes. ``_resolve_checkouts`` unions the
+    reads only across checkouts that share a query key (same origin and
+    branch), which are one query identity anyway; a list shared beyond that
+    key would search destinations another checkout never configured.
 
     Uses this module's timed ``_git`` rather than ``gitctx``'s: a checkout on a
     stalled network mount or holding a git lock would otherwise block a
@@ -1113,32 +1115,45 @@ def _resolve_null_repository(
 
 def _fetch_details(
     client: GitHubClient, owner: str, repo: str, numbers: set[Any], key: RepoKey
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], set[Any]]:
     """Fetch the rich node for each owned PR the bounded branch page omitted.
 
-    Bounded by what discovery already proved belongs to this checkout, so this
-    is normally empty or a single PR. A failed fetch drops that PR from this
-    tick's result rather than failing the whole repo, matching the fail-soft
-    contract of the surrounding chunk.
+    Bounded by what discovery or the REST probe already proved belongs to this
+    checkout, so this is normally empty or a single PR. Returns
+    ``(found, unresolved)``: the rich nodes fetched, plus every number the fetch
+    could not resolve (a failed request, a rate-limit stop, or a response
+    missing the node). A failed fetch must not silently drop an owned OPEN PR
+    from this tick's result: the caller reports truncation on ``unresolved`` so
+    the owner-scoped REST list (which still lists it) is served and no cache
+    records the absence, while the chunk itself stays fail-soft.
     """
     found: list[dict[str, Any]] = []
-    for number in sorted(n for n in numbers if isinstance(n, int)):
+    unresolved: set[Any] = set()
+    ordered = sorted(n for n in numbers if isinstance(n, int))
+    for index, number in enumerate(ordered):
         try:
             data = client.post_graphql(graphql.DETAIL_QUERY, {"owner": owner, "repo": repo, "number": number})
         except RateLimitedError:
             _set_backoff("graphql")
+            unresolved.update(ordered[index:])
             break
         except GitHubError:
+            unresolved.add(number)
             continue
         rate_info = (data.get("data") or {}).get("rateLimit") or {}
         _observe_rate_limit(rate_info, kind="detail", repo=f"{owner}/{repo}", aliases=1)
         if _graphql_rate_limited(data):
             _set_backoff("graphql", rate_info.get("resetAt"))
+            unresolved.update(ordered[index:])
             break
         node = ((data.get("data") or {}).get("repository") or {}).get("pullRequest")
         if isinstance(node, dict) and lookup.matches_head(lookup.graphql_head(node), key):
             found.append(node)
-    return found
+        elif not isinstance(node, dict):
+            # The PR the caller proved ours did not come back: an absence this
+            # code cannot confirm, so report it rather than cache it.
+            unresolved.add(number)
+    return found, unresolved
 
 
 def _needs_discovery(conn: dict[str, Any]) -> bool:
@@ -1152,29 +1167,48 @@ def _needs_discovery(conn: dict[str, Any]) -> bool:
     return not (isinstance(page_info, dict) and page_info.get("hasNextPage") is False)
 
 
-def _owned_connection(client: GitHubClient, key: RepoKey, conn: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+def _owned_connection(
+    client: GitHubClient, key: RepoKey, conn: dict[str, Any], basic: list[dict[str, Any]]
+) -> tuple[bool, dict[str, Any]]:
     """Resolve one chunk's page down to the checkout's own PRs.
 
-    Returns ``(truncated, owned_conn)``. Ownership is decided by the
-    item-per-page identity discovery (``lookup.discover_pages``), not by the
-    rich page: the aliased full/digest documents carry nested connections, so
-    paging THEM costs multiples of a small page, while discovery resolves a
-    busy branch name for a few scalars per page and stops early once every
-    owned PR is known.
+    Returns ``(truncated, owned_conn)``. Ownership needs no lookup when the
+    answer is already proven: a final page (``hasNextPage: false``) holds every
+    OPEN/MERGED PR with the branch name, and on a crowded page the owner-scoped
+    REST probe's open set (``basic``, already filtered by ``head=owner:branch``
+    and ``matches_head``) is the exact owned open set -- when every one of its
+    PR numbers is on the head-filtered page, nothing owned hides past the page
+    bounds, so the filtered page is accepted without discovery. Identity
+    discovery (``lookup.discover_pages``) then runs only when an open REST PR is
+    missing from the page: the aliased full/digest documents carry nested
+    connections, so paging THEM costs multiples of a small page, while
+    discovery resolves a busy branch name for a few scalars per page and stops
+    early once every owned PR is known.
 
-    When discovery cannot prove the answer (its page bound was exhausted while
-    the server still reported more PRs, so ours may lie past it, or the request
-    failed), ``truncated`` is True: the caller serves the owner-scoped REST list
-    instead of trusting the rich page. A REST-only collision still never arms
-    the per-key cooldown, because a collision is not a failure to retry.
+    ``truncated`` is True when the answer stays unproven: discovery failed or
+    exhausted its page bound while the server still reported more PRs, or an
+    owned OPEN PR the page omitted could not be fetched by number. The caller
+    then serves the owner-scoped REST list instead of trusting (or caching) the
+    rich page. A REST-only collision still never arms the per-key cooldown,
+    because a collision is not a failure to retry.
     """
     owner, repo, branch = key[:3]
-    # A final page is self-evident: ``hasNextPage: false`` says this page holds
-    # every OPEN/MERGED PR with the branch name, so head filtering IS the full
-    # answer and discovery would cost one serial round trip per key per tick for
-    # nothing. Discovery then runs only where the page is actually crowded.
-    if not _needs_discovery(conn):
-        return False, lookup.filter_connection(conn, key)
+    filtered = lookup.filter_connection(conn, key)
+    # The answer is proven without a lookup when either holds:
+    # - A final page is self-evident: ``hasNextPage: false`` says this page
+    #   holds every OPEN/MERGED PR with the branch name, so head filtering IS
+    #   the full answer and discovery would cost a serial round trip per key
+    #   per tick for nothing.
+    # - On a crowded page, the REST probe is this tick's cheap owner-scoped
+    #   census: if the page carries every open PR it lists, no owned PR is
+    #   hidden past the page bounds. Accepting the filtered page skips
+    #   discovery on both tiers -- a long-lived crowded name would otherwise
+    #   spend a serial discovery per key per digest tick and still fail past
+    #   its page bound, discarding the rich nodes the page already returned.
+    page_numbers = {node.get("number") for node in filtered.get("nodes") or [] if isinstance(node, dict)}
+    rest_numbers = {pr.get("number") for pr in basic if isinstance(pr, dict)}
+    if not _needs_discovery(conn) or rest_numbers <= page_numbers:
+        return False, filtered
 
     def observe(rate_info: dict[str, Any]) -> None:
         """Record discovery's spend and arm the gate on budget pressure.
@@ -1193,14 +1227,19 @@ def _owned_connection(client: GitHubClient, key: RepoKey, conn: dict[str, Any]) 
         if rate_limited:
             _set_backoff("graphql")
     except RateLimitedError:
-        raise
+        # Discovery runs after the chunk's main request has returned, so an
+        # HTTP-level rate limit here would otherwise escape the chunk handlers,
+        # degrade every remaining key to an "internal" error, and never arm the
+        # gate. Arm it and let this key serve REST/stale this tick.
+        _set_backoff("graphql")
+        return True, filtered
     except GitHubError:
-        return True, lookup.filter_connection(conn, key)
+        return True, filtered
     if not complete:
         # The page bound was reached with the server still reporting more PRs, so
         # which of them are ours is unknown: the rich page proves nothing either
         # way. Serve the owner-scoped REST list instead.
-        return True, lookup.filter_connection(conn, key)
+        return True, filtered
     # Discovery supplies membership only: the rich page's own nodes are the ones
     # normalised, so CI/review/comment fields are never replaced by the identity
     # records. A PR discovery proved ours but this bounded page did not carry
@@ -1223,10 +1262,24 @@ def _owned_connection(client: GitHubClient, key: RepoKey, conn: dict[str, Any]) 
     missing = {node.get("number") for node in owned if node.get("state") == "OPEN"} - {
         node.get("number") for node in kept
     }
-    kept.extend(_fetch_details(client, owner, repo, missing, key))
+    details, unresolved = _fetch_details(client, owner, repo, missing, key)
+    kept.extend(details)
+    if unresolved:
+        # An owned OPEN PR could not be fetched: caching this page would record
+        # its absence as authoritative. Report truncation so the caller serves
+        # the owner-scoped REST list, which still lists it.
+        return True, filtered
     # A complete discovery is authoritative whatever the rich page truncated at,
     # so nothing is withheld; pagination is off for the promoted thread fetch.
-    return False, {**conn, "pageInfo": {"hasNextPage": False}, "nodes": kept}
+    # ``detail_numbers`` marks the nodes ``_fetch_details`` supplied, so a
+    # promotion reusing this proof later in the same tick can keep those rich
+    # nodes instead of fetching the same PR by number a second time.
+    return False, {
+        **conn,
+        "pageInfo": {"hasNextPage": False},
+        "nodes": kept,
+        "detail_numbers": {node.get("number") for node in details},
+    }
 
 
 def _apply_aliases(
@@ -1270,29 +1323,50 @@ def _apply_aliases(
                 if isinstance(node, dict) and node.get("number") in owned_numbers
             ]
             # A crowded page can leave an owned PR off the node list entirely
-            # (foreign same-name PRs fill ``first: 3``). Discovery already proved
-            # those exist, so fetch them by number instead of reporting them
-            # absent, matching what ``_owned_connection`` does for its own page.
-            # Only OPEN ones: merged PRs are historical entries the page carries
-            # on its own, and recovering every omitted one costs a serial query.
+            # (foreign same-name PRs fill ``first: 3``). The proof already
+            # established those exist, so recover them instead of reporting
+            # them absent, matching what ``_owned_connection`` does for its own
+            # page. Only OPEN ones: merged PRs are historical entries the page
+            # carries on its own, and recovering every omitted one costs a
+            # serial query.
             missing = {
                 node.get("number")
                 for node in proved.get("nodes") or []
                 if isinstance(node, dict) and node.get("state") == "OPEN"
             } - {node.get("number") for node in kept}
+            unresolved: set[Any] = set()
             if missing:
-                kept.extend(_fetch_details(client, key[0], key[1], missing, key))
+                # The digest pass may already have fetched some of these by
+                # number in this very tick (they are in ``detail_numbers``):
+                # reuse those rich nodes rather than paying the same
+                # DETAIL_QUERY twice for one refresh.
+                proved_details = proved.get("detail_numbers") or set()
+                reuse = [
+                    node
+                    for node in proved.get("nodes") or []
+                    if isinstance(node, dict) and node.get("number") in missing and node.get("number") in proved_details
+                ]
+                kept.extend(reuse)
+                missing -= {node.get("number") for node in reuse}
+            if missing:
+                details, unresolved = _fetch_details(client, key[0], key[1], missing, key)
+                kept.extend(details)
             conn = {**conn, "nodes": kept, "pageInfo": {"hasNextPage": False, "endCursor": None}}
-            truncated = False
+            # An owned OPEN PR stayed unfetchable: never cache a fresh result
+            # that omits it. Report truncation so the REST list (which has it)
+            # is served instead.
+            truncated = bool(unresolved)
         else:
-            truncated, conn = _owned_connection(client, key, conn)
+            truncated, conn = _owned_connection(client, key, conn, pending[key]["basic"])
         if truncated:
-            # The single page was exhausted by foreign same-name PRs, so it
-            # cannot prove the checkout's own PR is absent. The owner-scoped
-            # REST probe already lists it; serve that, reporting the probe's
-            # own freshness rather than asserting fresh for a backoff-served
-            # cache. Remember the truncation so the next tick does not re-spend
-            # a full query that is certain to truncate the same way.
+            # The page could not prove the checkout's own PR set (foreign
+            # same-name PRs exhausted it, discovery failed, or an owned PR's
+            # detail fetch did not resolve), so it cannot prove absence either.
+            # The owner-scoped REST probe already lists the open set; serve
+            # that, reporting the probe's own freshness rather than asserting
+            # fresh for a backoff-served cache. Remember the truncation so the
+            # next tick does not re-spend a full query that is certain to
+            # truncate the same way.
             with _cache_lock:
                 _truncated_until[_rich_cache_key(key, flags=flags)] = now + GRAPHQL_TRUNCATED_RETRY
             out[key] = _pulls_result(
@@ -1396,7 +1470,7 @@ def _apply_digest_aliases(
         conn = repository.get(f"b{i}")
         signature = None
         if f"b{i}" not in failed and isinstance(conn, dict):
-            truncated, owned = _owned_connection(client, key, conn)
+            truncated, owned = _owned_connection(client, key, conn, pending[key]["basic"])
             if truncated:
                 # Discovery could not prove the owned set (its page bound was
                 # exhausted, or the request itself failed), so this page proves
