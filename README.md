@@ -146,7 +146,10 @@ session-less `github.refresh` cover every session and prune vanished ones:
    token supplies that field, concatenated across the workspace's repos, plus an error marker per failed
    repo. Each chip is colored by tone, so failing CI / changes requested read as
    danger, unresolved comments as warn, and a healthy PR as success,
-   distinguishing a broken PR from a healthy one at a glance; a draft shows the PR
+   distinguishing a broken PR from a healthy one at a glance; with
+   `dense_row_badge_glyphs` on, each chip also carries a single-character mark so
+   the terminal has something to paint where it has no icons (off by default); a
+   draft shows the PR
    chip alone and merged-only repos are omitted, since the badge is an actionable
    indicator), a `row-column`
    (`{text, tone, tooltip, sort_value?, filter_values?}`, or `{}` to clear -- one deterministic
@@ -241,8 +244,13 @@ known, and a generic message for the REST path, which has no real reset. Backgro
 polls never notify, so a rate-limited workspace is not nagged on every tick.
 
 Each push is `params: { slot, id, session_id, payload }`. A badge item is
-`{ icon, tone?, href?, tooltip? }` (`icon` is a lucide name, e.g.
-`git-pull-request-arrow`; `tone` colors it; `href` opens the PR). A pane block
+`{ icon, tone, href?, tooltip }` (`icon` is a lucide name, e.g.
+`git-pull-request-arrow`; `tone` colors it; `href` opens the PR; `tooltip` keeps
+the full repo, PR number and title line). `text` is present only when
+`dense_row_badge_glyphs` is on: one character (`⇄`, `✓`, `✘`, `✉`) the host's
+terminal row paints where it has no icons, and the row-column drops its words so
+the row is marks plus the sort scalar. Off (the default), a chip is exactly the
+icon/tone/tooltip/href shape main ships. A pane block
 is one of a small, extensible set (`heading`, `row`, `note`, `divider`,
 `section`, `action`, `comment`, `callout`, `bar`, `columns`); the full field list
 per kind is in the host's
@@ -369,6 +377,21 @@ bot's COMMENTED review whose body literally recommends approval (a
 "Recommendation: Approve" line) from making the PR read "commented", when
 enabled; the bot's unresolved threads still count. Off (the default), such a
 review counts like any other comment.
+
+The `dense_row_badge_glyphs` setting (off by default) turns the row into marks:
+every badge chip gains its own one-character mark (`⇄` open PR, `◌` draft, `⊘`
+conflict, `✓` approved, `◷` partially approved, `✗` changes requested, `↻` pushed
+since review, `❝` commented, `⧗` awaiting review, `✔`/`✘` CI passing/failing, `~`
+CI running, `⇨` CI queued, `?` CI unknown, `⇉` merge queue, `✉` unresolved
+comments, `!` error) and the status words are dropped, so a session row reads as
+marks instead of titles. No two chips share a mark, so a lone mark still names its
+state when a chip category is toggled off, and every mark is one narrow cell, so
+the marks stay aligned in a double-width locale. The badge
+payload is shared, so the web row renders the same mark beside its icon
+(`SlotChrome.chipParts` paints icon and text together). The tooltip keeps the
+full line on hover either way, but `chipParts` drops `aria-label` when `text` is
+present (`text ? undefined : tooltip`), so in dense mode a screen reader
+announces the mark instead of the full line.
 
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol
