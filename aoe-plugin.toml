@@ -214,6 +214,18 @@ type = "boolean"
 default = false
 advanced = true
 
+# Dense row, off by default so the shipped payload is unchanged: each badge chip
+# carries a one-character state mark and the row-column drops its words, so a
+# session row is marks plus a sort scalar (the shape the Linear plugin's row badge
+# ships). The row-badge payload is shared with the web row, so with this on the web
+# chip shows the mark beside its icon.
+[[settings]]
+key = "dense_row_badge_glyphs"
+label = "Dense GitHub row badges"
+description = "Draw each session-row PR chip as a single-character state mark with no status words, instead of the terminal falling back to the PR title. The payload is shared, so the web row shows the mark next to its icon."
+type = "boolean"
+default = false
+
 [[settings]]
 key = "ignore_submodules"
 label = "Ignore Git submodules"

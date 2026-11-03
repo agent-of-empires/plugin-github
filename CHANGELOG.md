@@ -9,6 +9,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 ### Features
 
 - **pane:** Show GitHub-native pull request stacks, layer navigation, and readiness through the selected PR.
+- **ui:** Opt-in `dense_row_badge_glyphs` setting (default off) draws each session-row PR chip as a one-character state mark with no status words.
 
 ### Bug Fixes
 

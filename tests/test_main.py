@@ -165,6 +165,29 @@ def test_resolve_include_snoozed_respects_the_setting():
     assert rt.resolve_include_snoozed() is True
 
 
+def test_resolve_dense_glyphs_defaults_off():
+    # The dense row is opt-in: an unset or unsupported setting keeps main's payload
+    # (icons plus tooltips, no marks, status words shown).
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: None
+    assert rt.resolve_dense_glyphs() is False
+
+
+def test_dense_glyphs_setting_reaches_the_ui_mapper(monkeypatch):
+    seen = []
+
+    def spy_snapshot_params(_snapshot, **kwargs):
+        seen.append(kwargs["dense_glyphs"])
+        return []
+
+    monkeypatch.setattr(main.uistate, "snapshot_ui_state_params", spy_snapshot_params)
+    rt = main.Runtime(send=lambda _m: None)
+    rt._push_snapshot({"sessions": []})
+    rt._dense_glyphs = True
+    rt._push_snapshot({"sessions": []})
+    assert seen == [False, True]
+
+
 def test_required_checks_setting_reaches_refresh(monkeypatch):
     seen = []
 

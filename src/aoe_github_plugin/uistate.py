@@ -19,7 +19,13 @@ sort option, six global filter facets, plus three pushes per session:
   success), so the row distinguishes a broken PR from a healthy one at a glance
   (#36). A draft shows the PR chip alone; merged-only repos are omitted, since the
   badge is an actionable indicator. Every chip's href opens that PR; the pane
-  carries the full detail.
+  carries the full detail, and the tooltip keeps the full line. By default a chip
+  is the GitHub glyph, tone and tooltip the web row already paints, and the
+  ``row-column`` carries the words. With ``dense_row_badge_glyphs`` on, every chip
+  also gains a one-character mark the terminal row paints where it has no icons
+  (``⇄``, ``✓``, ``✘``, ``✉``), colored by tone, and the ``row-column`` drops its
+  words, so a row reads as marks rather than titles; the payload is shared, so the
+  web chip paints the mark beside its icon (`SlotChrome.chipParts` renders both).
 - a ``row-column`` whose payload is ``{"text", "tone", "tooltip",
   "sort_value"?, "filter_values"?}`` (or ``{}`` to clear) -- one deterministic
   words summary of the session's most-urgent PR signal, so the list is scannable
@@ -186,6 +192,41 @@ FILTER_FACETS: tuple[tuple[str, dict[str, Any]], ...] = (
     ),
 )
 
+# One-character marks for the session row, used only when
+# `dense_row_badge_glyphs` is on. The payload is shared: the web chip paints its
+# lucide `icon` and this `text` together (`SlotChrome.chipParts`), while the
+# terminal row, which paints no icons, shows the mark alone (colored by tone).
+# Every state owns its own mark and no two chips share one: the terminal row paints
+# text plus tone only, so a mark reused for two states (``✓`` for an approved review
+# and for passing CI, both success) went unreadable the moment a chip toggle hid
+# its neighbour. Review keeps the light marks and CI the heavy ones, so a lone chip
+# still names its category. Every mark is a single narrow cell (East-Asian Neutral
+# or Narrow, never Ambiguous or Wide) so the marks stay one column in a CJK locale;
+# `test_glyph_tables_cover_every_visual_state` pins both properties.
+_REVIEW_GLYPH: dict[str, str] = {
+    "approved": "✓",
+    "partially-approved": "◷",
+    "changes-requested": "✗",
+    "changes-pushed": "↻",
+    "commented": "❝",
+    "waiting": "⧗",
+}
+# The heavy check/cross pair, so CI never reads as the review chip next to it.
+_CHECK_GLYPH: dict[str, str] = {
+    "succeeded": "✔",
+    "failing": "✘",
+    "running": "~",
+    "queued": "⇨",
+    "unknown": "?",
+}
+_QUEUE_GLYPH = "⇉"
+_PR_GLYPH = "⇄"
+_DRAFT_GLYPH = "◌"
+_CONFLICT_GLYPH = "⊘"
+_COMMENT_GLYPH = "✉"
+_ERROR_GLYPH = "!"
+
+
 # PR attention kind -> (rank, lucide icon, host Tone, compact label). Lower rank
 # = more attention, so it wins the badge icon and the row-column summary. The
 # order follows issue #36 (#80 adds conflicts): a merge conflict outranks
@@ -329,70 +370,87 @@ def _badge_tooltip(repo: dict[str, Any], chips: frozenset[str]) -> str:
     return f"{head} ({label})"
 
 
-def _chip(icon: str, tone: str, tooltip: str, href: str | None) -> dict[str, Any]:
+def _chip(icon: str, tone: str, text: str | None, tooltip: str, href: str | None) -> dict[str, Any]:
+    """One row-badge chip: the GitHub glyph the web row paints, the tone that colors
+    it, the full line as a tooltip for hover, and the PR ``href``. ``text`` is the
+    single-character mark and only present when the dense terminal representation
+    is on: the payload is shared, so a mark pushed always would land on the web
+    chip too. Without it the host's terminal row falls back to the tooltip."""
     chip: dict[str, Any] = {"icon": icon, "tone": tone, "tooltip": tooltip}
+    if text is not None:
+        chip["text"] = text
     if href:
         chip["href"] = href
     return chip
 
 
-def _pr_badge_chips(repo_name: str, pull: dict[str, Any], chips_on: frozenset[str]) -> list[dict[str, Any]]:
+def _pr_badge_chips(
+    repo_name: str, pull: dict[str, Any], chips_on: frozenset[str], *, dense: bool = False
+) -> list[dict[str, Any]]:
     """The chip sequence for one non-merged PR (#36): a PR affordance, then review,
     CI, and unresolved-comment indicators, each present only when a token supplies
     that field and its category is enabled (``chips_on``). A no-token PR is the PR
-    chip alone, so the row stays uncluttered. Every chip's href opens the PR; its
-    tooltip carries the words."""
+    chip alone, so the row stays uncluttered. Every href opens the PR. ``dense``
+    adds the one-character mark the terminal row renders; off, the chip is the
+    icon/tone/tooltip shape the web row already had."""
     href = pull.get("url")
-    head = f"{repo_name}: PR #{pull.get('number', '?')} {pull.get('title', '')}".rstrip()
+    number = pull.get("number", "?")
+    head = f"{repo_name}: PR #{number} {pull.get('title', '')}".rstrip()
+
+    def mark(glyph: str) -> str | None:
+        return glyph if dense else None
 
     if pull.get("draft"):
         # a draft is WIP: skip review/CI/comment noise until it opens.
-        return [_chip(_ICON_DRAFT, "warn", f"{head} (draft)", href)]
-    chips = [_chip(_ICON_OPEN, "success", head, href)]
+        return [_chip(_ICON_DRAFT, "warn", mark(_DRAFT_GLYPH), f"{head} (draft)", href)]
+    chips = [_chip(_ICON_OPEN, "success", mark(_PR_GLYPH), head, href)]
 
     queue = pull.get("merge_queue")
     if isinstance(queue, dict):
         icon, tone, label = _queue_label(pull) or ("git-merge", "neutral", "in merge queue")
         position = queue.get("position")
         suffix = f" · position {position}" if isinstance(position, int) and not isinstance(position, bool) else ""
-        chips.append(_chip(icon, tone, f"{head} ({label}{suffix})", href))
+        chips.append(_chip(icon, tone, mark(_QUEUE_GLYPH), f"{head} ({label}{suffix})", href))
     if pull.get("merge_state") == "conflicts":
         # Conflicts are ungated (not a suppressible category): a merge-blocked
         # PR always shows the danger chip. Exact match avoids false conflicts.
-        chips.append(_chip("triangle-alert", "danger", f"{head} (conflicts)", href))
+        chips.append(_chip("triangle-alert", "danger", mark(_CONFLICT_GLYPH), f"{head} (conflicts)", href))
 
     review_state = pull.get("review_state")
-    review = _REVIEW_VISUAL.get(review_state) if isinstance(review_state, str) else None
-    if review and "review" in chips_on:
-        icon, tone, label = review
-        chips.append(_chip(icon, tone, f"{head} ({label})", href))
+    if isinstance(review_state, str) and "review" in chips_on:
+        review = _REVIEW_VISUAL.get(review_state)
+        if review:
+            icon, tone, label = review
+            chips.append(_chip(icon, tone, mark(_REVIEW_GLYPH.get(review_state, "?")), f"{head} ({label})", href))
 
     checks = pull.get("checks")
     cstate = checks.get("state") if isinstance(checks, dict) else None
     if isinstance(cstate, str) and "ci" in chips_on:
         icon, tone, label = _CHECK_VISUAL.get(cstate, _CHECK_VISUAL["unknown"])
-        chips.append(_chip(icon, tone, f"{head} (CI {label})", href))
+        chips.append(_chip(icon, tone, mark(_CHECK_GLYPH.get(cstate, "?")), f"{head} (CI {label})", href))
 
     comments = pull.get("comments")
     unresolved = comments.get("unresolved") if isinstance(comments, dict) else 0
     if unresolved and "comments" in chips_on:
-        chips.append(_chip("message-square", "warn", f"{head} ({unresolved} unresolved)", href))
+        chips.append(_chip("message-square", "warn", mark(_COMMENT_GLYPH), f"{head} ({unresolved} unresolved)", href))
 
     return chips
 
 
-def _badge_items(repos: list[dict[str, Any]], chips_on: frozenset[str]) -> list[dict[str, Any]]:
+def _badge_items(repos: list[dict[str, Any]], chips_on: frozenset[str], *, dense: bool = False) -> list[dict[str, Any]]:
     """Per session: a chip sequence per open PR (PR + review + CI + comments), an
     error marker per failed repo, concatenated across repos. Merged-only repos and
-    non-github checkouts contribute nothing, keeping the badge actionable."""
+    non-github checkouts contribute nothing, keeping the badge actionable.
+    ``dense`` adds the one-character terminal marks to every chip."""
     items: list[dict[str, Any]] = []
     for repo in repos:
         if repo.get("error"):
-            items.append(_chip(_ICON_ERROR, "danger", _badge_tooltip(repo, chips_on), None))
+            glyph = _ERROR_GLYPH if dense else None
+            items.append(_chip(_ICON_ERROR, "danger", glyph, _badge_tooltip(repo, chips_on), None))
             continue
         name = repo.get("name") or repo.get("repo") or "repo"
         for pull in _open_pulls(repo):
-            items.extend(_pr_badge_chips(name, pull, chips_on))
+            items.extend(_pr_badge_chips(name, pull, chips_on, dense=dense))
     return items
 
 
@@ -1461,6 +1519,7 @@ def snapshot_ui_state_params(
     *,
     chips_on: frozenset[str] = _ALL_CHIPS,
     show_column: bool = True,
+    dense_glyphs: bool = False,
     selected: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """``ui.state.set`` params for a refresh snapshot: per session, a ``row-badge``
@@ -1469,8 +1528,14 @@ def snapshot_ui_state_params(
     ``filter-facet`` entries. ``chips_on`` is the set
     of enabled chip categories (``review``/``ci``/``comments``); a disabled one is
     hidden from both the badge and the column. ``show_column`` False hides the
-    words while preserving the sort scalar. Pure and total: a missing/partial
-    snapshot yields no pushes rather than raising.
+    words while preserving the sort scalar. ``dense_glyphs`` is the dense
+    representation (``dense_row_badge_glyphs``): every badge chip carries a
+    one-character mark -- the terminal row renders ``text`` alone, since it paints
+    no icons, while the web chip renders it beside its ``icon`` -- and the
+    row-column drops its words while keeping ``sort_value``/``filter_values``, so
+    the row is marks and a sort scalar. Off by default, which is byte-for-byte the
+    payload the web row renders. Pure and total: a missing/partial snapshot yields
+    no pushes rather than raising.
     """
     raw_sessions = snapshot.get("sessions")
     if not isinstance(raw_sessions, list):
@@ -1492,8 +1557,8 @@ def snapshot_ui_state_params(
         # is the always-present anchor (unlike the row-column, which the
         # show_status_text toggle can clear). Reuse the column's winner so the
         # icon, the words, and the opened PR all agree.
-        badge_payload: dict[str, Any] = {"items": _badge_items(repos, chips_on)}
-        status_payload = _status_column(repos, chips_on, show_text=show_column)
+        badge_payload: dict[str, Any] = {"items": _badge_items(repos, chips_on, dense=dense_glyphs)}
+        status_payload = _status_column(repos, chips_on, show_text=show_column and not dense_glyphs)
         primary_href = _status_href(repos, chips_on)
         if primary_href:
             badge_payload["href"] = primary_href

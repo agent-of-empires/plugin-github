@@ -71,6 +71,11 @@ STATUS_TEXT_SETTING_KEY = "show_status_text"
 # those slots: snoozing is the user asking the worker to stop spending GitHub
 # quota on that session.
 INCLUDE_SNOOZED_SETTING_KEY = "include_snoozed_sessions"
+# Dense session-row representation: one-character marks on each badge chip and no
+# row-column words -- the shape the Linear plugin's row badge ships. Off by default
+# so the payload stays what main shipped; the payload is shared, so with it on the
+# web chip shows the mark beside its icon. Resolved in run().
+DENSE_GLYPHS_SETTING_KEY = "dense_row_badge_glyphs"
 IGNORE_SUBMODULES_SETTING_KEY = "ignore_submodules"
 # Toggle for the CI rollup semantics. Defaults off so existing row attention
 # keeps treating every failing check as actionable unless the user opts in.
@@ -233,6 +238,9 @@ class Runtime:
         # list_sessions() call, off until then so a parked session is not
         # refreshed before the user opted in.
         self._include_snoozed = False
+        # Whether the row is the dense form (one-char marks, no words); resolved in
+        # run(), off until then so the default payload matches main.
+        self._dense_glyphs = False
         self._ignore_submodules = True
         self._required_checks_only = False
         self._approved_overrides_stale_block = False
@@ -393,6 +401,7 @@ class Runtime:
             snapshot,
             chips_on=self._chip_flags,
             show_column=self._show_status_text,
+            dense_glyphs=self._dense_glyphs,
             selected=self._selected_pr,
         ):
             sid = params.get("session_id")
@@ -571,6 +580,13 @@ class Runtime:
         deadline (the fast session tick) is not stalled by the default."""
         return self._setting_bool(INCLUDE_SNOOZED_SETTING_KEY, default=self._include_snoozed, timeout=timeout)
 
+    def resolve_dense_glyphs(self) -> bool:
+        """Whether the session row uses the dense form (``dense_row_badge_glyphs``):
+        one-character marks on each badge chip and no row-column words. Off by
+        default so the shipped payload is unchanged; the payload is shared, so with
+        it on the web chip shows the same mark beside its icon."""
+        return self._setting_bool(DENSE_GLYPHS_SETTING_KEY, default=False)
+
     def resolve_ignore_submodules(self) -> bool:
         return self._setting_bool(IGNORE_SUBMODULES_SETTING_KEY, default=self._ignore_submodules)
 
@@ -642,6 +658,7 @@ class Runtime:
         # row reflects the user's choices, not the all-on default.
         self._chip_flags = self.resolve_chip_flags()
         self._show_status_text = self._setting_bool(STATUS_TEXT_SETTING_KEY, default=True)
+        self._dense_glyphs = self.resolve_dense_glyphs()
         self._ignore_submodules = self.resolve_ignore_submodules()
         self._required_checks_only = self.resolve_required_checks_only()
         # Paint last-known data instantly from the persisted snapshot, then run
