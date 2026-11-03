@@ -362,7 +362,9 @@ class Runtime:
         host-side ``exclude`` fixes)."""
         # Re-read the opt-in on every call: the host writes settings without
         # restarting the worker, so a value cached at startup would never flip.
-        self._include_snoozed = self.resolve_include_snoozed()
+        # Its read shares this call's timeout, so the fast tick's short deadline
+        # bounds both RPCs rather than the setting read stalling the tick alone.
+        self._include_snoozed = self.resolve_include_snoozed(timeout)
         exclude = ["archived", "trashed"] if self._include_snoozed else ["archived", "snoozed", "trashed"]
         result = self.call_host(SESSIONS_LIST, {"exclude": exclude}, timeout=timeout)
         sessions = result.get("sessions") if isinstance(result, dict) else None
@@ -559,11 +561,15 @@ class Runtime:
             category for key, category in CHIP_SETTING_KEYS.items() if self._setting_bool(key, default=True)
         )
 
-    def resolve_include_snoozed(self) -> bool:
+    def resolve_include_snoozed(self, timeout: float = HOST_RPC_TIMEOUT) -> bool:
         """Whether snoozed sessions keep being polled (``include_snoozed_sessions``).
-        Off by default: a snoozed row is parked, so polling it spends the user's
-        GitHub quota on state they set aside."""
-        return self._setting_bool(INCLUDE_SNOOZED_SETTING_KEY, default=False)
+        Off on the first answer: a snoozed row is parked, so polling it spends the
+        user's GitHub quota on state they set aside. A failed read keeps the last
+        value instead, because dropping the snoozed ids changes the session
+        topology: the fast tick then runs a full refresh whose prune removes the
+        parked rows' slots. ``timeout`` bounds the read so a caller on a short
+        deadline (the fast session tick) is not stalled by the default."""
+        return self._setting_bool(INCLUDE_SNOOZED_SETTING_KEY, default=self._include_snoozed, timeout=timeout)
 
     def resolve_ignore_submodules(self) -> bool:
         return self._setting_bool(IGNORE_SUBMODULES_SETTING_KEY, default=self._ignore_submodules)
@@ -589,10 +595,10 @@ class Runtime:
             return graphql.parse_ignored_commenters(result["value"])
         return self._ignored_commenters
 
-    def _setting_bool(self, key: str, *, default: bool) -> bool:
+    def _setting_bool(self, key: str, *, default: bool, timeout: float = HOST_RPC_TIMEOUT) -> bool:
         if self.stopped:
             return default
-        result = self.call_host(CONFIG_GET, {"key": key})
+        result = self.call_host(CONFIG_GET, {"key": key}, timeout=timeout)
         if isinstance(result, dict) and isinstance(result.get("value"), bool):
             return bool(result["value"])
         return default

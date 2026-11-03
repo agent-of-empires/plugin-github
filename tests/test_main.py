@@ -261,6 +261,45 @@ def test_include_snoozed_is_re_resolved_on_every_list_sessions():
     assert [s["id"] for s in rt.list_sessions()] == ["active", "snoozed"]
 
 
+def test_failed_config_get_keeps_snoozed_sessions_when_opted_in():
+    # A transient host failure must not read as "the user turned the opt-in off":
+    # dropping the snoozed ids changes the session topology, so the fast tick would
+    # run a full refresh and prune the parked rows' slots only to repaint them next
+    # tick. The last value wins, and the host is still asked to keep them.
+    replies = {"value": True}
+    excluded: list = []
+
+    def fake_call_host(method, params, **_kw):
+        if method == main.CONFIG_GET:
+            return replies
+        excluded.append(set(params["exclude"]))
+        return _flagged_sessions_reply()
+
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = fake_call_host
+    assert [s["id"] for s in rt.list_sessions()] == ["active", "snoozed"]
+    replies.clear()  # failed/malformed config.get from here on
+    assert [s["id"] for s in rt.list_sessions()] == ["active", "snoozed"]
+    assert "snoozed" not in excluded[-1]
+
+
+def test_list_sessions_passes_its_timeout_to_the_setting_read():
+    # The fast tick's 0.5s deadline must cover the per-call config.get too, or a
+    # wedged host stalls the tick for the 10s default and then for the list call.
+    timeouts = []
+
+    def fake_call_host(method, params, timeout=None):
+        if method == main.CONFIG_GET:
+            timeouts.append(timeout)
+            return {"value": True}
+        return {"sessions": [{"id": "s1", "project_path": "/a"}]}
+
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = fake_call_host
+    rt.list_sessions(main.SESSION_LIST_TIMEOUT)
+    assert timeouts == [main.SESSION_LIST_TIMEOUT]
+
+
 def _requested_exclude(include_snoozed):
     """The `exclude` list the worker sends the host for one list_sessions call."""
     captured = {}
