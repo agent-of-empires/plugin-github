@@ -4,20 +4,27 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
-## Unreleased
+## [2.4.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.4.0) - 2026-11-03
 
-### Features
 
-- **pane:** Show GitHub-native pull request stacks, layer navigation, and readiness through the selected PR.
-- **ui:** Opt-in `dense_row_badge_glyphs` setting (default off) draws each session-row PR chip as a one-character state mark with no status words.
 
 ### Bug Fixes
 
-- **refresh:** Cool down failed cold stack lookups, isolate stack retry cooldowns from primary REST backoff, evict departed members, mark fallback data stale, and exclude stack-only PRs from session status.
-- **pane:** Keep advisory stack states out of hard readiness blocks and omit footer verdicts for stack-only PRs.
-- **graphql:** Opt-in `ignore_bot_approval_recommendations` setting (default off) to exclude bot approval recommendations from commented state.
+- **refresh:** Read live branch from worktree_path for multi-repo sessions in [#128](https://github.com/agent-of-empires/plugin-github/pull/128) by [@Seluj78](https://github.com/Seluj78) ([`1719eaa`](https://github.com/agent-of-empires/plugin-github/commit/1719eaa1c54070a6cc5e89d5c4da08e20e661229))
+- **review:** Show approved only when no other approval is outstanding in [#124](https://github.com/agent-of-empires/plugin-github/pull/124) by [@Seluj78](https://github.com/Seluj78) ([`f366781`](https://github.com/agent-of-empires/plugin-github/commit/f366781e4fb9fb9f325471703ac10511169391f1))
 
+
+### Features
+
+- **stacks:** Show native PR stack status and navigation in [#109](https://github.com/agent-of-empires/plugin-github/pull/109) by [@athal7](https://github.com/athal7) ([`8ea9c85`](https://github.com/agent-of-empires/plugin-github/commit/8ea9c85277fcc8164de4af384404756f8ed6d8e0))
+- **graphql:** Opt-in settings to ignore bot approval recommendations in [#131](https://github.com/agent-of-empires/plugin-github/pull/131) by [@athal7](https://github.com/athal7) ([`624512d`](https://github.com/agent-of-empires/plugin-github/commit/624512d5138f4236f2a138a92d72923a2e31a550))
+- **uistate:** Add opt-in one-character marks to row-badge chips in [#142](https://github.com/agent-of-empires/plugin-github/pull/142) by [@athal7](https://github.com/athal7) ([`93142f6`](https://github.com/agent-of-empires/plugin-github/commit/93142f697c56979380ed08e2e3bbe689de56e552))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.3.0...v2.4.0
 ## [2.3.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.3.0) - 2026-10-21
+
+
 
 ### Features
 
@@ -26,6 +33,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **refresh:** Support multi-repository sessions in [#115](https://github.com/agent-of-empires/plugin-github/pull/115) by [@athal7](https://github.com/athal7) ([`0874785`](https://github.com/agent-of-empires/plugin-github/commit/08747853a09e9a381c0b7ffdb398200ba6997f58))
 - Add GitHub merge queue support in [#101](https://github.com/agent-of-empires/plugin-github/pull/101) by [@athal7](https://github.com/athal7) ([`75e6a01`](https://github.com/agent-of-empires/plugin-github/commit/75e6a01239e7556bbd4f0bdae7d92dc807339d09))
 - Add merge queue filter facet in [#120](https://github.com/agent-of-empires/plugin-github/pull/120) by [@Seluj78](https://github.com/Seluj78) ([`15521a0`](https://github.com/agent-of-empires/plugin-github/commit/15521a072dbe17f2771aac23cfe914b00fbc6a97))
+
 
 **Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.2.1...v2.3.0
 ## [2.2.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.1) - 2026-10-16
@@ -259,3 +267,6 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - Multi-session multi-repo GitHub UI refresh (+ manifest/worker fixes) in [#6](https://github.com/agent-of-empires/plugin-github/pull/6) by [@Seluj78](https://github.com/Seluj78) ([`352a981`](https://github.com/agent-of-empires/plugin-github/commit/352a981eca8473059dbc4f171f2570d70b28b07d))
 - Dockable pane slot, fresh-on-session-change, and a Refresh button in [#7](https://github.com/agent-of-empires/plugin-github/pull/7) by [@Seluj78](https://github.com/Seluj78) ([`795c6d3`](https://github.com/agent-of-empires/plugin-github/commit/795c6d367f5e81be0bf32aa3aff63c639cff8e27))
 - **pane:** Rich per-PR state (merged/review/CI/comments) via token-gated GraphQL in [#13](https://github.com/agent-of-empires/plugin-github/pull/13) by [@Seluj78](https://github.com/Seluj78) ([`4b66d82`](https://github.com/agent-of-empires/plugin-github/commit/4b66d8212709a4dca18185f35e78db490ea5fc04))
+
+
+
