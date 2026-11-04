@@ -3,6 +3,7 @@
 import os
 import json
 import time
+import unicodedata
 
 import pytest
 
@@ -635,8 +636,8 @@ def test_no_token_note_shown_only_when_a_github_repo_exists():
 # --- attention status in session rows (#36): badge + row-column ---
 
 
-def _badge_items_for(repos, sid="s1"):
-    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(session_id=sid, repos=repos)))
+def _badge_items_for(repos, sid="s1", **kwargs):
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(session_id=sid, repos=repos)), **kwargs)
     return _badge(params, sid)["payload"]["items"]
 
 
@@ -739,9 +740,14 @@ def test_badge_draft_is_chip_only_no_rich_chips():
     checks = {"state": "failing", "runs": []}
     pull = _rich_pull(review="changes-requested", checks=checks)
     pull["draft"] = True
-    items = _badge_items_for([_repo(pulls=[pull])])
+    items = _badge_items_for([_repo(pulls=[pull])], dense_glyphs=True)
     assert [i["icon"] for i in items] == ["git-pull-request-draft"]
     assert items[0]["tone"] == "warn"
+    assert items[0]["text"] == "◌"
+    # Default (dense off): the draft chip carries no mark, exactly as main ships it.
+    default = _badge_items_for([_repo(pulls=[pull])])
+    assert [i["icon"] for i in default] == ["git-pull-request-draft"]
+    assert "text" not in default[0]
 
 
 def test_badge_concatenates_chips_across_repos():
@@ -755,13 +761,82 @@ def test_badge_concatenates_chips_across_repos():
     assert icons == ["git-pull-request-arrow", "badge-check", "git-pull-request-arrow", "badge-check", "circle-x"]
 
 
-def test_badge_chip_tooltips_name_repo_and_state():
+def test_badge_chips_use_single_character_marks():
+    # One mark per chip, colored by tone, and only with dense_row_badge_glyphs on:
+    # the terminal row paints `text` where it paints no icons, and the web chip
+    # paints the mark beside its `icon` (the shape the Linear plugin's row badge
+    # ships). No PR number and no words in the row; the tooltip keeps the full line.
     checks = {"state": "failing", "runs": []}
-    items = _badge_items_for([_repo(name="a", pulls=[_rich_pull(review="changes-requested", checks=checks)])])
-    tips = [i["tooltip"] for i in items]
-    assert tips[0].startswith("a: PR #5")
-    assert "changes requested" in tips[1]
-    assert "CI failing" in tips[2]
+    comments = {"unresolved": 2, "items": [{"author": "a", "body": "x", "resolved": False}]}
+    items = _badge_items_for(
+        [_repo(name="a", pulls=[_rich_pull(review="changes-requested", checks=checks, comments=comments)])],
+        dense_glyphs=True,
+    )
+    assert [i["text"] for i in items] == ["⇄", "✗", "✘", "✉"]
+    assert all(len(i["text"]) == 1 for i in items)
+    assert all(not i["text"].isdigit() for i in items)
+    assert items[0]["tooltip"] == "a: PR #5 T"
+    assert "changes requested" in items[1]["tooltip"]
+    assert "CI failing" in items[2]["tooltip"]
+
+
+def test_badge_dense_marks_cover_queue_conflict_and_error():
+    # Queue, conflict and repo-error chips each carry their own mark in dense mode;
+    # the error chip is the only one on a failed repo.
+    queue = {"state": "queued", "position": 2}
+    conflicted = _rich_pull(review="approved")
+    conflicted["merge_state"] = "conflicts"
+    conflicted["merge_queue"] = queue
+    marks = [i["text"] for i in _badge_items_for([_repo(pulls=[conflicted])], dense_glyphs=True)]
+    assert marks[:3] == ["⇄", "⇉", "⊘"]
+    assert [i["text"] for i in _badge_items_for([_repo(error={"hint": "boom"})], dense_glyphs=True)] == ["!"]
+
+
+def test_dense_row_column_drops_words_but_keeps_sort_and_filters():
+    # Dense mode clears the row-column words; the sort scalar and the facet values
+    # survive so the sidebar can still sort and filter a row with no text.
+    checks = {"state": "failing", "runs": []}
+    repos = [_repo(pulls=[_rich_pull(review="changes-requested", checks=checks)])]
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos)), dense_glyphs=True)
+    cell = _column(params, "s1")["payload"]
+    assert cell["text"] == ""
+    assert cell["sort_value"] == uistate._ATTENTION_VISUAL["changes-requested"][0]
+    assert cell["filter_values"] == ["ci:failing", "pr:open", "review:changes-requested"]
+
+
+def test_badge_payload_is_web_identical_by_default():
+    # The dense marks are opt-in, so by default a chip is exactly what main ships:
+    # icon, tone, tooltip and href, no text.
+    items = _badge_items_for([_repo(name="a", pulls=[_rich_pull(review="approved")])])
+    assert items
+    for item in items:
+        assert set(item) <= {"icon", "tone", "href", "tooltip"}
+        assert "text" not in item
+
+
+def test_glyph_tables_cover_every_visual_state():
+    # A state with no glyph would fall back to a mark; the tables are pinned to the
+    # visual ones so a new review/CI state cannot silently lose its mark.
+    assert set(uistate._REVIEW_GLYPH) == set(uistate._REVIEW_VISUAL)
+    assert set(uistate._CHECK_GLYPH) == set(uistate._CHECK_VISUAL)
+    marks = (
+        uistate._PR_GLYPH,
+        uistate._DRAFT_GLYPH,
+        uistate._QUEUE_GLYPH,
+        uistate._CONFLICT_GLYPH,
+        uistate._COMMENT_GLYPH,
+        uistate._ERROR_GLYPH,
+        *uistate._REVIEW_GLYPH.values(),
+        *uistate._CHECK_GLYPH.values(),
+    )
+    # No two chips share a mark: the row paints text plus tone only, so with a chip
+    # category toggled off a lone mark has to name its own state.
+    assert len(set(marks)) == len(marks)
+    # Each is one narrow cell, so a mark cannot turn a row into words or break the
+    # alignment in a double-width locale (Ambiguous width renders two cells there).
+    for mark in marks:
+        assert len(mark) == 1
+        assert unicodedata.east_asian_width(mark) in {"N", "Na", "H"}, mark
 
 
 # --- chip-visibility settings (#36 follow-up): per-category toggles ---

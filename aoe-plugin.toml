@@ -11,7 +11,7 @@
 
 id = "agent-of-empires.github"
 name = "GitHub"
-version = "2.3.0"
+version = "2.4.0"
 # Manifest schema / host API version. api_version 5 added the [[screenshots]]
 # list (declared below); 6 lets a command declare a client-executed `action`
 # (the `open_pr` command below uses `open-ui-link`); 7 adds the `icon` /
@@ -201,6 +201,18 @@ label = "Show PR status summary text in session row"
 description = "Show the words summary at the end of each session row (e.g. \"CI failing\", \"approved\"). Turn off to keep only the PR status icons. The GitHub pane is unaffected."
 type = "boolean"
 default = true
+
+# Dense row, off by default so the shipped payload is unchanged: each badge chip
+# carries a one-character state mark and the row-column drops its words, so a
+# session row is marks plus a sort scalar (the shape the Linear plugin's row badge
+# ships). The row-badge payload is shared with the web row, so with this on the web
+# chip shows the mark beside its icon.
+[[settings]]
+key = "dense_row_badge_glyphs"
+label = "Dense GitHub row badges"
+description = "Draw each session-row PR chip as a single-character state mark with no status words, instead of the terminal falling back to the PR title. The payload is shared, so the web row shows the mark next to its icon."
+type = "boolean"
+default = false
 
 [[settings]]
 key = "ignore_submodules"
