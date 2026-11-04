@@ -373,11 +373,11 @@ def test_unavailable_upstream_does_not_hide_existing_origin_pull(tmp_path):
     assert [p["number"] for p in repo["pulls"]] == [1]
 
 
-def test_truncated_page_serves_rest_without_cooldown_on_busy_branch(tmp_path):
+def test_busy_branch_owned_pr_off_page_is_fetched_without_discovery(tmp_path):
     # A popular branch (e.g. same-repo main) with more foreign same-name PRs
-    # than one page can prove an absence; the owner-scoped REST probe is the
-    # trusted source, and a collision must not arm the per-key cooldown or
-    # re-query in a loop.
+    # than one page can hold. The owner-scoped REST probe names the owned PR the
+    # page omitted, so it is fetched by number: no discovery, no cooldown, and
+    # the rich page is cached instead of discarded.
     path = _checkout(tmp_path / "repo", "team/r")
     team_pull = _node("team/r", "team/r", 2)
     foreign = [_node("team/r", f"stranger{i}/r", i + 10) for i in range(105)]
@@ -423,20 +423,17 @@ def test_truncated_page_serves_rest_without_cooldown_on_busy_branch(tmp_path):
     # with a hand-set flag.
     assert len(served_pages) == 1
     assert len(served_pages[0]) == 100
-    # The owned PR survives through the owner-scoped REST fallback, not an empty
-    # rich page, and only one GraphQL query is spent.
+    # The owned PR the page omitted arrives by number, and only one branch-page
+    # query is spent.
     assert [p["number"] for p in repo["pulls"]] == [2]
     assert len(graphql_queries) == 1
-    assert refresh._graphql_cache == {}  # nothing cached as a confirmed result
-    assert refresh._retry_cooldown == {}  # a collision is not a failure
-    # The truncation is remembered so the next tick cannot re-spend a full query
-    # that is certain to truncate identically.
-    assert refresh._truncated_until != {}
-
-    # The premise of this test: discovery really was exhausted by foreign
-    # same-name PRs, so completeness was unprovable rather than merely slow.
-    assert len(discovery_queries) == lookup.MAX_PULL_PAGES
-    assert all(q.get("cursor") for q in discovery_queries[1:])
+    assert refresh._graphql_cache != {}  # the rich page is kept, not discarded
+    assert refresh._retry_cooldown == {}
+    assert refresh._truncated_until == {}
+    # Discovery would exhaust its page bound on the foreign same-name PRs,
+    # which is exactly what the fresh probe makes unnecessary: the only
+    # lookups here are by-number detail fetches.
+    assert [q for q in discovery_queries if "number" not in q] == []
     assert len(foreign) > lookup.MAX_PULL_PAGES * lookup.DISCOVER_PAGE_SIZE
 
     # Second tick: no new GraphQL query, and the same owned PR is still shown.
@@ -552,12 +549,14 @@ def test_truncated_key_reports_probe_freshness_not_fresh(tmp_path):
         return api(request)
 
     transport = httpx.MockTransport(handler)
-    refresh.build_snapshot([{"id": "s", "project_path": str(path)}], env=_Env(token=True), transport=transport)
-    assert refresh._truncated_until != {}
+    repo = refresh.build_snapshot([{"id": "s", "project_path": str(path)}], env=_Env(token=True), transport=transport)[
+        "sessions"
+    ][0]["repos"][0]
+    # The covered page is served rich and nothing truncates here; the marker
+    # branch below is seeded directly.
+    assert [p["number"] for p in repo["pulls"]] == [2]
+    assert refresh._truncated_until == {}
 
-    # A probe that fails (error or rate limit) takes the fail-soft branch and
-    # never consults the marker, so the marker branch is driven directly with a
-    # probe that changed nothing and is NOT fresh (a backoff-served 304).
     # A probe that fails (error or rate limit) takes the fail-soft branch and
     # never consults the marker, so the marker branch is driven directly: a
     # changed-nowhere probe whose own list came from the backoff-served cache.
@@ -646,9 +645,14 @@ def test_truncated_window_with_rest_backoff_keeps_freshness_stamp(tmp_path):
     transport = httpx.MockTransport(handler)
     first = refresh.build_snapshot([{"id": "s", "project_path": str(path)}], env=_Env(token=True), transport=transport)
     stamp = first["sessions"][0]["freshness"]["refreshed_at"]
-    assert refresh._truncated_until != {}
     assert len(queries) == 1
+    assert refresh._truncated_until == {}  # the covered page is accepted as rich
 
+    # A page certain to truncate again (a discovery that hit its page bound)
+    # holds the full query for the long window; a tick served from the REST
+    # backoff cache must not spend or revalidate anything during it.
+    key = lookup.pull_keys([("team", "r")], "feature")[0]
+    refresh._truncated_until[refresh._rich_cache_key(key, flags=refresh.DEFAULT_NORMALIZE_FLAGS)] = float("inf")
     refresh._backoff["rest"]["until"] = float("inf")
     second = refresh.build_snapshot([{"id": "s", "project_path": str(path)}], env=_Env(token=True), transport=transport)
     repo = second["sessions"][0]["repos"][0]
