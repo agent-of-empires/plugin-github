@@ -85,6 +85,14 @@ def _latest(state, oid, login="jules"):
     return {"state": state, "author": {"login": login}, "commit": {"oid": oid}}
 
 
+def _approval_recommendation():
+    return {
+        "state": "COMMENTED",
+        "body": "Recommendation: Approve",
+        "author": {"login": "reviewbot", "__typename": "Bot"},
+    }
+
+
 def test_review_state_changes_pushed_only_when_every_blocking_review_is_stale():
     def pr(*latest):
         out = _pr(decision="CHANGES_REQUESTED")
@@ -138,6 +146,98 @@ def test_review_state_infers_commented_from_review_or_thread():
     assert graphql.review_state(_pr(threads=[_thread(resolved=False)])) == "commented"
     # Resolved-only thread, no comment review, no decision -> waiting.
     assert graphql.review_state(_pr(threads=[_thread(resolved=True)])) == "waiting"
+
+
+def test_bot_approval_recommendation_is_opt_in():
+    bot_recommendation = _approval_recommendation()
+    pr = _pr(reviews=[bot_recommendation])
+    pr["latestReviews"] = {"nodes": [bot_recommendation]}
+    # Default (off): the recommendation counts like any other comment.
+    assert graphql.review_state(pr) == "commented"
+    assert graphql.commenters(pr) == ["reviewbot"]
+    assert graphql.reviewers(pr) == [{"name": "reviewbot", "state": "commented"}]
+    pulled = graphql.normalize_connection(_conn(pr))[0]
+    assert pulled["review_state"] == "commented"
+    assert pulled["commenters"] == ["reviewbot"]
+    assert pulled["reviewers"] == [{"name": "reviewbot", "state": "commented"}]
+
+    # Opting in excludes the bot approval recommendation from all three outputs.
+    assert graphql.review_state(pr, ignore_bot_approval_recommendations=True) == "waiting"
+    assert graphql.commenters(pr, ignore_bot_approval_recommendations=True) == []
+    assert graphql.reviewers(pr, ignore_bot_approval_recommendations=True) == []
+    opted = graphql.normalize_connection(_conn(pr), ignore_bot_approval_recommendations=True)[0]
+    assert opted["review_state"] == "waiting"
+    assert opted["commenters"] == []
+    assert opted["reviewers"] == []
+
+    bot_comment = {**bot_recommendation, "body": "Please update this section."}
+    bot = _pr(reviews=[bot_comment])
+    bot["latestReviews"] = {"nodes": [bot_comment]}
+    assert graphql.review_state(bot, ignore_bot_approval_recommendations=True) == "commented"
+    assert graphql.commenters(bot, ignore_bot_approval_recommendations=True) == ["reviewbot"]
+    assert graphql.reviewers(bot, ignore_bot_approval_recommendations=True) == [
+        {"name": "reviewbot", "state": "commented"}
+    ]
+
+    human_recommendation = {
+        **bot_recommendation,
+        "author": {"login": "reviewer", "__typename": "User"},
+    }
+    human = _pr(reviews=[human_recommendation])
+    human["latestReviews"] = {"nodes": [human_recommendation]}
+    assert graphql.review_state(human, ignore_bot_approval_recommendations=True) == "commented"
+    assert graphql.commenters(human, ignore_bot_approval_recommendations=True) == ["reviewer"]
+    assert graphql.reviewers(human, ignore_bot_approval_recommendations=True) == [
+        {"name": "reviewer", "state": "commented"}
+    ]
+
+    threaded = _pr(reviews=[bot_recommendation], threads=[_thread(resolved=False, author="reviewbot")])
+    threaded["latestReviews"] = {"nodes": [bot_recommendation]}
+    assert graphql.review_state(threaded, ignore_bot_approval_recommendations=True) == "commented"
+    assert graphql.commenters(threaded, ignore_bot_approval_recommendations=True) == ["reviewbot"]
+    # An unresolved thread is genuine feedback, so the bot stays a reviewer.
+    assert graphql.reviewers(threaded, ignore_bot_approval_recommendations=True) == [
+        {"name": "reviewbot", "state": "commented"}
+    ]
+
+    # An earlier genuine COMMENTED review also keeps the bot a reviewer even
+    # though its latest review is the excluded recommendation.
+    prior_comment = {**bot_recommendation, "body": "Please update this section."}
+    both = _pr(reviews=[prior_comment, bot_recommendation])
+    both["latestReviews"] = {"nodes": [bot_recommendation]}
+    assert graphql.review_state(both, ignore_bot_approval_recommendations=True) == "commented"
+    assert graphql.commenters(both, ignore_bot_approval_recommendations=True) == ["reviewbot"]
+    assert graphql.reviewers(both, ignore_bot_approval_recommendations=True) == [
+        {"name": "reviewbot", "state": "commented"}
+    ]
+
+    formal_approval = {**bot_recommendation, "state": "APPROVED"}
+    approved = _pr(decision="APPROVED")
+    approved["latestReviews"] = {"nodes": [formal_approval]}
+    assert graphql.review_state(approved, ignore_bot_approval_recommendations=True) == "approved"
+    assert graphql.reviewers(approved, ignore_bot_approval_recommendations=True) == [
+        {"name": "reviewbot", "state": "approved"}
+    ]
+
+
+def test_standing_block_outranks_retained_bot_comment():
+    # A standing CHANGES_REQUESTED outranks a retained comment: a bot that
+    # blocked, then commented, then recommended approval must still show the
+    # block in reviewers (a comment does not dismiss the earlier block).
+    rec = _approval_recommendation()
+    prior_comment = {**rec, "body": "Please update this section."}
+    blocked = _pr(decision="CHANGES_REQUESTED")
+    blocked["reviews"] = {"nodes": [prior_comment, rec]}
+    blocked["latestReviews"] = {"nodes": [rec]}
+    blocked["decidedReviews"] = {"nodes": [_latest("CHANGES_REQUESTED", "head", "reviewbot")]}
+    blocked["headRefOid"] = "head"
+    assert graphql.review_state(blocked, ignore_bot_approval_recommendations=True) == "changes-requested"
+    assert graphql.reviewers(blocked, ignore_bot_approval_recommendations=True) == [
+        {"name": "reviewbot", "state": "changes-requested"}
+    ]
+    pulled = graphql.normalize_connection(_conn(blocked), ignore_bot_approval_recommendations=True)[0]
+    assert pulled["review_summary"] == "changes requested"
+    assert pulled["review_state"] == "changes-requested"
 
 
 def test_ignored_commenters_only_downgrade_bot_only_commented():
@@ -416,6 +516,29 @@ def test_normalize_pull_with_no_commit_or_threads_does_not_raise():
     assert out["comments"] == {"unresolved": 0, "items": []}
 
 
+def test_normalize_pull_exposes_merge_queue_and_degrades_without_entry():
+    queued = _pr(decision="APPROVED")
+    queued["mergeQueueEntry"] = {"position": 2, "state": "AWAITING_CHECKS"}
+    queued["mergeQueue"] = {"url": "https://github.com/o/r/queue/main"}
+    without_queue = _pr()
+    without_queue["mergeQueueEntry"] = None
+    assert graphql.normalize_connection(_conn(queued))[0]["merge_queue"] == {
+        "position": 2,
+        "state": "awaiting-checks",
+        "url": "https://github.com/o/r/queue/main",
+    }
+    assert graphql.normalize_connection(_conn(without_queue))[0]["merge_queue"] is None
+
+
+def test_merge_queue_position_rejects_invalid_values():
+    queued = _pr()
+    queued["mergeQueueEntry"] = {"position": True, "state": None}
+    assert graphql.normalize_connection(_conn(queued))[0]["merge_queue"] == {
+        "position": None,
+        "state": "unknown",
+    }
+
+
 def test_build_query_aliases_each_branch_with_variables():
     q = graphql.build_query(3)
     # One typed variable + one aliased field per branch, sharing the fragment.
@@ -426,6 +549,8 @@ def test_build_query_aliases_each_branch_with_variables():
     assert "fragment PRConnection on PullRequestConnection" in q
     assert "reviewThreads(first: 100)" in q
     assert "pageInfo { hasNextPage endCursor }" in q
+    assert "mergeQueueEntry { position state }" in q
+    assert "mergeQueue { url }" in q
 
 
 def test_build_query_single_alias_is_just_one_branch():
@@ -452,6 +577,7 @@ def test_build_digest_query_aliases_and_omits_rich_connections():
     assert "contexts" not in q
     assert "comments" not in q
     assert "PRConnection" not in q
+    assert "mergeQueueEntry" in q
 
 
 def test_digest_signature_equal_for_digest_and_full_shapes():
@@ -471,6 +597,9 @@ def test_digest_signature_equal_for_digest_and_full_shapes():
         "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
         "reviewThreads": {"totalCount": 2},
     }
+    full_node["mergeQueueEntry"] = {"position": 2, "state": "QUEUED"}
+    full_node["mergeQueue"] = {"url": "https://github.com/org/repo/queues/1"}
+    digest_node["mergeQueueEntry"] = {"position": 2, "state": "QUEUED"}
     sig_full = graphql.digest_signature(_conn(full_node))
     sig_digest = graphql.digest_signature(_conn(digest_node))
     assert sig_full is not None
@@ -499,6 +628,7 @@ def test_digest_signature_changes_on_each_watched_field():
         ("headRefOid", "def"),
         ("reviewThreads", {"totalCount": 3}),
         ("mergeable", "CONFLICTING"),
+        ("mergeQueueEntry", {"position": 2, "state": "QUEUED"}),
     ]:
         node = dict(base)
         node[field] = value
@@ -730,13 +860,66 @@ def test_check_runs_carry_duration_workflow_group_and_a_skipped_flag():
     assert "skipped" not in runs["Clippy"]
 
 
-def test_approve_over_stale_block_upgrades_only_when_someone_approved():
+def test_approve_over_stale_block_upgrades_only_when_someone_approved_the_head():
     people = [{"name": "a", "state": "approved"}, {"name": "b", "state": "changes-pushed"}]
-    pull = {"review_state": "changes-pushed", "reviewers": people}
+    pull = {"review_state": "changes-pushed", "reviewers": people, "head_approved": True, "review_requested": False}
     assert graphql.approve_over_stale_block(pull)["review_state"] == "approved"
     assert pull["review_state"] == "changes-pushed"
+    # Someone is still requested (e.g. a code-owner group): not fully approved.
+    waiting = {**pull, "reviewers": [*people, {"name": "acp", "state": "pending"}], "review_requested": True}
+    assert graphql.approve_over_stale_block(waiting)["review_state"] == "partially-approved"
+    # The stale reviewer themselves was re-requested: no separate pending entry, still requested.
+    rerequested = {**pull, "review_requested": True}
+    assert graphql.approve_over_stale_block(rerequested)["review_state"] == "partially-approved"
+    # No approval on the current head, or no approval at all.
+    assert graphql.approve_over_stale_block({**pull, "head_approved": False})["review_state"] == "changes-pushed"
     lone = {"review_state": "changes-pushed", "reviewers": people[1:]}
     assert graphql.approve_over_stale_block(lone) is lone
-    live = {"review_state": "changes-requested", "reviewers": people}
+    live = {"review_state": "changes-requested", "reviewers": people, "head_approved": True}
     assert graphql.approve_over_stale_block(live) is live
     assert graphql.approve_over_stale_block({"review_state": "changes-pushed"})["review_state"] == "changes-pushed"
+
+
+def test_review_state_approved_needs_nobody_else_outstanding():
+    def pr(**extra):
+        out = _pr(decision="APPROVED")
+        out.update(extra)
+        return out
+
+    green = {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS", "contexts": {"nodes": []}}}}]}
+    assert graphql.review_state(pr()) == "approved"
+    # A requested reviewer or team (code-owner group) is still outstanding.
+    requested = {"nodes": [{"requestedReviewer": {"__typename": "Team", "name": "acp"}}]}
+    assert graphql.review_state(pr(reviewRequests=requested)) == "partially-approved"
+    # Blocked with green CI can only be a missing review; blocked with no green CI says nothing.
+    assert graphql.review_state(pr(mergeStateStatus="BLOCKED", commits=green)) == "partially-approved"
+    assert graphql.review_state(pr(mergeStateStatus="BLOCKED")) == "approved"
+    assert graphql.review_state(pr(mergeStateStatus="BLOCKED", commits=green, isDraft=True)) == "approved"
+    assert graphql.review_state(pr(mergeStateStatus="CLEAN", commits=green)) == "approved"
+    # A failed run re-run green: the raw rollup stays FAILURE but the checks read green.
+    rerun = {
+        "nodes": [
+            {
+                "commit": {
+                    "statusCheckRollup": {
+                        "state": "FAILURE",
+                        "contexts": {
+                            "totalCount": 2,
+                            "nodes": [
+                                _checkrun("Clippy", "COMPLETED", "FAILURE", completed_at="2026-01-01T00:00:00Z"),
+                                _checkrun("Clippy", "COMPLETED", "SUCCESS", completed_at="2026-01-01T00:05:00Z"),
+                            ],
+                        },
+                    }
+                }
+            }
+        ]
+    }
+    assert graphql.review_state(pr(mergeStateStatus="BLOCKED", commits=rerun)) == "partially-approved"
+
+
+def test_head_approved_ignores_approvals_on_older_commits():
+    pr = {"headRefOid": "new", "latestReviews": {"nodes": [_latest("APPROVED", "old")]}}
+    assert graphql.head_approved(pr) is False
+    pr["latestReviews"]["nodes"].append(_latest("APPROVED", "new", "nate"))
+    assert graphql.head_approved(pr) is True

@@ -152,6 +152,29 @@ def test_resolve_chip_flags_respects_disabled_setting():
     assert rt.resolve_chip_flags() == frozenset({"review", "comments"})
 
 
+def test_resolve_dense_glyphs_defaults_off():
+    # The dense row is opt-in: an unset or unsupported setting keeps main's payload
+    # (icons plus tooltips, no marks, status words shown).
+    rt = main.Runtime(send=lambda _m: None)
+    rt.call_host = lambda *_a, **_kw: None
+    assert rt.resolve_dense_glyphs() is False
+
+
+def test_dense_glyphs_setting_reaches_the_ui_mapper(monkeypatch):
+    seen = []
+
+    def spy_snapshot_params(_snapshot, **kwargs):
+        seen.append(kwargs["dense_glyphs"])
+        return []
+
+    monkeypatch.setattr(main.uistate, "snapshot_ui_state_params", spy_snapshot_params)
+    rt = main.Runtime(send=lambda _m: None)
+    rt._push_snapshot({"sessions": []})
+    rt._dense_glyphs = True
+    rt._push_snapshot({"sessions": []})
+    assert seen == [False, True]
+
+
 def test_required_checks_setting_reaches_refresh(monkeypatch):
     seen = []
 
@@ -162,6 +185,21 @@ def test_required_checks_setting_reaches_refresh(monkeypatch):
     monkeypatch.setattr(main.refresh, "build_snapshot", spy_build_snapshot)
     rt = main.Runtime(send=lambda _m: None)
     rt._required_checks_only = True
+    rt.call_host = lambda *_a, **_kw: {"value": True}
+    rt.run_refresh(sessions=[])
+    assert seen == [True]
+
+
+def test_ignore_bot_approval_recommendations_setting_reaches_refresh(monkeypatch):
+    seen = []
+
+    def spy_build_snapshot(sessions, **kwargs):
+        seen.append(kwargs["settings"].ignore_bot_approval_recommendations)
+        return {"sessions": [], "version": 2, "auth": {"github.com": {"present": True}}}
+
+    monkeypatch.setattr(main.refresh, "build_snapshot", spy_build_snapshot)
+    rt = main.Runtime(send=lambda _m: None)
+    # Opt-in: enabling the setting (config returns True) must reach SnapshotSettings.
     rt.call_host = lambda *_a, **_kw: {"value": True}
     rt.run_refresh(sessions=[])
     assert seen == [True]
@@ -583,6 +621,51 @@ def test_runtime_reuses_trust_until_manual_refresh(monkeypatch):
     assert sent[-1]["result"]["host"] == "b.corp"
 
 
+def test_stack_navigation_repoints_pane_without_host_checkout_rpc():
+    stack = [
+        {
+            "number": 1,
+            "title": "Base",
+            "url": "https://github.com/o/r/pull/1",
+            "state": "open",
+            "mergeable_state": "clean",
+        },
+        {
+            "number": 2,
+            "title": "Top",
+            "url": "https://github.com/o/r/pull/2",
+            "state": "open",
+            "mergeable_state": "clean",
+        },
+    ]
+    pulls = [
+        {"number": member["number"], "url": member["url"], "title": member["title"], "state": "open", "stack": stack}
+        for member in stack
+    ]
+    snapshot = {
+        "sessions": [{"session_id": "s1", "repos": [{"repo": "o/r", "name": "r", "pulls": pulls}]}],
+        "version": 2,
+        "auth": {"github.com": {"present": True}},
+    }
+    sent = []
+    rt = main.Runtime(send=sent.append)
+    rt._push_snapshot(snapshot)
+    sent.clear()
+
+    rt.handle_inbound({"method": main.SELECT_PR_METHOD, "params": {"session_id": "s1", "pr": "github.com/o/r#2"}})
+
+    pane = next(
+        message["params"]["payload"]
+        for message in sent
+        if message["method"] == "ui.state.set" and message["params"]["slot"] == "pane"
+    )
+    assert rt._selected_pr == {"s1": "github.com/o/r#2"}
+    assert (
+        next(block["title"] for block in pane["blocks"] if block.get("title", "").startswith("Stack"))
+        == "Stack · PR 2 of 2"
+    )
+
+
 def test_fast_poll_refreshes_changed_workspace_repos_without_new_session(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     source = tmp_path / "source"
@@ -614,3 +697,11 @@ def test_fast_poll_refreshes_changed_workspace_repos_without_new_session(tmp_pat
     rt._next_poll = 0
     rt._service_ticks()
     assert refreshed == [True]
+
+
+def test_session_topology_changes_with_worktree_path():
+    def topology(worktree):
+        repo = {"source_path": "/src/a", "branch": "b", "worktree_path": worktree}
+        return main.Runtime._session_topology([{"id": "s1", "project_path": "/ws", "workspace_repos": [repo]}])
+
+    assert topology("/ws/a") != topology("/ws/other")

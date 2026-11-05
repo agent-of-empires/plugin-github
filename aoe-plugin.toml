@@ -11,7 +11,7 @@
 
 id = "agent-of-empires.github"
 name = "GitHub"
-version = "2.2.1"
+version = "2.4.0"
 # Manifest schema / host API version. api_version 5 added the [[screenshots]]
 # list (declared below); 6 lets a command declare a client-executed `action`
 # (the `open_pr` command below uses `open-ui-link`); 7 adds the `icon` /
@@ -143,7 +143,7 @@ advanced = true
 [[settings]]
 key = "show_review_status"
 label = "Show review status in session row"
-description = "Show the PR review-state chip (approved / changes requested / awaiting review) on each session row. The GitHub pane still shows review state when this is off."
+description = "Show the PR review-state chip (approved / partially approved / changes requested / awaiting review) on each session row. The GitHub pane still shows review state when this is off."
 type = "boolean"
 default = true
 
@@ -182,7 +182,15 @@ advanced = true
 [[settings]]
 key = "approved_overrides_stale_block"
 label = "Approval overrides a stale changes-requested review"
-description = "When a reviewer requested changes on an older commit and someone else approved the current head, show the PR as approved instead of \"pushed since review\". GitHub still blocks the merge until the stale review is re-done or dismissed. Off keeps \"pushed since review\" and notes the approval."
+description = "When a reviewer requested changes on an older commit and someone else approved the current head, show the PR as approved (or \"partially approved\" if another reviewer is still requested) instead of \"pushed since review\". GitHub still blocks the merge until the stale review is re-done or dismissed. Off keeps \"pushed since review\" and notes the approval."
+type = "boolean"
+default = false
+advanced = true
+
+[[settings]]
+key = "ignore_bot_approval_recommendations"
+label = "Ignore bot approval recommendations"
+description = "Off (default): a bot's COMMENTED review whose body literally recommends approval (a \"Recommendation: Approve\" line) counts like any other comment. On: such a review does not make the PR read \"commented\"."
 type = "boolean"
 default = false
 advanced = true
@@ -193,6 +201,18 @@ label = "Show PR status summary text in session row"
 description = "Show the words summary at the end of each session row (e.g. \"CI failing\", \"approved\"). Turn off to keep only the PR status icons. The GitHub pane is unaffected."
 type = "boolean"
 default = true
+
+# Dense row, off by default so the shipped payload is unchanged: each badge chip
+# carries a one-character state mark and the row-column drops its words, so a
+# session row is marks plus a sort scalar (the shape the Linear plugin's row badge
+# ships). The row-badge payload is shared with the web row, so with this on the web
+# chip shows the mark beside its icon.
+[[settings]]
+key = "dense_row_badge_glyphs"
+label = "Dense GitHub row badges"
+description = "Draw each session-row PR chip as a single-character state mark with no status words, instead of the terminal falling back to the PR title. The payload is shared, so the web row shows the mark next to its icon."
+type = "boolean"
+default = false
 
 [[settings]]
 key = "ignore_submodules"
@@ -219,7 +239,7 @@ id = "github_pane"
 
 # A per-session text cell on the session row: one deterministic words summary of
 # the session's most-urgent PR signal (changes requested / CI failing /
-# unresolved comments / awaiting review / healthy), so the list is scannable
+# unresolved comments / partially approved / awaiting review / healthy), so the list is scannable
 # without hovering the badge or opening the pane (#36). The badge carries the
 # per-repo icon; this carries the words. Driven by one push per session; an empty
 # payload clears it.
@@ -254,6 +274,10 @@ id = "github_comments"
 [[ui]]
 slot = "filter-facet"
 id = "github_conflicts"
+
+[[ui]]
+slot = "filter-facet"
+id = "github_queue"
 
 # Tier 1 worker: the executable the host spawns and supervises, speaking
 # ndjson JSON-RPC over stdio. The host requires the entrypoint to be

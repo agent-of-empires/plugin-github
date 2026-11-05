@@ -8,9 +8,10 @@ common git/GitHub operations from #658 without dropping into a terminal.
 > layer from AoE core (PR #1681 / issue #1667) into a Tier 1 plugin worker, with
 > structured `github.status` (open PRs for the branch, each with its URL) and
 > `github.open` (open-in-GitHub). The per-session pane shows rich PR state
-> (state incl. merged, review state, merge conflicts, CI checks, and unresolved comments) when a
-> token is present, degrading to open PRs only without one. The write operations
-> (create/merge PR, push, pull, fix-CI) land in follow-ups.
+> (state incl. merged, review state, merge conflicts, merge queue position and
+> state, CI checks, and unresolved comments) when a token is present, degrading
+> to open PRs only without one. The write operations (create/merge PR, push, pull,
+> fix-CI) land in follow-ups.
 
 ## Layout
 
@@ -46,7 +47,7 @@ anything is written.
 | Command | `refresh` -> worker method `github.refresh`                        |
 | Command | `open` (open-in-GitHub) -> worker method `github.open`             |
 | Command | `open_pr` (`GitHub: open PR`) -> client `open-ui-link` action, default chord `Ctrl+Shift+G` |
-| UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), five `filter-facet`s (`github_ci`, `github_review`, `github_pr`, `github_comments`, `github_conflicts`), and a `pane` tool-window (`github_pane`) |
+| UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), six `filter-facet`s (`github_ci`, `github_review`, `github_pr`, `github_comments`, `github_conflicts`, `github_queue`), and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
 `open_pr` is the command-palette / shortcut way to open the active session's PR
@@ -61,7 +62,7 @@ highest-attention PR and is present whenever an open PR exists, independent of t
 
 Compatible with the [Board](https://github.com/agent-of-empires/plugin-kanban)
 (kanban) plugin. Its Cards show the PR badges and status text as the sidebar
-does, and its Signal columns can match on the five filter facets below, e.g. a
+does, and its Signal columns can match on the six filter facets below, e.g. a
 column holding every session where `GitHub CI is failing` or `GitHub review is
 changes requested`.
 
@@ -133,21 +134,24 @@ session-less `github.refresh` cover every session and prune vanished ones:
    forced refresh, a cold cache, or a cheap digest query detecting a change past
    the freshness ceiling) does it spend the expensive
    GraphQL query for the rich state (PR state incl. MERGED, `reviewDecision`,
-   mergeability (merge conflicts with the base), the
-   head commit's check rollup + per-check runs, and every unresolved review
-   thread with its first comment). Branches of the same repo that need a fresh
+   mergeability (merge conflicts with the base), merge queue membership/state/
+   position, the head commit's check rollup + per-check runs, and every unresolved
+   review thread with its first comment). Branches of the same repo that need a fresh
    fetch are aliased into one batched GraphQL query rather than one per branch, so
    a workspace of many worktrees of one repo costs a single query (split into a
    few once it exceeds the per-query alias cap). Without a token it is the basic
    REST open-PR lookup only.
-4. Push one global `sort-key`, five global `filter-facet`s (below), and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
+4. Push one global `sort-key`, six global `filter-facet`s (below), and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
    chip sequence per open PR: a clickable PR icon, a merge-conflict chip when the
-   PR conflicts with its base, then review-state, CI-rollup,
-   and unresolved-comment chips, each shown only when a token supplies that field,
-   concatenated across the workspace's repos, plus an error marker per failed
+   PR conflicts with its base, a merge-queue status/position chip when queued, then
+   review-state, CI-rollup, and unresolved-comment chips, each shown only when a
+   token supplies that field, concatenated across the workspace's repos, plus an error marker per failed
    repo. Each chip is colored by tone, so failing CI / changes requested read as
    danger, unresolved comments as warn, and a healthy PR as success,
-   distinguishing a broken PR from a healthy one at a glance; a draft shows the PR
+   distinguishing a broken PR from a healthy one at a glance; with
+   `dense_row_badge_glyphs` on, each chip also carries a single-character mark so
+   the terminal has something to paint where it has no icons (off by default); a
+   draft shows the PR
    chip alone and merged-only repos are omitted, since the badge is an actionable
    indicator), a `row-column`
    (`{text, tone, tooltip, sort_value?, filter_values?}`, or `{}` to clear -- one deterministic
@@ -166,7 +170,7 @@ session-less `github.refresh` cover every session and prune vanished ones:
 Filter facets: each session's `row-column` carries `filter_values`, the sorted
 union of facts across every open (non-merged) PR in the workspace, drafts
 included. They are data, not display, so the session-row chip toggles do not
-affect them. The five global `filter-facet` entries point at that column
+affect them. The six global `filter-facet` entries point at that column
 (`column: "github_pr_status"`) and list the values a user can pick; a facet
 matches a session when its `filter_values` holds any selected value, so the
 dashboard sidebar and other plugins (such as the Board) can filter sessions by
@@ -175,10 +179,11 @@ dashboard sidebar and other plugins (such as the Board) can filter sessions by
 | Facet id          | Label           | Values                                                                                                   |
 | ----------------- | --------------- | -------------------------------------------------------------------------------------------------------- |
 | `github_ci`       | GitHub CI       | `ci:passing`, `ci:failing`, `ci:running`, `ci:queued`, `ci:unknown` (only when the PR has a check rollup) |
-| `github_review`   | GitHub review   | `review:approved`, `review:changes-requested`, `review:changes-pushed`, `review:commented`, `review:waiting` |
+| `github_review`   | GitHub review   | `review:approved`, `review:partially-approved`, `review:changes-requested`, `review:changes-pushed`, `review:commented`, `review:waiting` |
 | `github_pr`       | GitHub PR       | `pr:open`, `pr:draft`                                                                                     |
 | `github_comments` | GitHub comments | `comments:unresolved` (at least one unresolved review thread)                                            |
 | `github_conflicts` | GitHub conflicts | `conflicts:yes` (the PR conflicts with its base)                                                        |
+| `github_queue`    | GitHub merge queue | `queue:queued`, `queue:awaiting-checks`, `queue:mergeable`, `queue:locked`, `queue:unmergeable` (only while the PR is in a merge queue) |
 
 Each option is `{ value, label, tone }`, with the label and tone matching the
 pane's CI and review vocabulary. Without a token only the `pr:*` values exist.
@@ -200,15 +205,14 @@ no `304`) is two-tier: the expensive rich query (per-check runs, review threads,
 comment excerpts; roughly 25-30 points per 10-branch batch) fires only when the
 conditional check reports a change, on a forced refresh, on a cold cache, or when
 the cheap DIGEST query detects a change. The digest (~1 point per batch) carries
-just the change-detection fields (PR state, `reviewDecision`, `updatedAt`, head
-commit, check rollup state, review-thread count) and revalidates cached rich
+just the change-detection fields (PR state, `reviewDecision`, `updatedAt`, head commit, merge queue membership/state/position, check rollup state, review-thread count) and revalidates cached rich
 state past its freshness ceiling; a matching signature serves the cache and
 re-arms the window, so an idle workspace revalidates for pennies instead of
 re-paying the rich query every 5 minutes. The ceilings exist because the `/pulls`
 list ETag does not reliably bump when a CI check completes or a review thread
 changes. They are state-aware: a branch whose cached state is active (a CI check
-running or queued) digests on a short ceiling so a finishing CI run shows up on
-the next tick, while a terminal or awaiting-review branch uses the 300s ceiling.
+running or queued, or a PR in a merge queue) digests on a short ceiling so
+finishing checks and queue transitions show up on the next tick, while a terminal or awaiting-review branch uses the 300s ceiling.
 Because the digest cannot see everything the pane renders (a comment body edit,
 a per-check change under an unchanged rollup), a hard full-refresh ceiling
 (2h idle, 5m active) bounds how long a full fetch can be deferred. Either way a
@@ -242,8 +246,13 @@ known, and a generic message for the REST path, which has no real reset. Backgro
 polls never notify, so a rate-limited workspace is not nagged on every tick.
 
 Each push is `params: { slot, id, session_id, payload }`. A badge item is
-`{ icon, tone?, href?, tooltip? }` (`icon` is a lucide name, e.g.
-`git-pull-request-arrow`; `tone` colors it; `href` opens the PR). A pane block
+`{ icon, tone, href?, tooltip }` (`icon` is a lucide name, e.g.
+`git-pull-request-arrow`; `tone` colors it; `href` opens the PR; `tooltip` keeps
+the full repo, PR number and title line). `text` is present only when
+`dense_row_badge_glyphs` is on: one character (`⇄`, `✓`, `✘`, `✉`) the host's
+terminal row paints where it has no icons, and the row-column drops its words so
+the row is marks plus the sort scalar. Off (the default), a chip is exactly the
+icon/tone/tooltip/href shape main ships. A pane block
 is one of a small, extensible set (`heading`, `row`, `note`, `divider`,
 `section`, `action`, `comment`, `callout`, `bar`, `columns`); the full field list
 per kind is in the host's
@@ -262,42 +271,63 @@ prepends a warn `note` telling the user a token unlocks review/CI/comments/merge
 
 The pane is one-PR-focused, and reads top to bottom:
 
-1. **PR selector.** Every PR in the session, most-actionable first (the same
-   attention ladder the session row uses, with merged PRs sinking below every open
-   one). Each row carries `#number`, the title, `branch · author`, and a glyph
-   strip for CI / review / conflicts / unresolved-comment count. Clicking a row
-   fires `github.select_pr { pr }`; the trailing arrow is a separate link to
-   GitHub, so picking a PR never navigates away. The selection is remembered in
-   memory per session, and falls back to the top of the list whenever the PR it
-   named is no longer in the snapshot (merged, closed, renamed).
-2. **Merge verdict** (`callout`). Why the PR can or cannot merge, derived here
+1. **PR selector.** Every PR in the session plus any additional members of its
+   GitHub-native stacks, most-actionable first (the same attention ladder the
+   session row uses, with merged PRs sinking below every open one). Each row
+   carries `#number`, the title, `branch · author`, and a glyph strip for CI /
+   review / conflicts / merge-queue state and position / unresolved-comment
+   count. Clicking a row fires `github.select_pr { pr }`; the trailing arrow is a
+   separate link to GitHub, so picking a PR never navigates away or changes a
+   checkout. The selection is remembered in memory per session, and falls back
+   to the top of the list whenever the PR it named is no longer in the snapshot
+   (merged, closed, renamed).
+2. **Stack map.** GitHub's native stack membership and ordering show the selected
+   PR's position and provide one-click selection of every layer. The readiness
+   row covers only unmerged PRs from the bottom through the selected PR: GitHub
+   must report each as `clean` (or already merged). A draft, `dirty`, or
+   `blocked` state blocks readiness. Advisory `behind`, `unstable`, and
+   `has_hooks` states remain visible but leave readiness unknown; missing status
+   is also unknown.
+   A fully merged range reads `Already merged`; closed, unmerged members are
+   blocked and do not count as open PRs or show an inferred review verdict.
+   PRs above the selected one do not affect its readiness. Stack data is fetched
+   only when a token is available. Successful data is rechecked after five
+   minutes; on failures, the last stack data may remain available and the pane
+   freshness is marked stale. Manual refresh bypasses the freshness TTL only
+   when no REST backoff or stack retry cooldown is active; data may be absent
+   when GitHub does not return it.
+3. **Merge verdict** (`callout`). Why the PR can or cannot merge, derived here
    rather than fetched: `mergeStateStatus` collapses conflicts, policy, CI and
    review into one enum and so cannot say which is blocking. The ladder is
-   draft, conflicts, changes requested, awaiting re-review, failing checks, running
-   checks, unresolved comments, ready, awaiting review, ordered by who can clear
-   the block. "Awaiting re-review" (`pushed since review` in the row) is a
+   draft, merge queue state, conflicts, changes requested, awaiting re-review, failing checks, running
+   checks, unresolved comments, awaiting more approvals, ready, awaiting review,
+   ordered by who can clear the block. "Awaiting more approvals"
+   (`partially approved` in the row) is an approved PR that still has a requested
+   reviewer or team, or that GitHub blocks while every check is green; only a PR
+   nobody else is being asked to review reads "ready". "Awaiting re-review" (`pushed since review` in the row) is a
    changes-requested decision whose blocking reviews were all made on an older
    commit; it still blocks the merge on GitHub until the reviewer re-reviews or
-   dismisses, but reads as info, not an alarm. **This
-   plugin never merges for you:** a mergeable PR gets a link out to GitHub, and a
-   blocked one an inert button naming the block.
-3. **Review.** One row per reviewer (initials, name, current position), from
+   dismisses, but reads as info, not an alarm. A queued PR is never shown as
+   directly mergeable. **This plugin never merges for you:** queued PRs link to
+   the merge queue on GitHub; a directly mergeable PR gets a merge link, and a
+   blocked one gets an inert button naming the block.
+4. **Review.** One row per reviewer (initials, name, current position), from
    `latestReviews` plus any outstanding `reviewRequests`, under the summary GitHub
    itself would show. Degrades to the single aggregate review-state row when
    per-reviewer data is absent.
-4. **Checks.** Count pills in the header; the runs needing attention (failing,
+5. **Checks.** Count pills in the header; the runs needing attention (failing,
    running, queued) listed outright with `workflow · duration`; the passes folded
    into a collapsed group; skipped runs on their own line. The body scrolls in
    place, so a twenty-check repo does not bury everything below it. A skipped run
    still counts as passing for the rollup (it blocks nothing) but is listed apart
    from the real passes.
-5. **Unresolved comments**, as read-only `comment` blocks.
-6. **Diff and Linked** (`columns`), side by side: `+added / -removed` with a
+6. **Unresolved comments**, as read-only `comment` blocks.
+7. **Diff and Linked** (`columns`), side by side: `+added / -removed` with a
    proportional bar and a file count, and the issues the PR closes on merge (from
    GitHub's own `closingIssuesReferences`). Either can be absent, and a lone
    survivor spans the full width.
-7. **Activity.** Recent timeline events, newest first, with local wall-clock times.
-8. **Footer**, pinned below the scroll: the last refresh time and the verdict in a
+8. **Activity.** Recent timeline events, newest first, with local wall-clock times.
+9. **Footer**, pinned below the scroll: the last refresh time and the verdict in a
    word.
 
 Repos that contribute no PR (a failed lookup, a non-GitHub checkout, a clean
@@ -331,9 +361,39 @@ count either. Their unresolved threads still count toward unresolved comments.
 
 The advanced `approved_overrides_stale_block` setting (default off) makes a PR
 read "approved" when a reviewer requested changes on an older commit and another
-reviewer approved the current head. Off, it stays "pushed since review" and the
-reviewer summary notes the approval. GitHub still blocks the merge until the
+reviewer approved the current head, unless someone else is still requested, in
+which case it reads "partially approved". Off, it stays "pushed since review" and
+the reviewer summary notes the approval. GitHub still blocks the merge until the
 stale review is re-done or dismissed.
+
+"approved" means nobody else is still being asked to review. GitHub's
+`reviewDecision` can read `APPROVED` while a code-owner group or ruleset
+requirement is still unmet, so an approved PR with a requested reviewer or team,
+or one `mergeStateStatus` reports `BLOCKED` while every check is green (drafts
+excluded), reads "partially approved" (`review:partially-approved` facet). Merge
+blockers other than review, such as failing CI, are not inferred from
+`mergeStateStatus`.
+
+The advanced `ignore_bot_approval_recommendations` setting (default off) stops a
+bot's COMMENTED review whose body literally recommends approval (a
+"Recommendation: Approve" line) from making the PR read "commented", when
+enabled; the bot's unresolved threads still count. Off (the default), such a
+review counts like any other comment.
+
+The `dense_row_badge_glyphs` setting (off by default) turns the row into marks:
+every badge chip gains its own one-character mark (`⇄` open PR, `◌` draft, `⊘`
+conflict, `✓` approved, `◷` partially approved, `✗` changes requested, `↻` pushed
+since review, `❝` commented, `⧗` awaiting review, `✔`/`✘` CI passing/failing, `~`
+CI running, `⇨` CI queued, `?` CI unknown, `⇉` merge queue, `✉` unresolved
+comments, `!` error) and the status words are dropped, so a session row reads as
+marks instead of titles. No two chips share a mark, so a lone mark still names its
+state when a chip category is toggled off, and every mark is one narrow cell, so
+the marks stay aligned in a double-width locale. The badge
+payload is shared, so the web row renders the same mark beside its icon
+(`SlotChrome.chipParts` paints icon and text together). The tooltip keeps the
+full line on hover either way, but `chipParts` drops `aria-label` when `text` is
+present (`text ? undefined : tooltip`), so in dense mode a screen reader
+announces the mark instead of the full line.
 
 > Rendering these in the TUI / web UI is host-side and lands with the core
 > plugin UI slots (`agent-of-empires#2366`) over the worker protocol

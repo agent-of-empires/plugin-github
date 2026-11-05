@@ -3,6 +3,7 @@
 import os
 import json
 import time
+import unicodedata
 
 import pytest
 
@@ -210,6 +211,18 @@ def test_pane_footer_carries_freshness_and_the_selected_verdict(monkeypatch):
         "tone": "success",
     }
     assert payload["blocks"][-1]["method"] == "github.refresh"
+
+
+def test_pane_footer_omits_verdict_for_stack_only_selection(monkeypatch):
+    _set_tz(monkeypatch, "UTC")
+    stack_only = _rich_pull(review="approved")
+    stack_only.update(number=2, stack_only=True, url="https://github.com/o/r/pull/2")
+    session = _session(repos=[_repo(pulls=[stack_only])])
+    session["freshness"] = {"refreshed_at": "2026-06-29T14:32:10Z", "stale": False}
+
+    payload = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(session)))["payload"]
+
+    assert payload["footer"] == {"text": "refreshed 14:32", "icon": "refresh-cw"}
 
 
 def test_pane_footer_marks_stale_freshness(monkeypatch):
@@ -619,8 +632,8 @@ def test_no_token_note_shown_only_when_a_github_repo_exists():
 # --- attention status in session rows (#36): badge + row-column ---
 
 
-def _badge_items_for(repos, sid="s1"):
-    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(session_id=sid, repos=repos)))
+def _badge_items_for(repos, sid="s1", **kwargs):
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(session_id=sid, repos=repos)), **kwargs)
     return _badge(params, sid)["payload"]["items"]
 
 
@@ -642,6 +655,59 @@ def test_snapshot_emits_global_sort_key():
         "id": uistate.SORT_KEY_SLOT[1],
         "payload": uistate.SORT_KEY_PAYLOAD,
     }
+
+
+def test_stack_only_pulls_stay_in_pane_navigation_not_session_status():
+    checked_out = _rich_pull(review="approved")
+    checked_out["number"] = 1
+    stack_only = _rich_pull(review="changes-requested")
+    stack_only.update(number=2, stack_only=True, url="https://github.com/o/r/pull/2")
+    checked_out["stack"] = [
+        {"number": 1, "state": "open", "mergeable_state": "clean"},
+        {"number": 2, "state": "open", "mergeable_state": "clean"},
+    ]
+    repo = _repo(pulls=[checked_out, stack_only])
+
+    params = uistate.snapshot_ui_state_params(
+        _auth_snapshot(_session(repos=[repo])), selected={"s1": "github.com/o/r#1"}
+    )
+    assert uistate._open_pulls(repo) == [checked_out]
+    items = _badge(params)["payload"]["items"]
+    assert all(item.get("href") != stack_only["url"] for item in items)
+    column = _column(params)["payload"]
+    assert "PR #1" in column["tooltip"]
+    assert "PR #2" not in column["tooltip"]
+    stack = next(block for block in _pane(params)["payload"]["blocks"] if block.get("title") == "Stack · PR 1 of 2")
+    assert [row["params"]["pr"] for row in stack["children"][1:]] == ["github.com/o/r#1", "github.com/o/r#2"]
+
+
+def test_session_pull_selection_deduplicates_stack_only_copy_and_keeps_stack():
+    real = _rich_pull(review="approved")
+    real.update(number=2, url="https://github.com/o/r/pull/2")
+    stack_only = _rich_pull(review="changes-requested")
+    stack_only.update(number=2, stack_only=True, url=real["url"])
+    stack = [
+        {"number": 1, "state": "open", "mergeable_state": "clean"},
+        {"number": 2, "state": "open", "mergeable_state": "clean"},
+    ]
+    stack_only["stack"] = stack
+    real_repo = _repo(name="checkout", pulls=[real])
+    stack_repo = _repo(name="stack", pulls=[stack_only])
+
+    selected = uistate._session_pulls([real_repo, stack_repo])
+    assert len(selected) == 1
+    selected_repo, selected_pull = selected[0]
+    assert selected_repo is real_repo
+    assert selected_pull["review_state"] == "approved"
+    assert selected_pull["stack"] == stack
+
+    params = uistate.snapshot_ui_state_params(
+        _auth_snapshot(_session(repos=[real_repo, stack_repo])),
+        selected={"s1": "github.com/o/r#2"},
+    )
+    blocks = _pane(params)["payload"]["blocks"]
+    assert any(block.get("title") == "Stack · PR 2 of 2" for block in blocks)
+    assert not any(block.get("kind") == "note" for block in blocks)
 
 
 def test_badge_emits_pr_review_ci_comment_chip_sequence():
@@ -672,9 +738,14 @@ def test_badge_draft_is_chip_only_no_rich_chips():
     checks = {"state": "failing", "runs": []}
     pull = _rich_pull(review="changes-requested", checks=checks)
     pull["draft"] = True
-    items = _badge_items_for([_repo(pulls=[pull])])
+    items = _badge_items_for([_repo(pulls=[pull])], dense_glyphs=True)
     assert [i["icon"] for i in items] == ["git-pull-request-draft"]
     assert items[0]["tone"] == "warn"
+    assert items[0]["text"] == "◌"
+    # Default (dense off): the draft chip carries no mark, exactly as main ships it.
+    default = _badge_items_for([_repo(pulls=[pull])])
+    assert [i["icon"] for i in default] == ["git-pull-request-draft"]
+    assert "text" not in default[0]
 
 
 def test_badge_concatenates_chips_across_repos():
@@ -688,13 +759,82 @@ def test_badge_concatenates_chips_across_repos():
     assert icons == ["git-pull-request-arrow", "badge-check", "git-pull-request-arrow", "badge-check", "circle-x"]
 
 
-def test_badge_chip_tooltips_name_repo_and_state():
+def test_badge_chips_use_single_character_marks():
+    # One mark per chip, colored by tone, and only with dense_row_badge_glyphs on:
+    # the terminal row paints `text` where it paints no icons, and the web chip
+    # paints the mark beside its `icon` (the shape the Linear plugin's row badge
+    # ships). No PR number and no words in the row; the tooltip keeps the full line.
     checks = {"state": "failing", "runs": []}
-    items = _badge_items_for([_repo(name="a", pulls=[_rich_pull(review="changes-requested", checks=checks)])])
-    tips = [i["tooltip"] for i in items]
-    assert tips[0].startswith("a: PR #5")
-    assert "changes requested" in tips[1]
-    assert "CI failing" in tips[2]
+    comments = {"unresolved": 2, "items": [{"author": "a", "body": "x", "resolved": False}]}
+    items = _badge_items_for(
+        [_repo(name="a", pulls=[_rich_pull(review="changes-requested", checks=checks, comments=comments)])],
+        dense_glyphs=True,
+    )
+    assert [i["text"] for i in items] == ["⇄", "✗", "✘", "✉"]
+    assert all(len(i["text"]) == 1 for i in items)
+    assert all(not i["text"].isdigit() for i in items)
+    assert items[0]["tooltip"] == "a: PR #5 T"
+    assert "changes requested" in items[1]["tooltip"]
+    assert "CI failing" in items[2]["tooltip"]
+
+
+def test_badge_dense_marks_cover_queue_conflict_and_error():
+    # Queue, conflict and repo-error chips each carry their own mark in dense mode;
+    # the error chip is the only one on a failed repo.
+    queue = {"state": "queued", "position": 2}
+    conflicted = _rich_pull(review="approved")
+    conflicted["merge_state"] = "conflicts"
+    conflicted["merge_queue"] = queue
+    marks = [i["text"] for i in _badge_items_for([_repo(pulls=[conflicted])], dense_glyphs=True)]
+    assert marks[:3] == ["⇄", "⇉", "⊘"]
+    assert [i["text"] for i in _badge_items_for([_repo(error={"hint": "boom"})], dense_glyphs=True)] == ["!"]
+
+
+def test_dense_row_column_drops_words_but_keeps_sort_and_filters():
+    # Dense mode clears the row-column words; the sort scalar and the facet values
+    # survive so the sidebar can still sort and filter a row with no text.
+    checks = {"state": "failing", "runs": []}
+    repos = [_repo(pulls=[_rich_pull(review="changes-requested", checks=checks)])]
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos)), dense_glyphs=True)
+    cell = _column(params, "s1")["payload"]
+    assert cell["text"] == ""
+    assert cell["sort_value"] == uistate._ATTENTION_VISUAL["changes-requested"][0]
+    assert cell["filter_values"] == ["ci:failing", "pr:open", "review:changes-requested"]
+
+
+def test_badge_payload_is_web_identical_by_default():
+    # The dense marks are opt-in, so by default a chip is exactly what main ships:
+    # icon, tone, tooltip and href, no text.
+    items = _badge_items_for([_repo(name="a", pulls=[_rich_pull(review="approved")])])
+    assert items
+    for item in items:
+        assert set(item) <= {"icon", "tone", "href", "tooltip"}
+        assert "text" not in item
+
+
+def test_glyph_tables_cover_every_visual_state():
+    # A state with no glyph would fall back to a mark; the tables are pinned to the
+    # visual ones so a new review/CI state cannot silently lose its mark.
+    assert set(uistate._REVIEW_GLYPH) == set(uistate._REVIEW_VISUAL)
+    assert set(uistate._CHECK_GLYPH) == set(uistate._CHECK_VISUAL)
+    marks = (
+        uistate._PR_GLYPH,
+        uistate._DRAFT_GLYPH,
+        uistate._QUEUE_GLYPH,
+        uistate._CONFLICT_GLYPH,
+        uistate._COMMENT_GLYPH,
+        uistate._ERROR_GLYPH,
+        *uistate._REVIEW_GLYPH.values(),
+        *uistate._CHECK_GLYPH.values(),
+    )
+    # No two chips share a mark: the row paints text plus tone only, so with a chip
+    # category toggled off a lone mark has to name its own state.
+    assert len(set(marks)) == len(marks)
+    # Each is one narrow cell, so a mark cannot turn a row into words or break the
+    # alignment in a double-width locale (Ambiguous width renders two cells there).
+    for mark in marks:
+        assert len(mark) == 1
+        assert unicodedata.east_asian_width(mark) in {"N", "Na", "H"}, mark
 
 
 # --- chip-visibility settings (#36 follow-up): per-category toggles ---
@@ -805,6 +945,12 @@ def test_column_filter_values_ignore_chip_toggles():
     assert payload["filter_values"] == ["ci:running", "pr:open", "review:waiting"]
 
 
+def test_column_filter_values_include_partially_approved():
+    payload = _column_payload([_repo(pulls=[_rich_pull(review="partially-approved")])])
+    assert "review:partially-approved" in payload["filter_values"]
+    assert "review:approved" not in payload["filter_values"]
+
+
 def test_column_filter_values_map_unrecognized_ci_state_to_unknown():
     repos = [_repo(pulls=[_rich_pull(review=None, checks={"state": "weird", "runs": []})])]
     assert _column_payload(repos)["filter_values"] == ["ci:unknown", "pr:open"]
@@ -827,6 +973,7 @@ def test_snapshot_emits_global_filter_facets_on_the_status_column():
         "github_pr",
         "github_comments",
         "github_conflicts",
+        "github_queue",
     ]
     assert all("session_id" not in f for f in facets)
     assert all(f["payload"]["column"] == uistate.ROW_COLUMN_SLOT[1] for f in facets)
@@ -836,6 +983,7 @@ def test_snapshot_emits_global_filter_facets_on_the_status_column():
         "GitHub PR",
         "GitHub comments",
         "GitHub conflicts",
+        "GitHub merge queue",
     ]
     assert _facet(params, "github_ci")["payload"]["options"] == [
         {"value": "ci:passing", "label": "passing", "tone": "success"},
@@ -846,6 +994,7 @@ def test_snapshot_emits_global_filter_facets_on_the_status_column():
     ]
     assert _facet(params, "github_review")["payload"]["options"] == [
         {"value": "review:approved", "label": "approved", "tone": "success"},
+        {"value": "review:partially-approved", "label": "partially approved", "tone": "info"},
         {"value": "review:changes-requested", "label": "changes requested", "tone": "danger"},
         {"value": "review:changes-pushed", "label": "pushed since review", "tone": "info"},
         {"value": "review:commented", "label": "commented", "tone": "info"},
@@ -861,6 +1010,13 @@ def test_snapshot_emits_global_filter_facets_on_the_status_column():
     assert _facet(params, "github_conflicts")["payload"]["options"] == [
         {"value": "conflicts:yes", "label": "conflicts", "tone": "danger"},
     ]
+    assert [o["value"] for o in _facet(params, "github_queue")["payload"]["options"]] == [
+        "queue:awaiting-checks",
+        "queue:locked",
+        "queue:mergeable",
+        "queue:queued",
+        "queue:unmergeable",
+    ]
 
 
 def test_column_filter_values_cover_every_facet_option():
@@ -875,7 +1031,11 @@ def test_column_filter_values_cover_every_facet_option():
             for draft in (False, True):
                 pull = _rich_pull(review=review, checks={"state": cstate, "runs": []}, comments=comments, draft=draft)
                 emitted |= uistate._pull_filter_values(pull)
+    for state in [*uistate._QUEUE_VISUAL, "weird"]:
+        emitted |= uistate._pull_filter_values({**_rich_pull(), "merge_queue": {"state": state, "position": 1}})
     assert emitted == offered
+    assert not any(v.startswith("queue:") for v in uistate._pull_filter_values(_rich_pull()))
+    assert "queue:queued" in uistate._pull_filter_values({**_rich_pull(), "merge_queue": {"state": "weird"}})
 
 
 def test_column_shows_healthy_state_not_empty():
@@ -903,6 +1063,47 @@ def test_conflict_chip_is_ungated_by_categories():
     # toggle category disabled.
     repos = [_repo(pulls=[_rich_pull(review="approved", merge_state="conflicts")])]
     assert "triangle-alert" in _badge_icons_with(repos, frozenset())
+
+
+def test_merge_queue_is_visible_in_badge_column_and_verdict():
+    pull = _rich_pull(review="approved", merge_state="conflicts")
+    pull["merge_queue"] = {"position": 2, "state": "queued"}
+    repo = _repo(pulls=[pull])
+    payload = _column_payload([repo])
+    assert payload["text"] == "in merge queue"
+    assert payload["sort_value"] == uistate._ATTENTION_VISUAL["queue"][0]
+    chips = uistate._pr_badge_chips("r", pull, frozenset({"review", "ci", "comments"}))
+    assert any("position 2" in chip["tooltip"] for chip in chips)
+    verdict = uistate._merge_verdict(pull)
+    assert verdict["title"] == "In merge queue"
+    assert verdict["detail"] == (
+        "GitHub will merge this pull request when it reaches the front of the queue. It is position 2."
+    )
+    assert verdict["ready"] is False
+
+
+def test_merge_queue_state_renders_in_pr_selector_and_links_to_queue():
+    pull = _rich_pull(review="approved")
+    queue_url = "https://github.com/o/r/queue/main"
+    pull["merge_queue"] = {"position": 1, "state": "awaiting-checks", "url": queue_url}
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])])))
+    blocks = _pane(params)["payload"]["blocks"]
+    row = _rows(blocks)[0]
+    callout = next(block for block in blocks if block.get("kind") == "callout")
+    assert any("awaiting merge queue checks" in badge["tooltip"] for badge in row["badges"])
+    assert callout["title"] == "Awaiting merge queue checks"
+    assert callout["actions"][0]["label"] == "View queue on GitHub"
+    assert callout["actions"][0]["href"] == queue_url
+    assert callout["actions"][0]["href"] != pull["url"]
+    assert "disabled" not in callout["actions"][0]
+
+
+def test_merge_queue_without_queue_url_does_not_link_to_pull():
+    pull = _rich_pull(review="approved")
+    pull["merge_queue"] = {"position": 1, "state": "queued"}
+    action = _callout([_repo(pulls=[pull])])["actions"][0]
+    assert action["disabled"] is True
+    assert "href" not in action
 
 
 def _callout(repos):
@@ -953,6 +1154,106 @@ def test_merged_pr_verdict_replaces_the_conflict_signal():
     # Merged PRs suppress all live detail, including a stale conflict signal.
     pull = _rich_pull(state="MERGED", merged=True, merge_state="conflicts")
     assert _callout([_repo(pulls=[pull])])["title"] == "Merged"
+
+
+@pytest.mark.parametrize("host", ["github.com", "a.corp"])
+def test_stack_shows_position_navigation_and_readiness_only_through_selection(host):
+    selected = _rich_pull(review="approved")
+    selected["number"] = 2
+    selected["stack"] = [
+        {
+            "number": 1,
+            "title": "Foundation",
+            "url": f"https://{host}/o/r/pull/1",
+            "state": "open",
+            "mergeable_state": "clean",
+            "head": "foundation",
+        },
+        {
+            "number": 2,
+            "title": "Selected",
+            "url": f"https://{host}/o/r/pull/2",
+            "state": "open",
+            "mergeable_state": "clean",
+            "head": "feature",
+        },
+        {
+            "number": 3,
+            "title": "Blocked above",
+            "url": f"https://{host}/o/r/pull/3",
+            "state": "open",
+            "draft": True,
+            "mergeable_state": "draft",
+            "head": "top",
+        },
+    ]
+    blocks = _pane(
+        uistate.snapshot_ui_state_params(
+            _auth_snapshot(_session(repos=[{**_repo(pulls=[selected]), "host": host}])),
+            selected={"s1": f"{host}/o/r#2"},
+        )
+    )["payload"]["blocks"]
+    stack = next(block for block in blocks if block.get("title") == "Stack · PR 2 of 3")
+    rows = stack["children"]
+    assert rows[0]["value"] == "Mergeable through this PR"
+    assert [row["params"]["pr"] for row in rows[1:]] == [f"{host}/o/r#1", f"{host}/o/r#2", f"{host}/o/r#3"]
+    assert rows[2]["selected"] is True
+    assert rows[3]["value"] == "draft"
+
+
+@pytest.mark.parametrize(
+    ("mergeable_state", "expected", "row_tone"),
+    [
+        ("blocked", "Blocked at #1", "danger"),
+        ("dirty", "Blocked at #1", "danger"),
+        ("behind", "Mergeability unknown", "warn"),
+        ("unstable", "Mergeability unknown", "warn"),
+        ("has_hooks", "Mergeability unknown", "warn"),
+        (None, "Mergeability unknown", "warn"),
+    ],
+)
+def test_stack_readiness_distinguishes_hard_blocks_from_advisory_states(mergeable_state, expected, row_tone):
+    pull = _rich_pull(review="approved")
+    pull["number"] = 2
+    pull["stack"] = [
+        {"number": 1, "state": "open", "mergeable_state": mergeable_state},
+        {"number": 2, "state": "open", "mergeable_state": "clean"},
+    ]
+    blocks = _pane(
+        uistate.snapshot_ui_state_params(
+            _auth_snapshot(_session(repos=[_repo(pulls=[pull])])), selected={"s1": "github.com/o/r#2"}
+        )
+    )["payload"]["blocks"]
+    stack = next(block for block in blocks if block.get("title") == "Stack · PR 2 of 2")
+    assert stack["children"][0]["value"] == expected
+    assert stack["children"][1]["value_tone"] == row_tone
+
+
+def test_closed_unmerged_stack_member_is_not_presented_as_open():
+    closed = _rich_pull(state="CLOSED", merged=False)
+    closed["stack"] = [
+        {"number": 4, "state": "closed", "merged": False, "mergeable_state": "unknown"},
+        {"number": 5, "state": "open", "mergeable_state": "clean"},
+    ]
+    closed["number"] = 4
+    repo = _repo(pulls=[closed])
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[repo])))
+    row = _rows(_pane(params)["payload"]["blocks"])[0]
+    assert row["icon"] == "circle-x"
+    assert _badge(params)["payload"]["items"] == []
+    callout = next(block for block in _pane(params)["payload"]["blocks"] if block.get("kind") == "callout")
+    assert callout["title"] == "Closed"
+
+
+def test_fully_merged_stack_range_is_not_described_as_mergeable():
+    pull = _rich_pull(state="MERGED", merged=True)
+    pull["stack"] = [
+        {"number": 1, "state": "closed", "merged": True},
+        {"number": 2, "state": "closed", "merged": True},
+    ]
+    pull["number"] = 2
+    stack = uistate._stack_section(_repo(), pull)
+    assert stack["children"][0]["value"] == "Already merged"
 
 
 def test_column_is_empty_when_no_prs_to_clear_stale_state():

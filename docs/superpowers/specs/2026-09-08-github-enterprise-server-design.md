@@ -72,11 +72,14 @@ and applicable token family; dotcom guidance explains `GH_TOKEN` precedence.
 
 Network identity is `(host, owner, repo, branch)`. ETags, rich GraphQL caches,
 retry cooldowns, REST/GraphQL backoff and budget observations are partitioned by
-host. One host's low budget stretches only its own freshness intervals. Shared
-state is protected by the existing cache lock.
+host. Native stack data and unsupported-endpoint caches also include the host;
+stack retry backoff is per host and separate from primary REST backoff. One host's
+low budget stretches only its own freshness intervals. Shared state is protected
+by the existing cache lock.
 
-Honor usable host `workspace_repos` metadata, including its session branch;
-otherwise retain shallow checkout discovery. Local identity deduplication uses
+Honor usable host `workspace_repos` metadata. When it supplies `worktree_path`,
+read that checkout's live branch; older hosts retain their session branch
+override. Otherwise retain shallow checkout discovery. Local identity deduplication uses
 the checkout's real path and branch override, preserving separate sessions that
 share a source checkout but query different branches.
 

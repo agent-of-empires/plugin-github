@@ -2,12 +2,12 @@
 
 The host renders the slots; the worker only pushes typed display state. From one
 aggregate snapshot (see ``refresh.build_snapshot``) this produces one global
-sort option, five global filter facets, plus three pushes per session:
+sort option, six global filter facets, plus three pushes per session:
 
 - a global ``sort-key`` whose payload points at the ``github_pr_status``
   ``row-column`` and sorts by the same PR attention rank the row already uses.
   The host keeps the sorting client-side over the pushed scalar values.
-- global ``filter-facet`` entries (CI, review, PR, comments, conflicts; see
+- global ``filter-facet`` entries (CI, review, PR, comments, conflicts, merge queue; see
   ``FILTER_FACETS``) that also point at ``github_pr_status``, so the sidebar and
   other plugins can filter sessions by one PR fact such as "CI failing".
 
@@ -19,7 +19,13 @@ sort option, five global filter facets, plus three pushes per session:
   success), so the row distinguishes a broken PR from a healthy one at a glance
   (#36). A draft shows the PR chip alone; merged-only repos are omitted, since the
   badge is an actionable indicator. Every chip's href opens that PR; the pane
-  carries the full detail.
+  carries the full detail, and the tooltip keeps the full line. By default a chip
+  is the GitHub glyph, tone and tooltip the web row already paints, and the
+  ``row-column`` carries the words. With ``dense_row_badge_glyphs`` on, every chip
+  also gains a one-character mark the terminal row paints where it has no icons
+  (``⇄``, ``✓``, ``✘``, ``✉``), colored by tone, and the ``row-column`` drops its
+  words, so a row reads as marks rather than titles; the payload is shared, so the
+  web chip paints the mark beside its icon (`SlotChrome.chipParts` renders both).
 - a ``row-column`` whose payload is ``{"text", "tone", "tooltip",
   "sort_value"?, "filter_values"?}`` (or ``{}`` to clear) -- one deterministic
   words summary of the session's most-urgent PR signal, so the list is scannable
@@ -90,6 +96,8 @@ _ICON_ERROR = "circle-alert"
 # review_state -> (lucide icon, host Tone, human label).
 _REVIEW_VISUAL: dict[str, tuple[str, str, str]] = {
     "approved": ("badge-check", "success", "approved"),
+    # Approved, but a reviewer or code-owner group is still outstanding.
+    "partially-approved": ("circle-dashed", "info", "partially approved"),
     "changes-requested": ("circle-x", "danger", "changes requested"),
     # Blocking review made on an older commit: still merge-blocking on GitHub, but
     # likely addressed, so it reads as info rather than an alarm.
@@ -106,6 +114,15 @@ _CHECK_VISUAL: dict[str, tuple[str, str, str]] = {
     "running": ("loader", "info", "running"),
     "queued": ("clock", "neutral", "queued"),
     "unknown": ("circle-help", "neutral", "unknown"),
+}
+
+# merge-queue entry state -> (lucide icon, host Tone, human label)
+_QUEUE_VISUAL: dict[str, tuple[str, str, str]] = {
+    "awaiting-checks": ("loader", "info", "awaiting merge queue checks"),
+    "locked": ("lock-keyhole", "warn", "merge queue locked"),
+    "mergeable": ("git-merge", "success", "ready in merge queue"),
+    "queued": ("git-merge", "info", "in merge queue"),
+    "unmergeable": ("circle-x", "danger", "unmergeable in queue"),
 }
 
 # Global `filter-facet` entries: (facet id, payload). Each facet matches a session
@@ -163,7 +180,53 @@ FILTER_FACETS: tuple[tuple[str, dict[str, Any]], ...] = (
             "options": [{"value": "conflicts:yes", "label": "conflicts", "tone": "danger"}],
         },
     ),
+    (
+        "github_queue",
+        {
+            "label": "GitHub merge queue",
+            "column": ROW_COLUMN_SLOT[1],
+            "options": [
+                {"value": f"queue:{state}", "label": state.replace("-", " "), "tone": tone}
+                for state, (_icon, tone, _label) in _QUEUE_VISUAL.items()
+            ],
+        },
+    ),
 )
+
+# One-character marks for the session row, used only when
+# `dense_row_badge_glyphs` is on. The payload is shared: the web chip paints its
+# lucide `icon` and this `text` together (`SlotChrome.chipParts`), while the
+# terminal row, which paints no icons, shows the mark alone (colored by tone).
+# Every state owns its own mark and no two chips share one: the terminal row paints
+# text plus tone only, so a mark reused for two states (``✓`` for an approved review
+# and for passing CI, both success) went unreadable the moment a chip toggle hid
+# its neighbour. Review keeps the light marks and CI the heavy ones, so a lone chip
+# still names its category. Every mark is a single narrow cell (East-Asian Neutral
+# or Narrow, never Ambiguous or Wide) so the marks stay one column in a CJK locale;
+# `test_glyph_tables_cover_every_visual_state` pins both properties.
+_REVIEW_GLYPH: dict[str, str] = {
+    "approved": "✓",
+    "partially-approved": "◷",
+    "changes-requested": "✗",
+    "changes-pushed": "↻",
+    "commented": "❝",
+    "waiting": "⧗",
+}
+# The heavy check/cross pair, so CI never reads as the review chip next to it.
+_CHECK_GLYPH: dict[str, str] = {
+    "succeeded": "✔",
+    "failing": "✘",
+    "running": "~",
+    "queued": "⇨",
+    "unknown": "?",
+}
+_QUEUE_GLYPH = "⇉"
+_PR_GLYPH = "⇄"
+_DRAFT_GLYPH = "◌"
+_CONFLICT_GLYPH = "⊘"
+_COMMENT_GLYPH = "✉"
+_ERROR_GLYPH = "!"
+
 
 # PR attention kind -> (rank, lucide icon, host Tone, compact label). Lower rank
 # = more attention, so it wins the badge icon and the row-column summary. The
@@ -175,18 +238,20 @@ FILTER_FACETS: tuple[tuple[str, dict[str, Any]], ...] = (
 # notable); "draft" is WIP.
 _ATTENTION_VISUAL: dict[str, tuple[int, str, str, str]] = {
     "error": (0, _ICON_ERROR, "danger", "error"),
-    "conflicts": (1, "triangle-alert", "danger", "conflicts"),
-    "changes-requested": (2, *_REVIEW_VISUAL["changes-requested"][:2], "changes requested"),
-    "checks-failing": (3, *_CHECK_VISUAL["failing"][:2], "CI failing"),
-    "unresolved": (4, "message-square", "warn", "unresolved comments"),
-    "checks-running": (5, *_CHECK_VISUAL["running"][:2], "CI running"),
-    "checks-queued": (6, *_CHECK_VISUAL["queued"][:2], "CI queued"),
-    "changes-pushed": (7, *_REVIEW_VISUAL["changes-pushed"][:2], "pushed since review"),
-    "awaiting-review": (8, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
-    "commented": (9, *_REVIEW_VISUAL["commented"][:2], "commented"),
-    "approved": (10, *_REVIEW_VISUAL["approved"][:2], "approved"),
-    "open": (11, _ICON_OPEN, "success", "open PR"),
-    "draft": (12, _ICON_DRAFT, "warn", "draft"),
+    "queue": (1, "git-merge", "info", "in merge queue"),
+    "conflicts": (2, "triangle-alert", "danger", "conflicts"),
+    "changes-requested": (3, *_REVIEW_VISUAL["changes-requested"][:2], "changes requested"),
+    "checks-failing": (4, *_CHECK_VISUAL["failing"][:2], "CI failing"),
+    "unresolved": (5, "message-square", "warn", "unresolved comments"),
+    "checks-running": (6, *_CHECK_VISUAL["running"][:2], "CI running"),
+    "checks-queued": (7, *_CHECK_VISUAL["queued"][:2], "CI queued"),
+    "changes-pushed": (8, *_REVIEW_VISUAL["changes-pushed"][:2], "pushed since review"),
+    "awaiting-review": (9, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
+    "commented": (10, *_REVIEW_VISUAL["commented"][:2], "commented"),
+    "partially-approved": (11, *_REVIEW_VISUAL["partially-approved"][:2], "partially approved"),
+    "approved": (12, *_REVIEW_VISUAL["approved"][:2], "approved"),
+    "open": (13, _ICON_OPEN, "success", "open PR"),
+    "draft": (14, _ICON_DRAFT, "warn", "draft"),
 }
 
 
@@ -198,6 +263,7 @@ _KIND_CATEGORY: dict[str, str] = {
     "changes-pushed": "review",
     "awaiting-review": "review",
     "commented": "review",
+    "partially-approved": "review",
     "approved": "review",
     "checks-failing": "ci",
     "checks-running": "ci",
@@ -209,6 +275,16 @@ _KIND_CATEGORY: dict[str, str] = {
 _ALL_CHIPS = frozenset(_KIND_CATEGORY.values())
 
 
+def _queue_label(pull: dict[str, Any]) -> tuple[str, str, str] | None:
+    queue = pull.get("merge_queue")
+    if not isinstance(queue, dict):
+        return None
+    state = queue.get("state")
+    if not isinstance(state, str):
+        return ("git-merge", "neutral", "in merge queue")
+    return _QUEUE_VISUAL.get(state, ("git-merge", "neutral", "in merge queue"))
+
+
 def _pull_attention(pull: dict[str, Any], chips: frozenset[str]) -> str:
     """The attention kind for one non-merged PR, in issue #36 priority order,
     skipping any kind whose category the user disabled (``chips``). The rich
@@ -217,9 +293,10 @@ def _pull_attention(pull: dict[str, Any], chips: frozenset[str]) -> str:
     basic view rather than mislabeling state it cannot see."""
     if pull.get("draft"):
         return "draft"
-    # A merge conflict is a hard blocker that no reviewer can clear, so it wins
-    # over the whole toggle ladder and is never user-suppressible (kept out of
-    # _KIND_CATEGORY, matched here before the ladder so it cannot KeyError).
+    # Queue membership is not user-suppressible and takes precedence over stale
+    # per-commit signals while GitHub processes the queued merge.
+    if pull.get("merge_queue") is not None:
+        return "queue"
     if pull.get("merge_state") == "conflicts":
         return "conflicts"
     review = pull.get("review_state")
@@ -238,6 +315,7 @@ def _pull_attention(pull: dict[str, Any], chips: frozenset[str]) -> str:
         (review == "changes-pushed", "changes-pushed"),
         (review == "waiting", "awaiting-review"),
         (review == "commented", "commented"),
+        (review == "partially-approved", "partially-approved"),
         (review == "approved", "approved"),
     )
     for cond, kind in rules:
@@ -270,8 +348,12 @@ def _is_merged(pull: dict[str, Any]) -> bool:
     return bool(pull.get("merged")) or str(pull.get("state") or "").upper() == "MERGED"
 
 
+def _is_closed(pull: dict[str, Any]) -> bool:
+    return str(pull.get("state") or "").lower() == "closed" and not _is_merged(pull)
+
+
 def _open_pulls(repo: dict[str, Any]) -> list[dict[str, Any]]:
-    return [p for p in (repo.get("pulls") or []) if not _is_merged(p)]
+    return [p for p in (repo.get("pulls") or []) if not p.get("stack_only") and not _is_merged(p) and not _is_closed(p)]
 
 
 def _badge_tooltip(repo: dict[str, Any], chips: frozenset[str]) -> str:
@@ -289,65 +371,87 @@ def _badge_tooltip(repo: dict[str, Any], chips: frozenset[str]) -> str:
     return f"{head} ({label})"
 
 
-def _chip(icon: str, tone: str, tooltip: str, href: str | None) -> dict[str, Any]:
+def _chip(icon: str, tone: str, text: str | None, tooltip: str, href: str | None) -> dict[str, Any]:
+    """One row-badge chip: the GitHub glyph the web row paints, the tone that colors
+    it, the full line as a tooltip for hover, and the PR ``href``. ``text`` is the
+    single-character mark and only present when the dense terminal representation
+    is on: the payload is shared, so a mark pushed always would land on the web
+    chip too. Without it the host's terminal row falls back to the tooltip."""
     chip: dict[str, Any] = {"icon": icon, "tone": tone, "tooltip": tooltip}
+    if text is not None:
+        chip["text"] = text
     if href:
         chip["href"] = href
     return chip
 
 
-def _pr_badge_chips(repo_name: str, pull: dict[str, Any], chips_on: frozenset[str]) -> list[dict[str, Any]]:
+def _pr_badge_chips(
+    repo_name: str, pull: dict[str, Any], chips_on: frozenset[str], *, dense: bool = False
+) -> list[dict[str, Any]]:
     """The chip sequence for one non-merged PR (#36): a PR affordance, then review,
     CI, and unresolved-comment indicators, each present only when a token supplies
     that field and its category is enabled (``chips_on``). A no-token PR is the PR
-    chip alone, so the row stays uncluttered. Every chip's href opens the PR; its
-    tooltip carries the words."""
+    chip alone, so the row stays uncluttered. Every href opens the PR. ``dense``
+    adds the one-character mark the terminal row renders; off, the chip is the
+    icon/tone/tooltip shape the web row already had."""
     href = pull.get("url")
-    head = f"{repo_name}: PR #{pull.get('number', '?')} {pull.get('title', '')}".rstrip()
+    number = pull.get("number", "?")
+    head = f"{repo_name}: PR #{number} {pull.get('title', '')}".rstrip()
+
+    def mark(glyph: str) -> str | None:
+        return glyph if dense else None
 
     if pull.get("draft"):
         # a draft is WIP: skip review/CI/comment noise until it opens.
-        return [_chip(_ICON_DRAFT, "warn", f"{head} (draft)", href)]
-    chips = [_chip(_ICON_OPEN, "success", head, href)]
+        return [_chip(_ICON_DRAFT, "warn", mark(_DRAFT_GLYPH), f"{head} (draft)", href)]
+    chips = [_chip(_ICON_OPEN, "success", mark(_PR_GLYPH), head, href)]
 
-    # Conflicts are ungated (not a suppressible category): a merge-blocked PR
-    # always shows the danger chip. Exact match, so a malformed/future value
-    # never trips a false conflict.
+    queue = pull.get("merge_queue")
+    if isinstance(queue, dict):
+        icon, tone, label = _queue_label(pull) or ("git-merge", "neutral", "in merge queue")
+        position = queue.get("position")
+        suffix = f" · position {position}" if isinstance(position, int) and not isinstance(position, bool) else ""
+        chips.append(_chip(icon, tone, mark(_QUEUE_GLYPH), f"{head} ({label}{suffix})", href))
     if pull.get("merge_state") == "conflicts":
-        chips.append(_chip("triangle-alert", "danger", f"{head} (conflicts)", href))
+        # Conflicts are ungated (not a suppressible category): a merge-blocked
+        # PR always shows the danger chip. Exact match avoids false conflicts.
+        chips.append(_chip("triangle-alert", "danger", mark(_CONFLICT_GLYPH), f"{head} (conflicts)", href))
 
     review_state = pull.get("review_state")
-    review = _REVIEW_VISUAL.get(review_state) if isinstance(review_state, str) else None
-    if review and "review" in chips_on:
-        icon, tone, label = review
-        chips.append(_chip(icon, tone, f"{head} ({label})", href))
+    if isinstance(review_state, str) and "review" in chips_on:
+        review = _REVIEW_VISUAL.get(review_state)
+        if review:
+            icon, tone, label = review
+            chips.append(_chip(icon, tone, mark(_REVIEW_GLYPH.get(review_state, "?")), f"{head} ({label})", href))
 
     checks = pull.get("checks")
     cstate = checks.get("state") if isinstance(checks, dict) else None
     if isinstance(cstate, str) and "ci" in chips_on:
         icon, tone, label = _CHECK_VISUAL.get(cstate, _CHECK_VISUAL["unknown"])
-        chips.append(_chip(icon, tone, f"{head} (CI {label})", href))
+        chips.append(_chip(icon, tone, mark(_CHECK_GLYPH.get(cstate, "?")), f"{head} (CI {label})", href))
 
     comments = pull.get("comments")
     unresolved = comments.get("unresolved") if isinstance(comments, dict) else 0
     if unresolved and "comments" in chips_on:
-        chips.append(_chip("message-square", "warn", f"{head} ({unresolved} unresolved)", href))
+        chips.append(_chip("message-square", "warn", mark(_COMMENT_GLYPH), f"{head} ({unresolved} unresolved)", href))
 
     return chips
 
 
-def _badge_items(repos: list[dict[str, Any]], chips_on: frozenset[str]) -> list[dict[str, Any]]:
+def _badge_items(repos: list[dict[str, Any]], chips_on: frozenset[str], *, dense: bool = False) -> list[dict[str, Any]]:
     """Per session: a chip sequence per open PR (PR + review + CI + comments), an
     error marker per failed repo, concatenated across repos. Merged-only repos and
-    non-github checkouts contribute nothing, keeping the badge actionable."""
+    non-github checkouts contribute nothing, keeping the badge actionable.
+    ``dense`` adds the one-character terminal marks to every chip."""
     items: list[dict[str, Any]] = []
     for repo in repos:
         if repo.get("error"):
-            items.append(_chip(_ICON_ERROR, "danger", _badge_tooltip(repo, chips_on), None))
+            glyph = _ERROR_GLYPH if dense else None
+            items.append(_chip(_ICON_ERROR, "danger", glyph, _badge_tooltip(repo, chips_on), None))
             continue
         name = repo.get("name") or repo.get("repo") or "repo"
         for pull in _open_pulls(repo):
-            items.extend(_pr_badge_chips(name, pull, chips_on))
+            items.extend(_pr_badge_chips(name, pull, chips_on, dense=dense))
     return items
 
 
@@ -418,6 +522,11 @@ def _pull_filter_values(pull: dict[str, Any]) -> set[str]:
         values.add("comments:unresolved")
     if pull.get("merge_state") == "conflicts":
         values.add("conflicts:yes")
+    queue = pull.get("merge_queue")
+    if isinstance(queue, dict):
+        state = queue.get("state")
+        # An unrecognized state is still queued, like `_queue_label`'s fallback.
+        values.add(f"queue:{state if state in _QUEUE_VISUAL else 'queued'}")
     return values
 
 
@@ -442,6 +551,8 @@ def _pull_visual(pull: dict[str, Any]) -> tuple[str, str | None, str | None]:
     (purple) because no semantic tone names it; open/draft use a tone."""
     if _is_merged(pull):
         return _ICON_MERGED, None, MERGED_COLOR
+    if _is_closed(pull):
+        return "circle-x", "neutral", None
     if pull.get("draft"):
         return _ICON_DRAFT, "warn", None
     return _ICON_OPEN, "success", None
@@ -460,23 +571,43 @@ def _pull_key(repo: dict[str, Any], pull: dict[str, Any]) -> str:
 
 
 def _session_pulls(repos: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """Every PR in the session as ``(repo, pull)``, most-actionable first.
+    """Return one entry per PR, most-actionable first.
 
-    Ranked per PR rather than per repo (the pane's selector is a flat list across
-    the workspace), using the same attention ladder the session row uses so the
-    two orders agree. Merged PRs sink below every open one: they are history, not
-    work. Ties keep snapshot order, which keeps the list stable between refreshes.
+    Duplicate stack-only copies must not shadow a checked-out PR. Preserve a
+    usable stack from another copy when the preferred entry lacks one.
     """
-    ranked: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
-    order = 0
+    unique: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for repo in repos:
         for pull in repo.get("pulls") or []:
-            if _is_merged(pull):
-                rank = len(_ATTENTION_VISUAL)
-            else:
-                rank = _ATTENTION_VISUAL[_pull_attention(pull, _ALL_CHIPS)][0]
-            ranked.append((rank, order, repo, pull))
-            order += 1
+            key = _pull_key(repo, pull)
+            current = unique.get(key)
+            if current is None:
+                unique[key] = (repo, pull)
+                continue
+
+            preferred = current
+            other_pull = pull
+            if current[1].get("stack_only") and not pull.get("stack_only"):
+                preferred = (repo, pull)
+                other_pull = current[1]
+            preferred_pull = preferred[1]
+            preferred_stack = preferred_pull.get("stack")
+            other_stack = other_pull.get("stack")
+            if (
+                (not isinstance(preferred_stack, list) or len(preferred_stack) < 2)
+                and isinstance(other_stack, list)
+                and len(other_stack) >= 2
+            ):
+                preferred = (preferred[0], {**preferred_pull, "stack": other_stack})
+            unique[key] = preferred
+
+    ranked: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
+    for order, (repo, pull) in enumerate(unique.values()):
+        if _is_merged(pull) or _is_closed(pull):
+            rank = len(_ATTENTION_VISUAL)
+        else:
+            rank = _ATTENTION_VISUAL[_pull_attention(pull, _ALL_CHIPS)][0]
+        ranked.append((rank, order, repo, pull))
     ranked.sort(key=lambda item: (item[0], item[1]))
     return [(repo, pull) for _, _, repo, pull in ranked]
 
@@ -503,6 +634,15 @@ def _pr_signals(pull: dict[str, Any]) -> list[dict[str, Any]]:
     if visual is not None:
         icon, tone, label = visual
         signals.append({"icon": icon, "tone": tone, "tooltip": label})
+    queue_label = _queue_label(pull)
+    if queue_label is not None:
+        icon, tone, label = queue_label
+        queue = pull.get("merge_queue")
+        position = queue.get("position") if isinstance(queue, dict) else None
+        tooltip = (
+            f"{label} · position {position}" if isinstance(position, int) and not isinstance(position, bool) else label
+        )
+        signals.append({"icon": icon, "tone": tone, "tooltip": tooltip})
     if pull.get("merge_state") == "conflicts":
         signals.append({"icon": "triangle-alert", "tone": "danger", "tooltip": "conflicts with base branch"})
     unresolved = _unresolved_count(pull)
@@ -857,6 +997,27 @@ def _verdict(title: str, detail: str, visual: tuple[str, str], short: str, *, re
     return {"title": title, "detail": detail, "icon": icon, "tone": tone, "short": short, "ready": ready}
 
 
+def _queue_verdict_detail(pull: dict[str, Any]) -> str:
+    queue = pull.get("merge_queue")
+    if not isinstance(queue, dict):
+        return "GitHub is processing this pull request in the merge queue."
+    position = queue.get("position")
+    position_text = (
+        f" It is position {position}." if isinstance(position, int) and not isinstance(position, bool) else ""
+    )
+    details = {
+        "awaiting-checks": "The merge queue is waiting for its checks to pass.",
+        "locked": "The merge queue is currently locked.",
+        "mergeable": "The merge queue reports this pull request as mergeable.",
+        "queued": "GitHub will merge this pull request when it reaches the front of the queue.",
+        "unmergeable": "The merge queue reports this pull request as unmergeable.",
+    }
+    state = queue.get("state")
+    default = "GitHub is processing this pull request in the merge queue."
+    detail = details.get(state, default) if isinstance(state, str) else default
+    return detail + position_text
+
+
 def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
     """Whether the selected PR can merge, and why not when it cannot.
 
@@ -866,10 +1027,10 @@ def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
     is blocking (the reason #80 left it unselected). ``short`` is the footer's
     one-word version.
 
-    The rungs are ordered by who can clear the block: a state only the author can
-    change (draft, conflicts) outranks one a reviewer owns, which outranks one CI
-    will resolve on its own. First match wins, so the pane always names the thing
-    to do next rather than the worst thing that is true.
+    The rungs are ordered by who can clear the block: draft outranks active
+    merge-queue state, which outranks ordinary PR checks and review. First match
+    wins, so the pane always names the thing to do next rather than the worst
+    thing that is true.
     """
     buckets = _check_buckets(pull.get("checks")) or {k: [] for k in ("failing", "running", "queued", "passing")}
     base = pull.get("base") or "the base branch"
@@ -879,14 +1040,28 @@ def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
     def plural(count: int) -> str:
         return "check" if count == 1 else "checks"
 
+    queue_visual = _queue_label(pull) or ("git-merge", "neutral", "in merge queue")
     ladder: tuple[tuple[bool, dict[str, Any]], ...] = (
         (
             _is_merged(pull),
             _verdict("Merged", f"This PR is merged into {base}.", (_ICON_MERGED, "neutral"), "merged"),
         ),
         (
+            _is_closed(pull),
+            _verdict("Closed", "This PR was closed without merging.", ("circle-x", "neutral"), "closed"),
+        ),
+        (
             bool(pull.get("draft")),
             _verdict("Draft", "Mark the PR ready for review to merge it.", (_ICON_DRAFT, "warn"), "draft"),
+        ),
+        (
+            pull.get("merge_queue") is not None,
+            _verdict(
+                queue_visual[2].capitalize(),
+                _queue_verdict_detail(pull),
+                queue_visual[:2],
+                "in queue",
+            ),
         ),
         (
             pull.get("merge_state") == "conflicts",
@@ -943,6 +1118,15 @@ def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
             ),
         ),
         (
+            pull.get("review_state") == "partially-approved",
+            _verdict(
+                "Awaiting more approvals",
+                "Approved so far, but another reviewer or code owner group has yet to approve.",
+                _REVIEW_VISUAL["partially-approved"][:2],
+                "partially approved",
+            ),
+        ),
+        (
             pull.get("review_state") == "approved",
             _verdict(
                 "Ready to merge",
@@ -967,11 +1151,23 @@ def _merge_verdict(pull: dict[str, Any]) -> dict[str, Any]:
 
 
 def _merge_callout(pull: dict[str, Any]) -> dict[str, Any]:
-    """The pane's headline verdict card. Its button is deliberately not a merge:
-    this plugin is read-only, so a mergeable PR gets a link out to GitHub and a
-    blocked one gets an inert button naming the block."""
+    """The headline verdict and its outbound action. This plugin is read-only:
+    a queued PR links to GitHub's queue, a directly mergeable PR links to GitHub,
+    and a blocked one gets an inert button.
+    """
     verdict = _merge_verdict(pull)
-    if verdict["ready"] and pull.get("url"):
+    queue = pull.get("merge_queue")
+    queue_url = queue.get("url") if isinstance(queue, dict) else None
+    if isinstance(queue, dict) and isinstance(queue_url, str) and queue_url:
+        action: dict[str, Any] = {
+            "kind": "action",
+            "label": "View queue on GitHub",
+            "variant": "primary",
+            "icon": "git-merge",
+            "href": queue_url,
+            "tooltip": "Opens this pull request's merge queue on GitHub.",
+        }
+    elif verdict["ready"] and pull.get("url"):
         action = {
             "kind": "action",
             "label": "Merge on GitHub",
@@ -992,12 +1188,102 @@ def _merge_callout(pull: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _stack_member_status(member: dict[str, Any]) -> tuple[str, str]:
+    if _is_merged(member):
+        return "merged", "success"
+    if member.get("state") == "closed":
+        return "closed", "danger"
+    if member.get("draft") is True:
+        return "draft", "danger"
+    status = member.get("mergeable_state")
+    if status == "clean":
+        return "clean", "success"
+    if status in ("dirty", "blocked", "behind", "unstable", "has_hooks"):
+        tone = "danger" if status in ("dirty", "blocked") else "warn"
+        return status, tone
+    return status if isinstance(status, str) else "unknown", "warn"
+
+
+def _stack_rows(repo: dict[str, Any], stack: list[Any], position: int) -> tuple[list[dict[str, Any]], list[str], bool]:
+    rows: list[dict[str, Any]] = []
+    blockers: list[str] = []
+    unknown = False
+    for index, member in enumerate(stack):
+        if not isinstance(member, dict):
+            if index <= position:
+                unknown = True
+            continue
+        member_number = member.get("number")
+        status, tone = _stack_member_status(member)
+        if index <= position and not _is_merged(member):
+            if tone == "danger":
+                blockers.append(f"#{member_number}")
+            elif tone == "warn":
+                unknown = True
+        row: dict[str, Any] = {
+            "kind": "row",
+            "prefix": f"#{member_number}",
+            "label": member.get("title") or "",
+            "value": status,
+            "value_tone": tone,
+            "method": SELECT_METHOD,
+            "params": {"pr": _pull_key(repo, member)},
+            "selected": index == position,
+        }
+        if member.get("url"):
+            row["href"] = member["url"]
+        if member.get("head"):
+            row["sublabel"] = str(member["head"])
+        rows.append(row)
+    return rows, blockers, unknown
+
+
+def _stack_section(repo: dict[str, Any], pull: dict[str, Any]) -> dict[str, Any] | None:
+    """Stack map and mergeability through the selected PR, from bottom upward."""
+    stack = pull.get("stack")
+    if not isinstance(stack, list) or len(stack) < 2:
+        return None
+    number = pull.get("number")
+    position = next(
+        (index for index, member in enumerate(stack) if isinstance(member, dict) and member.get("number") == number),
+        None,
+    )
+    if position is None:
+        return None
+
+    rows, blockers, unknown = _stack_rows(repo, stack, position)
+    prefix = [member for member in stack[: position + 1] if isinstance(member, dict)]
+    if prefix and all(_is_merged(member) for member in prefix):
+        summary, tone = "Already merged", "neutral"
+    elif blockers:
+        summary, tone = f"Blocked at {', '.join(blockers)}", "danger"
+    elif unknown:
+        summary, tone = "Mergeability unknown", "warn"
+    else:
+        summary, tone = "Mergeable through this PR", "success"
+    rows.insert(0, {"kind": "row", "label": "Stack readiness", "value": summary, "value_tone": tone})
+    return {
+        "kind": "section",
+        "title": f"Stack · PR {position + 1} of {len(stack)}",
+        "boxed": True,
+        "children": rows,
+    }
+
+
 def _pull_detail_blocks(pull: dict[str, Any]) -> list[dict[str, Any]]:
-    """The selected PR's detail stack: verdict, reviewers, checks, diff/linked, and
-    recent activity. A merged PR keeps only its verdict and activity: its review
-    decision and CI rollup are history, not something to act on."""
+    """Selected PR details; stack-only entries deliberately omit unqueried review verdicts."""
+    if pull.get("stack_only"):
+        return [
+            {
+                "kind": "note",
+                "tone": "warn",
+                "text": (
+                    "Review and CI details are not loaded for this stack member. Open the PR on GitHub for full status."
+                ),
+            }
+        ]
     blocks: list[dict[str, Any]] = [_merge_callout(pull)]
-    if not _is_merged(pull):
+    if not _is_merged(pull) and not _is_closed(pull):
         candidates = (
             _review_section(pull),
             _checks_section(pull.get("checks")),
@@ -1141,6 +1427,31 @@ def _resolve_selection(
     return pulls[0]
 
 
+def _auth_notes(repos: list[dict[str, Any]], auth: dict[str, Any]) -> list[dict[str, Any]]:
+    """Show each relevant host's authentication hint at most once."""
+    notes: list[dict[str, Any]] = []
+    noted: set[str] = set()
+    for repo in repos:
+        name = repo.get("host") or "github.com"
+        if name in noted or (auth.get(name) or {}).get("present", True):
+            continue
+        noted.add(name)
+        if name == "github.com":
+            notes.append(dict(_TOKEN_NOTE))
+        else:
+            host = GitHubHost.enterprise(name)
+            notes.append(
+                {
+                    "kind": "note",
+                    "tone": "warn",
+                    "text": (
+                        f"No token for {name}: showing open PRs only. Run: {host.login_hint}. Or {host.token_hint}."
+                    ),
+                }
+            )
+    return notes
+
+
 def _pane_blocks(
     repos: list[dict[str, Any]],
     *,
@@ -1164,25 +1475,7 @@ def _pane_blocks(
     pulls = _session_pulls(repos)
     selection = _resolve_selection(pulls, selected_key)
     relevant = [selection[0]] if selection is not None else [r for r in repos if r.get("repo")]
-    noted: set[str] = set()
-    for repo in relevant:
-        name = repo.get("host") or "github.com"
-        if name in noted or (auth.get(name) or {}).get("present", True):
-            continue
-        noted.add(name)
-        if name == "github.com":
-            head.append(dict(_TOKEN_NOTE))
-        else:
-            host = GitHubHost.enterprise(name)
-            head.append(
-                {
-                    "kind": "note",
-                    "tone": "warn",
-                    "text": (
-                        f"No token for {name}: showing open PRs only. Run: {host.login_hint}. Or {host.token_hint}."
-                    ),
-                }
-            )
+    head.extend(_auth_notes(relevant, auth))
     tail = [{"kind": "divider"}, dict(_REFRESH_ACTION)]
 
     if not repos:
@@ -1207,6 +1500,9 @@ def _pane_blocks(
                 ],
             }
         )
+        stack = _stack_section(*selection)
+        if stack is not None:
+            middle.append(stack)
         middle.extend(_pull_detail_blocks(selection[1]))
 
     status_rows = _repo_status_rows(repos)
@@ -1240,7 +1536,7 @@ def _pane_footer(freshness: Any, selection: tuple[dict[str, Any], dict[str, Any]
             stale = freshness.get("stale") is True
             footer["text"] = f"last good refresh {at}" if stale else f"refreshed {at}"
             footer["icon"] = "clock" if stale else "refresh-cw"
-    if selection is not None:
+    if selection is not None and not selection[1].get("stack_only"):
         verdict = _merge_verdict(selection[1])
         footer["value"] = verdict["short"]
         footer["tone"] = verdict["tone"]
@@ -1252,6 +1548,7 @@ def snapshot_ui_state_params(
     *,
     chips_on: frozenset[str] = _ALL_CHIPS,
     show_column: bool = True,
+    dense_glyphs: bool = False,
     selected: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """``ui.state.set`` params for a refresh snapshot: per session, a ``row-badge``
@@ -1260,8 +1557,14 @@ def snapshot_ui_state_params(
     ``filter-facet`` entries. ``chips_on`` is the set
     of enabled chip categories (``review``/``ci``/``comments``); a disabled one is
     hidden from both the badge and the column. ``show_column`` False hides the
-    words while preserving the sort scalar. Pure and total: a missing/partial
-    snapshot yields no pushes rather than raising.
+    words while preserving the sort scalar. ``dense_glyphs`` is the dense
+    representation (``dense_row_badge_glyphs``): every badge chip carries a
+    one-character mark -- the terminal row renders ``text`` alone, since it paints
+    no icons, while the web chip renders it beside its ``icon`` -- and the
+    row-column drops its words while keeping ``sort_value``/``filter_values``, so
+    the row is marks and a sort scalar. Off by default, which is byte-for-byte the
+    payload the web row renders. Pure and total: a missing/partial snapshot yields
+    no pushes rather than raising.
     """
     raw_sessions = snapshot.get("sessions")
     if not isinstance(raw_sessions, list):
@@ -1283,8 +1586,8 @@ def snapshot_ui_state_params(
         # is the always-present anchor (unlike the row-column, which the
         # show_status_text toggle can clear). Reuse the column's winner so the
         # icon, the words, and the opened PR all agree.
-        badge_payload: dict[str, Any] = {"items": _badge_items(repos, chips_on)}
-        status_payload = _status_column(repos, chips_on, show_text=show_column)
+        badge_payload: dict[str, Any] = {"items": _badge_items(repos, chips_on, dense=dense_glyphs)}
+        status_payload = _status_column(repos, chips_on, show_text=show_column and not dense_glyphs)
         primary_href = _status_href(repos, chips_on)
         if primary_href:
             badge_payload["href"] = primary_href

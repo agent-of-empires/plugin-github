@@ -70,6 +70,11 @@ CHIP_SETTING_KEYS = {
 # Toggle for the row-column status-text cell (the words summary). Off keeps the
 # badge icons but clears the text. Defaults on.
 STATUS_TEXT_SETTING_KEY = "show_status_text"
+# Dense session-row representation: one-character marks on each badge chip and no
+# row-column words -- the shape the Linear plugin's row badge ships. Off by default
+# so the payload stays what main shipped; the payload is shared, so with it on the
+# web chip shows the mark beside its icon. Resolved in run().
+DENSE_GLYPHS_SETTING_KEY = "dense_row_badge_glyphs"
 IGNORE_SUBMODULES_SETTING_KEY = "ignore_submodules"
 # Toggle for the CI rollup semantics. Defaults off so existing row attention
 # keeps treating every failing check as actionable unless the user opts in.
@@ -81,16 +86,22 @@ DEFAULT_IGNORED_COMMENTERS = "coderabbitai, codecov"
 # Off by default: a stale CHANGES_REQUESTED still reads "pushed since review"
 # (with an approval hint) even when another reviewer approved the current head.
 APPROVED_OVERRIDES_STALE_BLOCK_SETTING_KEY = "approved_overrides_stale_block"
+# Off by default (opt-in): a bot's COMMENTED review whose body literally
+# recommends approval ("Recommendation: Approve") counts like any other comment
+# unless the user enables the setting, which stops such a review from making
+# the PR read "commented".
+IGNORE_BOT_APPROVAL_RECOMMENDATIONS_SETTING_KEY = "ignore_bot_approval_recommendations"
 # The pane's PR selector fires this with the clicked row's `params` (`{"pr": key}`);
 # `uistate.SELECT_METHOD` is the same name on the block-building side.
 SELECT_PR_METHOD = uistate.SELECT_METHOD
-# Default NETWORK poll interval. Sized so worst-case (every key changes every
-# tick, so each spends a REST + a GraphQL query) stays well under the user's
-# shared 5000/hr budgets: at 120s a 20-key workspace tops out around 600 REST
-# req/hr and ~600 GraphQL queries/hr, a small fraction of either limit. In the
-# common steady state the REST conditional check returns 304 (free) and no
-# GraphQL fires, so the real cost is far lower. The fast local session tick
-# (SESSION_POLL_SECS) stays separate and unthrottled. See refresh.py and README.
+# Default NETWORK poll interval. The primary PR-list + rich-query estimate below
+# assumes every key changes every tick: at 120s a 20-key workspace makes ~600
+# REST requests/hr and ~600 GraphQL queries/hr. It excludes token-gated native
+# stack lookups, which add REST calls as their five-minute cache expires and use
+# a separate retry cooldown. In unchanged primary state, REST returns 304 and
+# rich GraphQL fetches are gated by digest/freshness ceilings. The fast local
+# session tick (SESSION_POLL_SECS) stays separate and unthrottled. See refresh.py
+# and README.
 DEFAULT_REFRESH_SECS = 120
 # A wedged host must never freeze the worker: outbound host RPCs time out and
 # the caller falls back (default interval, empty session list).
@@ -232,9 +243,13 @@ class Runtime:
         self._chip_flags: frozenset[str] = frozenset(CHIP_SETTING_KEYS.values())
         # Whether the row-column status text is shown; resolved in run(), on until.
         self._show_status_text = True
+        # Whether the row is the dense form (one-char marks, no words); resolved in
+        # run(), off until then so the default payload matches main.
+        self._dense_glyphs = False
         self._ignore_submodules = True
         self._required_checks_only = False
         self._approved_overrides_stale_block = False
+        self._ignore_bot_approval_recommendations = False
         self._ignored_commenters = graphql.parse_ignored_commenters(DEFAULT_IGNORED_COMMENTERS)
         self._next_network: float | None = None
         self._next_poll: float | None = None
@@ -376,6 +391,7 @@ class Runtime:
             snapshot,
             chips_on=self._chip_flags,
             show_column=self._show_status_text,
+            dense_glyphs=self._dense_glyphs,
             selected=self._selected_pr,
         ):
             sid = params.get("session_id")
@@ -452,6 +468,7 @@ class Runtime:
             self._required_checks_only = self.resolve_required_checks_only()
             self._ignored_commenters = self.resolve_ignored_commenters()
             self._approved_overrides_stale_block = self.resolve_approved_overrides_stale_block()
+            self._ignore_bot_approval_recommendations = self.resolve_ignore_bot_approval_recommendations()
             snapshot = refresh.build_snapshot(
                 sessions,
                 env=self.env,
@@ -462,6 +479,7 @@ class Runtime:
                     required_checks_only=self._required_checks_only,
                     ignored_commenters=self._ignored_commenters,
                     approved_overrides_stale_block=self._approved_overrides_stale_block,
+                    ignore_bot_approval_recommendations=self._ignore_bot_approval_recommendations,
                 ),
             )
             current_ids = self._push_snapshot(snapshot)
@@ -512,7 +530,11 @@ class Runtime:
                 continue
             repos = session.get("workspace_repos")
             attached = (
-                tuple((repo.get("source_path"), repo.get("branch")) for repo in repos if isinstance(repo, dict))
+                tuple(
+                    (repo.get("source_path"), repo.get("branch"), repo.get("worktree_path"))
+                    for repo in repos
+                    if isinstance(repo, dict)
+                )
                 if isinstance(repos, list)
                 else ()
             )
@@ -542,6 +564,13 @@ class Runtime:
             category for key, category in CHIP_SETTING_KEYS.items() if self._setting_bool(key, default=True)
         )
 
+    def resolve_dense_glyphs(self) -> bool:
+        """Whether the session row uses the dense form (``dense_row_badge_glyphs``):
+        one-character marks on each badge chip and no row-column words. Off by
+        default so the shipped payload is unchanged; the payload is shared, so with
+        it on the web chip shows the same mark beside its icon."""
+        return self._setting_bool(DENSE_GLYPHS_SETTING_KEY, default=False)
+
     def resolve_ignore_submodules(self) -> bool:
         return self._setting_bool(IGNORE_SUBMODULES_SETTING_KEY, default=self._ignore_submodules)
 
@@ -551,6 +580,11 @@ class Runtime:
     def resolve_approved_overrides_stale_block(self) -> bool:
         return self._setting_bool(
             APPROVED_OVERRIDES_STALE_BLOCK_SETTING_KEY, default=self._approved_overrides_stale_block
+        )
+
+    def resolve_ignore_bot_approval_recommendations(self) -> bool:
+        return self._setting_bool(
+            IGNORE_BOT_APPROVAL_RECOMMENDATIONS_SETTING_KEY, default=self._ignore_bot_approval_recommendations
         )
 
     def resolve_ignored_commenters(self) -> frozenset[str]:
@@ -608,6 +642,7 @@ class Runtime:
         # row reflects the user's choices, not the all-on default.
         self._chip_flags = self.resolve_chip_flags()
         self._show_status_text = self._setting_bool(STATUS_TEXT_SETTING_KEY, default=True)
+        self._dense_glyphs = self.resolve_dense_glyphs()
         self._ignore_submodules = self.resolve_ignore_submodules()
         self._required_checks_only = self.resolve_required_checks_only()
         # Paint last-known data instantly from the persisted snapshot, then run

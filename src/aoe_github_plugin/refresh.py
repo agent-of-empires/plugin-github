@@ -13,8 +13,8 @@ Efficiency, against the user token's shared budget (REST 5000 req/hr, GraphQL
 - repos are deduplicated by ``(host, owner, repo, branch)`` so a branch shared across
   sessions/workspaces is fetched once per refresh;
 - a cheap REST conditional request (ETag / ``If-None-Match``) is the PRIMARY
-  poll; a ``304`` does not count against the primary rate limit, so a steady
-  state where nothing changed costs ~0;
+  open-PR poll; a ``304`` is free, so that path costs ~0 when unchanged (native
+  stack enrichment is separate and can add calls as its cache expires);
 - the expensive rich GraphQL query fires only when that conditional check
   reports a change, on an explicit (forced) refresh, on a cold cache, or when
   the cheap DIGEST query (#69) detects a change past the digest ceiling; the
@@ -24,8 +24,10 @@ Efficiency, against the user token's shared budget (REST 5000 req/hr, GraphQL
 - local git identity and the REST probes fan out on small bounded pools (#70);
   GraphQL queries stay serial to stay clear of the secondary/concurrency
   limits;
-- a ``403``/``429``/``RATE_LIMITED`` trips a short per-host backoff, during which
-  cached (stale) values are served instead of hammering the API.
+- a ``403``/``429``/``RATE_LIMITED`` on primary queries trips per-host backoff;
+  cached values are served instead of hammering the API;
+- native stack enrichment requires a token and uses its own cache and cooldown;
+  stack failures do not extend primary REST backoff.
 """
 
 from __future__ import annotations
@@ -56,6 +58,7 @@ from aoe_github_plugin.hosts import GitHubHost
 from aoe_github_plugin.hosts import discover_trusted_hosts
 from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import GitHubError
+from aoe_github_plugin.errors import NotFoundError
 from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.handlers import _resolve_optional_token
 from aoe_github_plugin.utils.gitctx import parse_owner_repo
@@ -129,7 +132,28 @@ BACKOFF_SECS = 60.0
 MAX_BACKOFF_SECS = 3600.0
 
 RepoKey = tuple[str, str, str, str]  # (host, owner, repo, branch)
-RichCacheKey = tuple[str, str, str, str, bool]
+# (host, owner, repo, branch, required_checks_only, ignore_bot_approval_recommendations).
+RichCacheKey = tuple[str, str, str, str, bool, bool]
+StackCacheKey = tuple[str, str, str, int]
+StackRepoKey = tuple[str, str, str]
+
+
+class _UnsupportedStackEndpointError(Exception):
+    """The repository does not expose GitHub's native stack endpoint."""
+
+
+@dataclass(frozen=True)
+class _NormalizeFlags:
+    """The two normalize-time booleans that affect a pull's review/CI state and
+    therefore the rich-cache key: passing them as one object keeps the fetch
+    pipeline signatures under Ruff's PLR0913 arg cap and forces every cache-key
+    site to consider both (so toggling either invalidates a cached pull)."""
+
+    required_checks_only: bool = False
+    ignore_bot_approval_recommendations: bool = False
+
+
+DEFAULT_NORMALIZE_FLAGS = _NormalizeFlags()
 
 
 @dataclass(frozen=True)
@@ -138,6 +162,7 @@ class SnapshotSettings:
     required_checks_only: bool = False
     ignored_commenters: frozenset[str] = frozenset()
     approved_overrides_stale_block: bool = False
+    ignore_bot_approval_recommendations: bool = False
 
 
 DEFAULT_SNAPSHOT_SETTINGS = SnapshotSettings()
@@ -149,6 +174,17 @@ _etag_cache: dict[RepoKey, dict[str, Any]] = {}  # key -> {"etag", "pulls"}
 # Last-good rich (GraphQL) result per key: {"pulls", "fetched_at"}. Serves the
 # TTL window and is the stale fallback while rate-limited.
 _graphql_cache: dict[RichCacheKey, dict[str, Any]] = {}
+# Last successful stack response per PR. The REST stack endpoint is separate
+# from the conditional open-PR poll, so bound its refresh cadence independently.
+_stack_cache: dict[StackCacheKey, dict[str, Any]] = {}
+STACK_CACHE_TTL = 300.0
+# Isolate the optional stack endpoint from primary open-PR polling.
+STACK_RETRY_COOLDOWN = 300.0
+_stack_backoff: dict[str, float] = defaultdict(float)
+# Some repositories do not support the native stack endpoint.
+STACK_UNSUPPORTED_TTL = 3600.0
+_stack_unsupported: dict[StackRepoKey, float] = {}
+STACK_API_VERSION = "2026-03-10"
 # Last successful full refresh per session id, scoped to the repo-key set so a
 # changed workspace never inherits a timestamp from unrelated data.
 _session_refresh_cache: dict[str, dict[str, Any]] = {}
@@ -312,7 +348,7 @@ def _identify(
 
 
 def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> list[tuple[str, str | None]]:
-    """Return checkout/branch pairs, preferring usable host metadata."""
+    """Return checkout/branch pairs, preferring usable host metadata. A ``None`` branch means "read live HEAD"."""
     workspace_repos = session.get("workspace_repos")
     if isinstance(workspace_repos, list) and workspace_repos:
         checkouts: list[tuple[str, str | None]] = []
@@ -320,12 +356,17 @@ def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> l
         for repo in workspace_repos:
             if not isinstance(repo, dict) or not isinstance(repo.get("source_path"), str) or not repo["source_path"]:
                 continue
-            checkout = repo["source_path"]
+            # A host that sends ``worktree_path`` names the checkout the session works in: read its live
+            # branch (the stored one is the branch at workspace creation). Older hosts keep the stored branch.
+            worktree = repo.get("worktree_path")
+            if isinstance(worktree, str) and worktree:
+                checkout, branch = worktree, None
+            else:
+                checkout, branch = repo["source_path"], repo.get("branch")
+                if not isinstance(branch, str) or not branch:
+                    continue
             top = _git(checkout, "rev-parse", "--show-toplevel")
             if not top or os.path.realpath(top) != os.path.realpath(checkout):
-                continue
-            branch = repo.get("branch")
-            if not isinstance(branch, str) or not branch:
                 continue
             key = (os.path.realpath(checkout), branch)
             if key not in seen:
@@ -353,6 +394,312 @@ def _trim(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for pr in raw
         if isinstance(pr, dict)
     ]
+
+
+def _stack_pull(raw: dict[str, Any], owner: str, repo: str, *, web_base: str) -> dict[str, Any] | None:
+    """Trim one full REST PR response for stack navigation and readiness."""
+    number = raw.get("number")
+    head = raw.get("head")
+    base = raw.get("base")
+    mergeable_state = raw.get("mergeable_state")
+    if not isinstance(number, int) or isinstance(number, bool):
+        return None
+    return {
+        "number": number,
+        "url": raw.get("html_url") or f"{web_base}/{owner}/{repo}/pull/{number}",
+        "title": raw.get("title") or "",
+        "state": raw.get("state"),
+        "draft": bool(raw.get("draft")),
+        "merged": raw.get("merged_at") is not None,
+        "mergeable_state": mergeable_state if isinstance(mergeable_state, str) else None,
+        "head": (head.get("ref") if isinstance(head, dict) else None),
+        "base": (base.get("ref") if isinstance(base, dict) else None),
+    }
+
+
+def _stack_for_number(response: list[Any], number: int) -> dict[str, Any] | None:
+    return next(
+        (
+            item
+            for item in response
+            if isinstance(item, dict)
+            and isinstance(item.get("pull_requests"), list)
+            and any(isinstance(member, dict) and member.get("number") == number for member in item["pull_requests"])
+        ),
+        None,
+    )
+
+
+def _fetch_stack_members(client: GitHubClient, key: RepoKey, members: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(members, list) or not members:
+        return None
+    pulls: list[dict[str, Any]] = []
+    for member in members:
+        if not isinstance(member, dict):
+            return None
+        number = member.get("number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            return None
+        raw = client.get_json(
+            f"/repos/{key[1]}/{key[2]}/pulls/{number}",
+            api_version=STACK_API_VERSION,
+        )
+        if not isinstance(raw, dict):
+            return None
+        trimmed = _stack_pull(raw, key[1], key[2], web_base=client.host.web_base)
+        if trimmed is None:
+            return None
+        pulls.append(trimmed)
+    return pulls
+
+
+def _cache_stack(key: StackCacheKey, pulls: list[dict[str, Any]], fetched_at: float) -> None:
+    member_numbers = {pull["number"] for pull in pulls}
+    with _cache_lock:
+        previous = _stack_cache.get(key)
+        previous_pulls = previous.get("pulls") if previous is not None else None
+        if isinstance(previous_pulls, list):
+            for member in previous_pulls:
+                old_key = (*key[:3], member["number"])
+                entry = _stack_cache.get(old_key)
+                if (
+                    member["number"] not in member_numbers
+                    and entry is not None
+                    and entry.get("pulls") is previous_pulls
+                ):
+                    del _stack_cache[old_key]
+
+        entry = {
+            "pulls": pulls,
+            "fetched_at": fetched_at,
+            "retry_at": 0.0,
+            "ttl": STACK_CACHE_TTL,
+            "stale": False,
+        }
+        if pulls:
+            for pull in pulls:
+                _stack_cache[(*key[:3], pull["number"])] = entry
+        else:
+            _stack_cache[key] = entry
+
+
+def _stale_stack(
+    cache_key: StackCacheKey,
+    cached: dict[str, Any] | None,
+    now: float,
+) -> list[dict[str, Any]] | None:
+    if cached is None:
+        with _cache_lock:
+            cached = _stack_cache.setdefault(
+                cache_key,
+                {
+                    "pulls": None,
+                    "fetched_at": 0.0,
+                    "retry_at": now + STACK_CACHE_TTL,
+                    "ttl": STACK_CACHE_TTL,
+                    "stale": False,
+                },
+            )
+    pulls = cached["pulls"]
+    with _cache_lock:
+        cached["retry_at"] = now + STACK_CACHE_TTL
+        if pulls is not None:
+            cached["stale"] = True
+            for member in pulls:
+                member_key = (*cache_key[:3], member["number"])
+                entry = _stack_cache.get(member_key)
+                if entry is not None and entry.get("pulls") is pulls:
+                    entry["retry_at"] = now + STACK_CACHE_TTL
+                    entry["stale"] = True
+    return pulls
+
+
+def _fetch_stack_with_state(
+    client: GitHubClient,
+    key: RepoKey,
+    number: int,
+    *,
+    force: bool = False,
+) -> tuple[list[dict[str, Any]] | None, bool]:
+    """Return stack data and whether it is stale fallback data."""
+    cache_key: StackCacheKey = (*key[:3], number)
+    now = time.monotonic()
+    with _cache_lock:
+        cached = _stack_cache.get(cache_key)
+    shortcut = _stack_cache_shortcut(cache_key, cached, now)
+    if shortcut is not None:
+        return shortcut
+    if cached is not None and not force and now - cached["fetched_at"] < cached.get("ttl", STACK_CACHE_TTL):
+        return cached["pulls"], False
+
+    try:
+        pulls = _fetch_stack_response(client, key, number)
+    except RateLimitedError:
+        _set_stack_backoff(now, host=key[0])
+        pulls = None
+    except _UnsupportedStackEndpointError:
+        with _cache_lock:
+            _stack_unsupported[key[:3]] = now + STACK_UNSUPPORTED_TTL
+        pulls = None
+    except GitHubError:
+        pulls = None
+    if pulls is None:
+        stale_pulls = _stale_stack(cache_key, cached, now)
+        return stale_pulls, stale_pulls is not None
+    _cache_stack(cache_key, pulls, now)
+    return pulls, False
+
+
+def _stack_cache_is_stale(cached: dict[str, Any], now: float) -> bool:
+    return cached.get("stale", False) or now - cached["fetched_at"] >= cached.get("ttl", STACK_CACHE_TTL)
+
+
+def _stack_cache_result(cached: dict[str, Any] | None, now: float) -> tuple[list[dict[str, Any]] | None, bool]:
+    if cached is None:
+        return None, False
+    pulls = cached["pulls"]
+    return pulls, pulls is not None and _stack_cache_is_stale(cached, now)
+
+
+def _stack_cache_shortcut(
+    cache_key: StackCacheKey,
+    cached: dict[str, Any] | None,
+    now: float,
+) -> tuple[list[dict[str, Any]] | None, bool] | None:
+    repo_key = cache_key[:3]
+    with _cache_lock:
+        blocked = now < _backoff[cache_key[0]]["rest"]["until"] or now < _stack_backoff[cache_key[0]]
+        unsupported_until = _stack_unsupported.get(repo_key)
+        if unsupported_until is not None and unsupported_until <= now:
+            del _stack_unsupported[repo_key]
+            unsupported_until = None
+    if blocked:
+        return _stack_cache_result(cached, now)
+    if unsupported_until is not None:
+        if cached is not None and not _stack_cache_is_stale(cached, now):
+            return cached["pulls"], False
+        stale_pulls = _stale_stack(cache_key, cached, now)
+        return stale_pulls, stale_pulls is not None
+    if cached is not None and now < cached.get("retry_at", 0.0):
+        return _stack_cache_result(cached, now)
+    return None
+
+
+def _set_stack_backoff(now: float, *, host: str) -> None:
+    with _cache_lock:
+        _stack_backoff[host] = max(_stack_backoff[host], now + STACK_RETRY_COOLDOWN)
+
+
+def _fetch_stack_response(client: GitHubClient, key: RepoKey, number: int) -> list[dict[str, Any]] | None:
+    try:
+        response = client.get_json(
+            f"/repos/{key[1]}/{key[2]}/stacks",
+            {"pull_request": str(number)},
+            api_version=STACK_API_VERSION,
+        )
+    except NotFoundError as exc:
+        raise _UnsupportedStackEndpointError from exc
+    if not isinstance(response, list):
+        return None
+    stack = _stack_for_number(response, number)
+    if stack is None:
+        return []
+    return _fetch_stack_members(client, key, stack.get("pull_requests"))
+
+
+def _fetch_stack(
+    client: GitHubClient,
+    key: RepoKey,
+    number: int,
+    *,
+    force: bool = False,
+) -> list[dict[str, Any]] | None:
+    pulls, _stale = _fetch_stack_with_state(client, key, number, force=force)
+    return pulls
+
+
+def _attach_stack_members(
+    stack: list[dict[str, Any]],
+    pulls: list[dict[str, Any]],
+    pulls_by_number: dict[int, dict[str, Any]],
+) -> None:
+    for member in stack:
+        existing = pulls_by_number.get(member["number"])
+        if existing is None:
+            existing = dict(member, stack=stack, stack_only=True)
+            pulls.append(existing)
+            pulls_by_number[member["number"]] = existing
+        else:
+            existing["stack"] = stack
+            existing["mergeable_state"] = member["mergeable_state"]
+
+
+def _fetch_stack_for_pull(
+    client: GitHubClient,
+    key: RepoKey,
+    pull: dict[str, Any],
+    refreshed: set[StackCacheKey],
+    *,
+    force: bool,
+) -> tuple[list[dict[str, Any]] | None, bool]:
+    number = pull.get("number")
+    if not isinstance(number, int) or isinstance(number, bool):
+        return None, False
+    cache_key = (*key[:3], number)
+    stack, stale = _fetch_stack_with_state(
+        client,
+        key,
+        number,
+        force=force and cache_key not in refreshed,
+    )
+    if stack:
+        refreshed.update((*key[:3], member["number"]) for member in stack)
+    return stack, stale
+
+
+def _attach_stack_for_pull(
+    pull: dict[str, Any],
+    stack: list[dict[str, Any]] | None,
+    pulls: list[dict[str, Any]],
+    pulls_by_number: dict[int, dict[str, Any]],
+) -> None:
+    if stack is None:
+        return
+    if not stack:
+        pull["stack"] = []
+        return
+    _attach_stack_members(stack, pulls, pulls_by_number)
+
+
+def _attach_stacks(
+    client: GitHubClient,
+    keys: list[RepoKey],
+    results: dict[RepoKey, dict[str, Any]],
+    *,
+    force: bool,
+) -> None:
+    refreshed: set[StackCacheKey] = set()
+    for key in keys:
+        result = results.get(key)
+        if not isinstance(result, dict):
+            continue
+        raw_pulls = result.get("pulls")
+        if not isinstance(raw_pulls, list):
+            continue
+        pulls = [dict(pull) for pull in raw_pulls if isinstance(pull, dict)]
+        result["pulls"] = pulls
+        pulls_by_number = {
+            pull["number"]: pull
+            for pull in pulls
+            if isinstance(pull, dict)
+            and isinstance(pull.get("number"), int)
+            and not isinstance(pull.get("number"), bool)
+        }
+        for pull in list(pulls):
+            stack, stale = _fetch_stack_for_pull(client, key, pull, refreshed, force=force)
+            if stale:
+                result["_stale"] = True
+            _attach_stack_for_pull(pull, stack, pulls, pulls_by_number)
 
 
 def _reset_to_monotonic(reset_at: Any) -> float | None:
@@ -546,20 +893,20 @@ def _error_entry(exc: GitHubError) -> dict[str, Any]:
     return {"error": {"kind": exc.kind, "hint": str(exc)}, "_fresh": False, "_stale": True}
 
 
-def _rich_cache_key(key: RepoKey, *, required_checks_only: bool) -> RichCacheKey:
+def _rich_cache_key(key: RepoKey, *, flags: _NormalizeFlags) -> RichCacheKey:
     host, owner, repo, branch = key
-    return host, owner, repo, branch, required_checks_only
+    return host, owner, repo, branch, flags.required_checks_only, flags.ignore_bot_approval_recommendations
 
 
 def _is_active(pulls: list[dict[str, Any]]) -> bool:
-    """A branch's cached rich state is ACTIVE when a non-merged PR has a CI check
-    running or queued (#26). That state finishes in seconds yet does not bump the
-    ``/pulls`` ETag, so it earns the shorter staleness ceiling. A PR merely
-    awaiting review is deliberately NOT active: it can idle for days, so polling
-    it every tick would burn budget for no signal."""
+    """A branch is ACTIVE when a non-merged PR has running CI or is in a merge
+    queue. Those transitions can happen without the REST pull-list ETag changing,
+    so they earn the shorter staleness ceiling."""
     for pull in pulls:
         if pull.get("merged"):
             continue
+        if pull.get("merge_queue") is not None:
+            return True
         checks = pull.get("checks")
         if not isinstance(checks, dict):
             continue
@@ -749,7 +1096,7 @@ def _apply_aliases(
     pending: dict[RepoKey, dict[str, Any]],
     data: dict[str, Any],
     *,
-    required_checks_only: bool,
+    flags: _NormalizeFlags,
 ) -> dict[RepoKey, dict[str, Any]]:
     """Normalize each alias connection back into its key's cache + result. A failed
     (named in ``errors[].path``) or malformed alias falls back per key (and arms
@@ -773,8 +1120,12 @@ def _apply_aliases(
         for node in conn.get("nodes") or []:
             if isinstance(node, dict):
                 _paginate_threads(client, node)
-        pulls = graphql.normalize_connection(conn, required_checks_only=required_checks_only)
-        cache_key = _rich_cache_key(key, required_checks_only=required_checks_only)
+        pulls = graphql.normalize_connection(
+            conn,
+            required_checks_only=flags.required_checks_only,
+            ignore_bot_approval_recommendations=flags.ignore_bot_approval_recommendations,
+        )
+        cache_key = _rich_cache_key(key, flags=flags)
         with _cache_lock:
             _graphql_cache[cache_key] = {
                 "pulls": pulls,
@@ -793,7 +1144,7 @@ def _fetch_chunk(
     pending: dict[RepoKey, dict[str, Any]],
     out: dict[RepoKey, dict[str, Any]],
     *,
-    required_checks_only: bool,
+    flags: _NormalizeFlags,
 ) -> None:
     """One batched GraphQL query for up to ``MAX_GRAPHQL_ALIASES`` branches of one
     repo (#25), aliased ``b0:``/``b1:``/... ``chunk`` is non-empty and all keys
@@ -838,7 +1189,7 @@ def _fetch_chunk(
     if not isinstance(repository, dict):
         _resolve_null_repository(chunk, pending, data, out)
         return
-    out.update(_apply_aliases(client, chunk, pending, data, required_checks_only=required_checks_only))
+    out.update(_apply_aliases(client, chunk, pending, data, flags=flags))
 
 
 def _apply_digest_aliases(
@@ -959,7 +1310,7 @@ def _run_chunked(
 
 
 def _fetch_rich(
-    client: GitHubClient, keys: list[RepoKey], *, force: bool, required_checks_only: bool
+    client: GitHubClient, keys: list[RepoKey], *, force: bool, flags: _NormalizeFlags
 ) -> dict[RepoKey, dict[str, Any]]:
     """Token path: a cheap REST conditional probe gates each key (#21), then a
     two-tier GraphQL pass (#69). Keys that are cold, forced, or REST-changed go
@@ -977,7 +1328,7 @@ def _fetch_rich(
     digest_pending: dict[RepoKey, dict[str, Any]] = {}
     probes = _probe_all(client, keys)
     for key in keys:
-        cache_key = _rich_cache_key(key, required_checks_only=required_checks_only)
+        cache_key = _rich_cache_key(key, flags=flags)
         with _cache_lock:
             rich = _graphql_cache.get(cache_key)
         probe = probes[key]
@@ -1013,7 +1364,7 @@ def _fetch_rich(
     )
     _run_chunked(
         full_pending,
-        lambda chunk: _fetch_chunk(client, chunk, full_pending, out, required_checks_only=required_checks_only),
+        lambda chunk: _fetch_chunk(client, chunk, full_pending, out, flags=flags),
         out,
     )
     return out
@@ -1060,7 +1411,7 @@ def _fetch_all(  # noqa: PLR0913 - explicit token, host, transport, and polling 
     transport: httpx.BaseTransport | None,
     *,
     force: bool = False,
-    required_checks_only: bool = False,
+    flags: _NormalizeFlags = DEFAULT_NORMALIZE_FLAGS,
     trusted: dict[str, GitHubHost],
 ) -> tuple[dict[RepoKey, dict[str, Any]], dict[str, bool]]:
     """Fetch every unique key. Returns ``(results, token_present_by_host)`` where results
@@ -1088,7 +1439,8 @@ def _fetch_all(  # noqa: PLR0913 - explicit token, host, transport, and polling 
         token = _resolve_optional_token(env, host)
         with GitHubClient(host=host, token=token, transport=transport) as client:
             if token is not None:
-                out = _fetch_rich(client, ordered, force=force, required_checks_only=required_checks_only)
+                out = _fetch_rich(client, ordered, force=force, flags=flags)
+                _attach_stacks(client, ordered, out, force=force)
             else:
                 with ThreadPoolExecutor(max_workers=REST_PROBE_WORKERS) as pool:
                     out = dict(zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True))
@@ -1150,7 +1502,10 @@ def build_snapshot(  # noqa: PLR0913 - explicit environment, transport, settings
         env,
         transport,
         force=force,
-        required_checks_only=settings.required_checks_only,
+        flags=_NormalizeFlags(
+            required_checks_only=settings.required_checks_only,
+            ignore_bot_approval_recommendations=settings.ignore_bot_approval_recommendations,
+        ),
         trusted=trusted,
     )
     refreshed_at = _utc_now_iso()

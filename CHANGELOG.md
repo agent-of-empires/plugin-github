@@ -11,6 +11,11 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - Support GitHub Enterprise Server alongside github.com, using hosts registered
   in GitHub CLI's `hosts.yml` and isolated credentials, caches and rate limits.
 
+### Bug Fixes
+
+- Rate-limit notifications are isolated per host; one server's active backoff
+  cannot suppress another server's notice.
+
 ### Compatibility
 
 - On github.com, `GH_TOKEN` now takes precedence over `GITHUB_TOKEN`, matching
@@ -20,13 +25,46 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - The snapshot cache moves to version 2; the first refresh after upgrading
   rebuilds the old cache.
 
+
+## [2.4.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.4.0) - 2026-11-03
+
+
+
+### Bug Fixes
+
+- **refresh:** Read live branch from worktree_path for multi-repo sessions in [#128](https://github.com/agent-of-empires/plugin-github/pull/128) by [@Seluj78](https://github.com/Seluj78) ([`1719eaa`](https://github.com/agent-of-empires/plugin-github/commit/1719eaa1c54070a6cc5e89d5c4da08e20e661229))
+- **review:** Show approved only when no other approval is outstanding in [#124](https://github.com/agent-of-empires/plugin-github/pull/124) by [@Seluj78](https://github.com/Seluj78) ([`f366781`](https://github.com/agent-of-empires/plugin-github/commit/f366781e4fb9fb9f325471703ac10511169391f1))
+
+
+### Features
+
+- **stacks:** Show native PR stack status and navigation in [#109](https://github.com/agent-of-empires/plugin-github/pull/109) by [@athal7](https://github.com/athal7) ([`8ea9c85`](https://github.com/agent-of-empires/plugin-github/commit/8ea9c85277fcc8164de4af384404756f8ed6d8e0))
+- **graphql:** Opt-in settings to ignore bot approval recommendations in [#131](https://github.com/agent-of-empires/plugin-github/pull/131) by [@athal7](https://github.com/athal7) ([`624512d`](https://github.com/agent-of-empires/plugin-github/commit/624512d5138f4236f2a138a92d72923a2e31a550))
+- **uistate:** Add opt-in one-character marks to row-badge chips in [#142](https://github.com/agent-of-empires/plugin-github/pull/142) by [@athal7](https://github.com/athal7) ([`93142f6`](https://github.com/agent-of-empires/plugin-github/commit/93142f697c56979380ed08e2e3bbe689de56e552))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.3.0...v2.4.0
+## [2.3.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.3.0) - 2026-10-21
+
+
+
+### Features
+
+- **ui:** Add a github_conflicts filter facet in [#114](https://github.com/agent-of-empires/plugin-github/pull/114) by [@Seluj78](https://github.com/Seluj78) ([`d2c6b99`](https://github.com/agent-of-empires/plugin-github/commit/d2c6b9914fe4f3f9d63660c62192c3e6b2c93853))
+- **ui:** Add approved_overrides_stale_block setting in [#118](https://github.com/agent-of-empires/plugin-github/pull/118) by [@Seluj78](https://github.com/Seluj78) ([`1efd21b`](https://github.com/agent-of-empires/plugin-github/commit/1efd21bd8a133e38b96e5318c06db7022a07a7fc))
+- **refresh:** Support multi-repository sessions in [#115](https://github.com/agent-of-empires/plugin-github/pull/115) by [@athal7](https://github.com/athal7) ([`0874785`](https://github.com/agent-of-empires/plugin-github/commit/08747853a09e9a381c0b7ffdb398200ba6997f58))
+- Add GitHub merge queue support in [#101](https://github.com/agent-of-empires/plugin-github/pull/101) by [@athal7](https://github.com/athal7) ([`75e6a01`](https://github.com/agent-of-empires/plugin-github/commit/75e6a01239e7556bbd4f0bdae7d92dc807339d09))
+- Add merge queue filter facet in [#120](https://github.com/agent-of-empires/plugin-github/pull/120) by [@Seluj78](https://github.com/Seluj78) ([`15521a0`](https://github.com/agent-of-empires/plugin-github/commit/15521a072dbe17f2771aac23cfe914b00fbc6a97))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.2.1...v2.3.0
 ## [2.2.1](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.2.1) - 2026-10-16
 
 
 
 ### Bug Fixes
 
-- **ui:** Do not count the PR author's own comments as commented in [#113](https://github.com/agent-of-empires/plugin-github/pull/113) by [@Seluj78](https://github.com/Seluj78)
+- **ui:** Do not count the PR author's own comments as commented in [#113](https://github.com/agent-of-empires/plugin-github/pull/113) by [@Seluj78](https://github.com/Seluj78) ([`0fec437`](https://github.com/agent-of-empires/plugin-github/commit/0fec4371fa8bed9a270645f32421df7df70af9f4))
 
 
 **Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.2.0...v2.2.1
@@ -36,7 +74,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Features
 
-- **ui:** Ignore bot commenters when inferring the commented state in [#112](https://github.com/agent-of-empires/plugin-github/pull/112) by [@Seluj78](https://github.com/Seluj78)
+- **ui:** Ignore bot commenters when inferring the commented state in [#112](https://github.com/agent-of-empires/plugin-github/pull/112) by [@Seluj78](https://github.com/Seluj78) ([`7e12c65`](https://github.com/agent-of-empires/plugin-github/commit/7e12c6550c847b721305bd3c5a27dae98b6ee4c1))
 
 
 **Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.1.0...v2.2.0
