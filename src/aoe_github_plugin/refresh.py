@@ -221,10 +221,12 @@ _retry_cooldown: dict[RichCacheKey, float] = {}
 GRAPHQL_TRUNCATED_RETRY = 1800.0
 _truncated_until: dict[RichCacheKey, float] = {}
 # Why an owned set stayed unproven. ``TRUNCATION_BOUNDED`` is a page certain to
-# truncate the same way (discovery exhausted its page bound), so the full query
-# cools for ``GRAPHQL_TRUNCATED_RETRY``. ``TRUNCATION_TRANSIENT`` is a one-off
-# request failure (a rate limit, a 5xx on a by-number fetch) that a short retry
-# covers, without withholding the rich shape for half an hour after one blip.
+# truncate the same way (discovery exhausted its page bound against this tick's
+# fresh REST probe), so the full query cools for ``GRAPHQL_TRUNCATED_RETRY``.
+# ``TRUNCATION_TRANSIENT`` is a one-off request failure (a rate limit, a 5xx on a
+# by-number fetch), or a page bound reached without a live probe to measure it,
+# that a short retry covers, without withholding the rich shape for half an hour
+# after one blip.
 TRUNCATION_BOUNDED = "bounded"
 TRUNCATION_TRANSIENT = "transient"
 
@@ -1242,9 +1244,10 @@ def _owned_connection(
 
     The caller serves the owner-scoped REST list instead of trusting (or
     caching) the rich page whenever ``reason`` is set, and cools the key by
-    reason: a bounded page deserves the long window, a transient failure only a
-    short retry. A REST-only collision never arms a cooldown, because a
-    collision is not a failure to retry.
+    reason: a bounded page measured against this tick's fresh probe deserves the
+    long window; a transient failure, or a bound reached while the probe was a
+    cache entry, only a short retry. A REST-only collision never arms a cooldown,
+    because a collision is not a failure to retry.
     """
     filtered = lookup.filter_connection(conn, key)
     # A final page is self-evident: ``hasNextPage: false`` says it holds every
@@ -1261,7 +1264,14 @@ def _owned_connection(
     # A backed-off probe is the last good list, not this tick's: a PR opened
     # since is absent from it, so it cannot stand in for a census. Fall through
     # to discovery, which proves ownership rather than trusting stale coverage.
-    return _discovered_connection(client, key, conn, filtered)
+    reason, resolved = _discovered_connection(client, key, conn, filtered)
+    if reason == TRUNCATION_BOUNDED and not rest_fresh:
+        # The crammed destination is real, but without a live probe this tick
+        # cannot know it will still be crammed on the next one. Cooling for the
+        # long window would withhold the rich shape on top of an already stale
+        # REST list, so this cools for the short retry instead.
+        return TRUNCATION_TRANSIENT, resolved
+    return reason, resolved
 
 
 def _discovered_connection(

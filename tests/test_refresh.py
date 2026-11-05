@@ -1973,7 +1973,7 @@ def test_digest_discovery_failure_serves_cache_without_full_query(tmp_path):
                 return httpx.Response(200, json={"data": {"rateLimit": {"remaining": 5000}, "repository": {}}})
             # A well-formed digest page that does NOT carry the owned PR (only
             # a foreign same-name head), so the REST probe's #7 is missing from
-            # it: discovery must run, and it is the only failure in play -- no
+            # it: discovery must run, and it is the only failure in play, with no
             # null-repository short circuit, no malformed alias.
             foreign = {**_gql_node(number=7), "headRepository": {"name": "r", "owner": {"login": "stranger"}}}
             body = {
@@ -2625,7 +2625,7 @@ def _branch_page_transport(head_oid, *, log, fail_full=False, promoted_crowded=F
         if digest_crowded:
             # A digest page full of foreign same-name PRs: it does not carry
             # the owned PR the REST probe lists, so ownership must go through
-            # discovery -- and that proof is what the promotion reuses.
+            # discovery, and that proof is what the promotion reuses.
             node = {**node, "headRepository": {"name": "r", "owner": {"login": "stranger"}}}
         return page([node], crowded=digest_crowded)
 
@@ -2910,7 +2910,7 @@ def test_rest_covered_crowded_page_serves_rich_without_discovery(tmp_path):
     answer when the REST probe lists exactly those PRs. Discovery on this name
     can never complete (foreign same-name PRs exhaust its page bound), so
     running it would discard the rich nodes the page already returned and
-    serve the basic REST shape for the whole truncation window -- on both the
+    serve the basic REST shape for the whole truncation window, on both the
     full and the digest tier."""
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -3137,10 +3137,12 @@ def test_owned_pr_off_crowded_page_fetched_by_number_without_discovery(tmp_path)
     assert refresh._truncated_until == {}
 
 
-def test_discovery_page_bound_arms_truncation_window(tmp_path):
-    """A discovery that exhausts its page bound is a page certain to truncate
-    the same way, so the full query cools for the long window while the REST
-    list is served. It is not a per-key transient failure."""
+def test_discovery_page_bound_on_cache_served_probe_cools_short(tmp_path):
+    """A discovery that exhausts its page bound is normally a page certain to
+    truncate the same way, but only this tick's live probe can establish that:
+    a backoff-served probe cannot say whether the crowding is still there. That
+    tick cools on the short retry instead of withholding the rich shape for the
+    long window on top of an already stale REST list."""
     ws = tmp_path / "ws"
     ws.mkdir()
     _make_repo(ws / "r")
@@ -3184,7 +3186,59 @@ def test_discovery_page_bound_arms_truncation_window(tmp_path):
     repo = snap["sessions"][0]["repos"][0]
     assert [p["number"] for p in repo["pulls"]] == [7]  # the REST list still lists it
     assert repo["error"] is None
-    assert refresh._truncated_until != {}
+    assert refresh._truncated_until == {}  # no long window without a live census
+    assert refresh._retry_cooldown != {}  # the short retry instead
+
+
+def test_discovery_page_bound_on_fresh_probe_arms_truncation_window(tmp_path):
+    """With this tick's REST probe live, a discovery that exhausts its page bound
+    is a page certain to truncate the same way, so the full query cools for the
+    long window while the fresh REST census is served. It is not a per-key
+    transient failure."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    kinds: list[str] = []
+
+    def handler(request):
+        if not _is_graphql(request):
+            return httpx.Response(200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=7)])
+        kinds.append(_graphql_kind(request))
+        if kinds[-1] == "discover":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                        "repository": {
+                            "pullRequests": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": "c"}}
+                        },
+                    }
+                },
+            )
+        # The page names an owned OPEN PR the probe does not list, so the two
+        # sources disagree and identity discovery has to arbitrate.
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "rateLimit": {"cost": 1, "remaining": 5000, "resetAt": "x"},
+                    "repository": {
+                        "b0": {
+                            "nodes": [_gql_node(number=5)],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "c"},
+                        }
+                    },
+                }
+            },
+        )
+
+    snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(handler))
+    repo = snap["sessions"][0]["repos"][0]
+    assert [p["number"] for p in repo["pulls"]] == [7]  # the fresh REST census is served
+    assert repo["error"] is None
+    assert refresh._truncated_until != {}  # certain to truncate again: long window
     assert refresh._retry_cooldown == {}
 
 
