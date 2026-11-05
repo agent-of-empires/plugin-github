@@ -388,8 +388,12 @@ def _passthrough(request, nodes, *, remaining=5000):
                     "rateLimit": rate,
                     "repository": {
                         "pullRequests": {
+                            # ``DISCOVER_QUERY`` selects ``state``, and only an
+                            # OPEN node is recoverable by number, so discovery
+                            # must report it the way the real server does.
                             "nodes": [
-                                {k: n.get(k) for k in ("number", "headRefName", "headRepository")} for n in present
+                                {k: n.get(k) for k in ("number", "state", "headRefName", "headRepository")}
+                                for n in present
                             ],
                             "pageInfo": {"hasNextPage": False, "endCursor": None},
                         }

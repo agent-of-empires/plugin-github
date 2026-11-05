@@ -491,9 +491,6 @@ def test_head_filter_pagination_is_bounded(tmp_path):
     assert len(pages) == lookup.MAX_PULL_PAGES
 
 
-_KEY = ("team", "r", "feature", "team", "team/r")
-
-
 class _StubClient:
     """Records GraphQL spends; its conditional probe answers 304 from the cache."""
 
@@ -503,8 +500,8 @@ class _StubClient:
         self.changed = changed
         self.asked = []
 
-    def post_json(self, path, payload, **_kwargs):
-        self.asked.append(payload)
+    def post_graphql(self, query, variables):
+        self.asked.append(variables)
         return {"data": {}}
 
     def get_json_conditional(self, path, params, etag):
@@ -514,10 +511,6 @@ class _StubClient:
         # 304 with a warm cache: the probe serves the cached list as stale.
         refresh._etag_cache[self.key] = {"etag": '"etag"', "pulls": self.cached_pulls}
         return 304, '"etag"', []
-
-    def get_json(self, path, params=None):
-        self.pages.append(params.get("page"))
-        return self.pulls
 
 
 def test_truncated_key_reports_probe_freshness_not_fresh(tmp_path):
