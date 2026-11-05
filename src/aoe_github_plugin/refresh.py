@@ -159,11 +159,12 @@ _session_refresh_cache: dict[str, dict[str, Any]] = {}
 #   until        - time.monotonic() seconds; that budget's HTTP is skipped until then.
 #   reset_known  - True iff `until` came from a parsed GraphQL `resetAt` (so the
 #                  countdown is real); False for the fixed REST fallback.
-# ``notified`` is shared: one user-facing notice per continuous backoff WINDOW
-# (the span where either gate is active), so a forced refresh announces at most once.
+# ``notified`` belongs to each host: one notice per continuous backoff window
+# spanning that host's REST and GraphQL gates.
 _BACKOFF_KINDS = ("rest", "graphql")
-_backoff: dict[str, Any] = defaultdict(lambda: {api: {"until": 0.0, "reset_known": False} for api in _BACKOFF_KINDS})
-_backoff_notice = {"notified": False}
+_backoff: dict[str, Any] = defaultdict(
+    lambda: {**{api: {"until": 0.0, "reset_known": False} for api in _BACKOFF_KINDS}, "notified": False}
+)
 # Observations and deadlines are isolated by canonical API host.
 _graphql_budget: dict[str, Any] = defaultdict(lambda: {"remaining": None, "valid_until": None})
 # Per-key cooldown deadline (monotonic) after a NON-rate GraphQL failure, keyed
@@ -376,9 +377,9 @@ def _set_backoff(api: str, reset_at: Any = None, *, host: str = "github.com") ->
     budget refills); falls back to a fixed window for the REST path, which has no
     usable reset.
 
-    A fresh WINDOW (both gates already expired) clears the shared ``notified``
+    A fresh host window (both of its gates already expired) clears its ``notified``
     flag so the next user-initiated refresh announces it once; an overlapping trip
-    of the other budget never re-opens the notice. Re-arming an already-active
+    of the same host's other budget never re-opens the notice. Re-arming an already-active
     gate only extends the deadline and upgrades ``reset_known``; it never shortens
     the wait or downgrades a real reset to the fallback (the fan-out calls this
     repeatedly per window)."""
@@ -387,9 +388,9 @@ def _set_backoff(api: str, reset_at: Any = None, *, host: str = "github.com") ->
     new_until = until if until is not None else now + BACKOFF_SECS
     new_known = until is not None
     with _cache_lock:
-        # Fresh window only when neither budget is currently backed off.
-        if _all_backoff_locked(now) is None:
-            _backoff_notice["notified"] = False
+        # Only this host's gates determine whether its notification window is new.
+        if _active_backoff_locked(now, host=host) is None:
+            _backoff[host]["notified"] = False
         gate = _backoff[host][api]
         if new_until > gate["until"]:  # arm or extend; never shorten
             gate["until"] = new_until
@@ -431,18 +432,23 @@ def _rate_limit_status() -> dict[str, Any] | None:
 
 
 def _consume_rate_limit_notice() -> dict[str, Any] | None:
-    """Claim this backoff window's one user-facing notice. Returns
-    ``{"seconds", "reset_known", "budget"}`` the first time it is called while a
-    backoff is active and unannounced (then marks the window announced), else
-    ``None``. Only a user-initiated (forced) refresh consumes it; background ticks
-    never do, so a rate-limited workspace is not nagged on every poll."""
+    """Claim one unannounced host window, preferring the longest remaining wait.
+
+    Only the announced host is marked notified. Other hosts remain eligible on
+    a later forced refresh; background refreshes never consume these notices.
+    """
     now = time.monotonic()
     with _cache_lock:
-        status = _all_backoff_locked(now)
-        if status is None or _backoff_notice["notified"]:
+        active = [
+            (host, status)
+            for host in sorted(_backoff)
+            if not _backoff[host]["notified"] and (status := _active_backoff_locked(now, host=host)) is not None
+        ]
+        if not active:
             return None
-        _backoff_notice["notified"] = True
-        return status
+        host, status = max(active, key=lambda item: item[1]["seconds"])
+        _backoff[host]["notified"] = True
+        return {**status, "host": host}
 
 
 def _forced_rate_limit_notice(*, force: bool) -> dict[str, Any]:

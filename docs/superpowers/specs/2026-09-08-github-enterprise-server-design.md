@@ -94,8 +94,10 @@ either cache format.
 PR selection keys include the host as well as owner/repo/PR number. Auth notices
 follow the selected repo's host, including repos without PRs. Single-host
 rate-limit notices name that host and budget; multi-host notices use aggregate
-wording. The one-shot rate-limit notification remains global. Compare links use
-`host.web_base`; PR links retain the server's absolute URLs.
+wording. Forced refreshes announce at most one unannounced host at a time,
+preferring the longest remaining wait. Notification state belongs to that host's
+continuous REST/GraphQL backoff window, so one server cannot suppress another.
+Compare links use `host.web_base`; PR links retain the server's absolute URLs.
 
 ## Validation and limits
 

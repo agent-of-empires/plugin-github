@@ -77,7 +77,6 @@ def _clear_cache():
         refresh._graphql_budget.clear()
         refresh._backoff["github.com"]["rest"].update({"until": 0.0, "reset_known": False})
         refresh._backoff["github.com"]["graphql"].update({"until": 0.0, "reset_known": False})
-        refresh._backoff_notice["notified"] = False
         refresh._graphql_budget["github.com"].update({"remaining": None, "valid_until": None})
         refresh._retry_cooldown.clear()
 
@@ -703,13 +702,82 @@ def test_background_refresh_never_emits_notice(tmp_path):
     # REST probe free to run, #62).
     refresh._backoff["github.com"]["rest"].update({"until": time.monotonic() + 300, "reset_known": True})
     refresh._backoff["github.com"]["graphql"].update({"until": time.monotonic() + 300, "reset_known": True})
-    refresh._backoff_notice["notified"] = False
 
     def boom(request):
         raise AssertionError("HTTP must not be called during backoff")
 
     snap = refresh.build_snapshot(sessions, env=_Env(), transport=httpx.MockTransport(boom), force=False)
     assert "rate_limit_notice" not in snap
+
+
+@pytest.mark.parametrize(("first_api", "second_api"), [("rest", "graphql"), ("graphql", "rest")])
+def test_one_host_notice_does_not_suppress_an_overlapping_host(monkeypatch, first_api, second_api):
+    now = [1000.0]
+    monkeypatch.setattr(refresh.time, "monotonic", lambda: now[0])
+    refresh._set_backoff(first_api, host="a.corp")
+    first = refresh._forced_rate_limit_notice(force=True)["rate_limit_notice"]
+    assert (first["host"], first["budget"]) == ("a.corp", first_api)
+
+    now[0] = 1010.0
+    refresh._set_backoff(second_api, host="b.corp")
+    # Let A expire while B's overlapping window remains active: B still deserves a notice.
+    now[0] = 1061.0
+    second = refresh._forced_rate_limit_notice(force=True).get("rate_limit_notice")
+    assert second is not None
+    assert (second["host"], second["budget"]) == ("b.corp", second_api)
+    assert second["seconds"] == pytest.approx(9.0)
+    assert refresh._forced_rate_limit_notice(force=True) == {}
+
+
+def test_forced_refresh_announces_only_one_unannounced_host_at_a_time(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(refresh.time, "monotonic", lambda: now[0])
+    refresh._set_backoff("rest", host="a.corp")
+    now[0] = 1010.0
+    refresh._set_backoff("graphql", host="b.corp")
+    assert refresh._forced_rate_limit_notice(force=False) == {}
+    assert refresh._rate_limit_status()["hosts"] == ["a.corp", "b.corp"]
+
+    first = refresh._forced_rate_limit_notice(force=True)["rate_limit_notice"]
+    assert first.get("host") == "b.corp"
+    assert first["budget"] == "graphql"
+    # Announcing B must neither consume A nor hide either host from the pane.
+    assert refresh._rate_limit_status()["hosts"] == ["a.corp", "b.corp"]
+    second = refresh._forced_rate_limit_notice(force=True)["rate_limit_notice"]
+    assert (second["host"], second["budget"]) == ("a.corp", "rest")
+    assert refresh._forced_rate_limit_notice(force=True) == {}
+
+
+def test_host_new_window_rearms_notice_while_another_host_remains_limited(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(refresh.time, "monotonic", lambda: now[0])
+    refresh._set_backoff("rest", host="a.corp")
+    refresh._forced_rate_limit_notice(force=True)
+    now[0] = 1010.0
+    refresh._set_backoff("graphql", host="b.corp")
+    refresh._forced_rate_limit_notice(force=True)
+    now[0] = 1061.0
+    refresh._set_backoff("graphql", host="a.corp")
+    notice = refresh._forced_rate_limit_notice(force=True).get("rate_limit_notice")
+    assert notice is not None
+    assert (notice["host"], notice["budget"]) == ("a.corp", "graphql")
+    assert refresh._forced_rate_limit_notice(force=True) == {}
+
+
+def test_same_host_overlapping_budgets_share_one_notice_window(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(refresh.time, "monotonic", lambda: now[0])
+    refresh._set_backoff("rest", host="a.corp")
+    assert refresh._forced_rate_limit_notice(force=True)["rate_limit_notice"]["host"] == "a.corp"
+    now[0] = 1010.0
+    refresh._set_backoff("graphql", host="a.corp")
+    assert refresh._forced_rate_limit_notice(force=True) == {}
+    now[0] = 1061.0
+    refresh._set_backoff("rest", host="a.corp")
+    assert refresh._forced_rate_limit_notice(force=True) == {}
+    now[0] = 1122.0
+    refresh._set_backoff("graphql", host="a.corp")
+    assert refresh._forced_rate_limit_notice(force=True)["rate_limit_notice"]["host"] == "a.corp"
 
 
 def test_known_reset_marks_notice_reset_known(tmp_path):
