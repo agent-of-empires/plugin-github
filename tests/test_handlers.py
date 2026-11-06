@@ -1,5 +1,7 @@
 """Structured status + open-in-GitHub handlers. No network (MockTransport)."""
 
+import subprocess
+
 import httpx
 import pytest
 
@@ -25,6 +27,7 @@ def _pr(number=7, branch="feature", draft=False):
         "title": f"PR for {branch}",
         "state": "open",
         "draft": draft,
+        "head": {"ref": branch, "repo": {"name": "r", "owner": {"login": "o"}}},
     }
 
 
@@ -116,3 +119,85 @@ def test_open_raises_without_github_remote(monkeypatch):
     monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: None)
     with pytest.raises(errors.GitHubError):
         handlers.github_open(env=_NoTokenEnv())
+
+
+def test_open_returns_upstream_pull_when_origin_errors(monkeypatch):
+    # #130 review: an origin failure must not hide an upstream hit. `open_pulls`
+    # keeps the origin error only when nothing found the PR, so `github.open`
+    # resolves the upstream PR instead of falling back to the origin compare
+    # URL that would claim no PR exists.
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("alice", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repos", lambda _p: [("alice", "r"), ("upstream", "r")])
+    monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
+
+    def handler(request):
+        if request.url.path == "/repos/alice/r/pulls":
+            return httpx.Response(502, json={"message": "server error"})
+        if request.url.path == "/repos/upstream/r/pulls":
+            assert request.url.params["head"] == "alice:feature"
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        **_pr(),
+                        "html_url": "https://github.com/upstream/r/pull/9",
+                        "head": {"ref": "feature", "repo": {"name": "r", "owner": {"login": "alice"}}},
+                    }
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    result = handlers.github_open(env=_NoTokenEnv(), transport=_transport(handler))
+    assert result == {"url": "https://github.com/upstream/r/pull/9", "kind": "pull"}
+
+
+def test_status_discovers_fork_pull_targeting_configured_upstream(tmp_path):
+    subprocess.run(["git", "init", "-q", "-b", "feature", str(tmp_path)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin", "https://github.com/alice/r.git"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "upstream", "git@github.com:upstream/r.git"],
+        check=True,
+    )
+
+    def handler(request):
+        # No repo-metadata request: the configured upstream is the only extra
+        # destination, and origin is probed directly.
+        assert request.url.path != "/repos/alice/r"
+        if request.url.path == "/repos/upstream/r/pulls" and request.url.params["head"] == "alice:feature":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        **_pr(),
+                        "html_url": "https://github.com/upstream/r/pull/7",
+                        "head": {"ref": "feature", "repo": {"name": "r", "owner": {"login": "alice"}}},
+                    }
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    result = handlers.github_status(str(tmp_path), env=_NoTokenEnv(), transport=_transport(handler))
+    assert result["repo"] == "alice/r"
+    assert result["pulls"][0]["url"] == "https://github.com/upstream/r/pull/7"
