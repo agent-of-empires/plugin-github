@@ -19,6 +19,8 @@ from aoe_github_plugin import lookup
 from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
 from aoe_github_plugin.auth import TokenEnvironment
+from aoe_github_plugin.errors import ApiError
+from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.utils.gitctx import remote_owner_repos
 
 
@@ -1666,9 +1668,13 @@ def test_rest_probe_pages_past_another_repo_sharing_the_branch(tmp_path):
             raise AssertionError("a paginated probe must not validate with page one's ETag")
         page = int(request.url.params.get("page", "1"))
         pages.append(page)
+        # Page one's ETag must not end up stored: the short second page holds a
+        # PR page one cannot validate, so the next tick has to re-read both.
         if page == 1:
-            return httpx.Response(200, json=[_pull(number=n, repo="other") for n in range(100)])
-        return httpx.Response(200, json=[_pull(number=12)])
+            return httpx.Response(
+                200, headers={"ETag": 'W/"v1"'}, json=[_pull(number=n, repo="other") for n in range(100)]
+            )
+        return httpx.Response(200, headers={"ETag": 'W/"v2"'}, json=[_pull(number=12)])
 
     transport = httpx.MockTransport(handler)
     snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
@@ -1682,6 +1688,66 @@ def test_rest_probe_pages_past_another_repo_sharing_the_branch(tmp_path):
     # The next tick re-reads every page instead of trusting a one-page 304.
     refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
     assert pages == [1, 2, 1, 2]
+
+
+class _PagingClient:
+    """REST probe stub whose scripted answers are consumed one request at a time."""
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+        self.calls = []
+
+    def _next(self, label):
+        self.calls.append(label)
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    def get_json_conditional(self, path, params, etag):
+        return self._next(("conditional", etag))
+
+    def get_json(self, path, params):
+        return self._next(("page", params.get("page")))
+
+
+def test_rest_probe_arms_backoff_when_a_later_page_is_rate_limited():
+    # A rate limit on page two is still a rate limit: it must arm the REST gate
+    # and must not leave a partial list behind as this key's cached pulls.
+    key = lookup.pull_keys([("o", "r")], "feature")[0]
+    client = _PagingClient(
+        [
+            (200, 'W/"v1"', [_pull(number=n, repo="other") for n in range(100)]),
+            RateLimitedError(),
+        ]
+    )
+    changed, pulls, fresh = refresh._rest_probe(client, key)
+    assert (changed, pulls, fresh) == (True, [], False)
+    assert refresh._backoff["rest"]["until"] > time.monotonic()
+    assert key not in refresh._etag_cache
+
+
+def test_rest_probe_keeps_last_complete_list_when_a_later_page_fails():
+    # One blip on page two must not replace a complete cached list with page
+    # one's partial one: an owned PR on page two would disappear from every
+    # fallback until pagination happened to succeed again.
+    key = lookup.pull_keys([("o", "r")], "feature")[0]
+    owned = _pull(number=12)
+    assert refresh._rest_probe(_PagingClient([(200, 'W/"v1"', [owned])]), key) == (
+        True,
+        refresh._trim([owned]),
+        True,
+    )
+    cached = dict(refresh._etag_cache[key])
+
+    failed = _PagingClient(
+        [
+            (200, 'W/"v2"', [_pull(number=n, repo="other") for n in range(100)]),
+            ApiError(502, "boom"),
+        ]
+    )
+    assert refresh._rest_probe(failed, key) == (False, cached["pulls"], False)
+    assert refresh._etag_cache[key] == cached
 
 
 def test_changed_rest_overrides_stale_empty_rich_cache(tmp_path):

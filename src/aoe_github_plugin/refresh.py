@@ -829,36 +829,42 @@ def _probe_extra_pages(
 ) -> tuple[bool, bool]:
     """Follow the pages a full first page implies, extending ``items`` in place.
 
-    Returns ``(single_page, fresh)``. ``single_page`` is True only when the first
-    page came back short, which is GitHub saying there is no second one; a second
-    page read, or the page bound running out with more still pending, both mean a
-    single ETag cannot validate the result. ``fresh`` is False when a later page
-    failed or the bound ran out: a partial list is not this tick's census, so the
-    caller falls back instead of budgeting on PRs it never saw.
+    Returns ``(single_page, fresh)``. ``single_page`` is True only when the FIRST
+    page came back short, which is GitHub saying there is no second one, so that
+    page's ETag validates the whole result. Any extra page read, however short it
+    turns out, means one ETag cannot cover the result: a later page can change
+    without page one's ETag moving. ``fresh`` is False when a later page failed
+    (a rate limit also arms the REST gate) or the page bound ran out with more
+    still pending: a partial list is not this tick's census.
     """
-    single_page = len(items) < page_size
+    if len(items) < page_size:
+        return True, True
     for page in range(2, lookup.MAX_PULL_PAGES + 1):
-        if single_page:
-            return True, True
         try:
             batch = client.get_json(path, {**params, "page": str(page)})
+        except RateLimitedError:
+            _set_backoff("rest")
+            return False, False
         except GitHubError:
             return False, False
         if not isinstance(batch, list):
             return False, False
         items.extend(item for item in batch if isinstance(item, dict))
-        single_page = len(batch) < page_size
-    return single_page, single_page
+        if len(batch) < page_size:
+            return False, True
+    return False, False
 
 
 def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str, Any]], bool]:
     """Cheap REST conditional check for one ``(owner, repo, branch)``: returns
     ``(changed, pulls, fresh)`` where ``changed`` is ``False`` on a ``304`` (the
     open-PR list is unchanged, the request was free against the primary limit).
-    A ``304`` is still fresh for the basic REST representation. Uses the
-    ETag cache and honors the backoff gate; a blocked or rate-limited probe with
-    a cached value reports ``fresh=False`` because it serves stale fallback, and
-    only raises ``GitHubError`` when there is nothing to fall back on."""
+    A ``304`` is still fresh for the basic REST representation, and a paginated
+    result (which no single ETag can validate) reports the same answer by
+    comparing its open-PR set with the cached one. Uses the ETag cache and honors
+    the backoff gate; a blocked or rate-limited probe with a cached value reports
+    ``fresh=False`` because it serves stale fallback, and only raises
+    ``GitHubError`` when there is nothing to fall back on."""
     owner, repo, branch, head_owner, _ = key
     with _cache_lock:
         cached = _etag_cache.get(key)
@@ -887,9 +893,22 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
     # and the result then stores no ETag.
     single_page, fresh = _probe_extra_pages(client, f"/repos/{owner}/{repo}/pulls", params, items, page_size)
     pulls = _trim([pr for pr in items if lookup.matches_head(pr.get("head"), key)])
+    if not fresh:
+        # A partial census must not become the cached list: an owned PR past the
+        # failed page would vanish from every later fallback. Serve the last
+        # complete list, or this tick's partial one flagged stale, and leave the
+        # cache alone.
+        return (False, cached["pulls"], False) if cached is not None else (True, pulls, False)
     with _cache_lock:
         _etag_cache[key] = {"etag": new_etag if single_page else None, "pulls": pulls}
-    return True, pulls, fresh
+    if single_page:
+        return True, pulls, True
+    # A multi-page result stores no ETag, so derive the answer a 304 would have
+    # given: unchanged exactly when this tick's open-PR set matches the cached
+    # one. Without it every paginated key would look changed on every tick and
+    # re-spend the full query.
+    before = {p.get("url") for p in cached["pulls"]} if cached is not None else None
+    return before != {p.get("url") for p in pulls}, pulls, True
 
 
 def _fetch_key(client: GitHubClient, key: RepoKey) -> tuple[list[dict[str, Any]], bool]:
