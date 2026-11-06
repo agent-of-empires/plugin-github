@@ -824,6 +824,33 @@ def _forced_rate_limit_notice(*, force: bool) -> dict[str, Any]:
     return {"rate_limit_notice": notice} if notice is not None else {}
 
 
+def _probe_extra_pages(
+    client: GitHubClient, path: str, params: dict[str, str], items: list[dict[str, Any]], page_size: int
+) -> tuple[bool, bool]:
+    """Follow the pages a full first page implies, extending ``items`` in place.
+
+    Returns ``(single_page, fresh)``. ``single_page`` is True only when the first
+    page came back short, which is GitHub saying there is no second one; a second
+    page read, or the page bound running out with more still pending, both mean a
+    single ETag cannot validate the result. ``fresh`` is False when a later page
+    failed or the bound ran out: a partial list is not this tick's census, so the
+    caller falls back instead of budgeting on PRs it never saw.
+    """
+    single_page = len(items) < page_size
+    for page in range(2, lookup.MAX_PULL_PAGES + 1):
+        if single_page:
+            return True, True
+        try:
+            batch = client.get_json(path, {**params, "page": str(page)})
+        except GitHubError:
+            return False, False
+        if not isinstance(batch, list):
+            return False, False
+        items.extend(item for item in batch if isinstance(item, dict))
+        single_page = len(batch) < page_size
+    return single_page, single_page
+
+
 def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str, Any]], bool]:
     """Cheap REST conditional check for one ``(owner, repo, branch)``: returns
     ``(changed, pulls, fresh)`` where ``changed`` is ``False`` on a ``304`` (the
@@ -841,7 +868,8 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
             return False, cached["pulls"], False
         raise RateLimitedError
     etag = cached["etag"] if cached else None
-    params = {"state": "open", "head": f"{head_owner}:{branch}", "per_page": "100"}
+    page_size = 100
+    params = {"state": "open", "head": f"{head_owner}:{branch}", "per_page": str(page_size)}
     try:
         status, new_etag, raw = client.get_json_conditional(f"/repos/{owner}/{repo}/pulls", params, etag)
     except RateLimitedError:
@@ -851,10 +879,17 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
         raise
     if status == 304 and cached is not None:
         return False, cached["pulls"], True
-    pulls = _trim([pr for pr in raw or [] if isinstance(pr, dict) and lookup.matches_head(pr.get("head"), key)])
+    items = [pr for pr in raw or [] if isinstance(pr, dict)]
+    # ``head=owner:branch`` matches that branch in EVERY repository the owner
+    # has, so another checkout's PRs can fill the first page and hide this one
+    # (#130 review). A full page means later pages may exist, and those can
+    # change without page one's ETag moving, so they are read unconditionally
+    # and the result then stores no ETag.
+    single_page, fresh = _probe_extra_pages(client, f"/repos/{owner}/{repo}/pulls", params, items, page_size)
+    pulls = _trim([pr for pr in items if lookup.matches_head(pr.get("head"), key)])
     with _cache_lock:
-        _etag_cache[key] = {"etag": new_etag, "pulls": pulls}
-    return True, pulls, True
+        _etag_cache[key] = {"etag": new_etag if single_page else None, "pulls": pulls}
+    return True, pulls, fresh
 
 
 def _fetch_key(client: GitHubClient, key: RepoKey) -> tuple[list[dict[str, Any]], bool]:

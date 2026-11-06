@@ -1648,6 +1648,42 @@ def test_graphql_backoff_does_not_block_rest_probe(tmp_path):
     assert refresh._backoff["rest"]["until"] <= time.monotonic()  # REST budget never gated
 
 
+def test_rest_probe_pages_past_another_repo_sharing_the_branch(tmp_path):
+    # #130 review: ``head=owner:branch`` matches the branch in every repository
+    # that owner has, so another repo's PRs can fill the first page and hide this
+    # checkout's PR. The probe pages past them, and a result that needed a second
+    # page stores no ETag, since a 304 on page one would claim the rest unchanged.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _make_repo(ws / "r")
+    sessions = [{"id": "s1", "project_path": str(ws)}]
+    pages = []
+
+    def handler(request):
+        if not request.url.path.endswith("/pulls"):
+            return httpx.Response(404)
+        if request.headers.get("If-None-Match"):
+            raise AssertionError("a paginated probe must not validate with page one's ETag")
+        page = int(request.url.params.get("page", "1"))
+        pages.append(page)
+        if page == 1:
+            return httpx.Response(200, json=[_pull(number=n, repo="other") for n in range(100)])
+        return httpx.Response(200, json=[_pull(number=12)])
+
+    transport = httpx.MockTransport(handler)
+    snap = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
+    repo = snap["sessions"][0]["repos"][0]
+    assert [p["number"] for p in repo["pulls"]] == [12]
+    assert pages == [1, 2]
+
+    key = lookup.pull_keys([("o", "r")], "feature")[0]
+    assert refresh._etag_cache[key] == {"etag": None, "pulls": repo["pulls"]}
+
+    # The next tick re-reads every page instead of trusting a one-page 304.
+    refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
+    assert pages == [1, 2, 1, 2]
+
+
 def test_changed_rest_overrides_stale_empty_rich_cache(tmp_path):
     # #33 / #62 residual: a branch whose rich cache is EMPTY (GraphQL previously
     # saw no PR) gets a PR opened while GraphQL is rate-limited. The REST probe

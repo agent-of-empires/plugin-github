@@ -163,9 +163,12 @@ class _API:
             return httpx.Response(304)
         # Deliberately include foreign heads: consumers must verify actual identity,
         # even when the server ignores the head filter or returns ambiguous data.
-        return httpx.Response(
-            200, headers={"ETag": '"stable"'}, json=[_rest(n) for n in self.nodes.get(destination, [])]
-        )
+        pulls = [_rest(n) for n in self.nodes.get(destination, [])]
+        # GitHub pages the head-filtered list 100 at a time, so the fixture must
+        # too: a probe that pages past a full page needs a real second page.
+        page = int(request.url.params.get("page", "1"))
+        start = (page - 1) * 100
+        return httpx.Response(200, headers={"ETag": '"stable"'}, json=pulls[start : start + 100])
 
 
 @pytest.fixture(autouse=True)
