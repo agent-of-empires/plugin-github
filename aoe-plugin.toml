@@ -202,6 +202,18 @@ description = "Show the words summary at the end of each session row (e.g. \"CI 
 type = "boolean"
 default = true
 
+# Snoozed sessions are skipped like archived ones by default: snoozing is the
+# user setting a session aside, so polling it would spend GitHub quota on state
+# they parked. The host keeps serving the row's badge/column, so this opts into
+# keeping that state live instead.
+[[settings]]
+key = "include_snoozed_sessions"
+label = "Keep polling snoozed sessions"
+description = "Snoozed sessions normally stop being refreshed, so the next full refresh clears their PR badge and status column while parked. Enable to keep them updating (and spending GitHub quota), so the row is live the moment you unsnooze it."
+type = "boolean"
+default = false
+advanced = true
+
 # Dense row, off by default so the shipped payload is unchanged: each badge chip
 # carries a one-character state mark and the row-column drops its words, so a
 # session row is marks plus a sort scalar (the shape the Linear plugin's row badge

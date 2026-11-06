@@ -66,6 +66,11 @@ CHIP_SETTING_KEYS = {
 # Toggle for the row-column status-text cell (the words summary). Off keeps the
 # badge icons but clears the text. Defaults on.
 STATUS_TEXT_SETTING_KEY = "show_status_text"
+# Opt-in: keep polling snoozed sessions so their row badge and status column stay
+# live while the row is parked. Off by default, where the next full refresh clears
+# those slots: snoozing is the user asking the worker to stop spending GitHub
+# quota on that session.
+INCLUDE_SNOOZED_SETTING_KEY = "include_snoozed_sessions"
 # Dense session-row representation: one-character marks on each badge chip and no
 # row-column words -- the shape the Linear plugin's row badge ships. Off by default
 # so the payload stays what main shipped; the payload is shared, so with it on the
@@ -229,6 +234,10 @@ class Runtime:
         self._chip_flags: frozenset[str] = frozenset(CHIP_SETTING_KEYS.values())
         # Whether the row-column status text is shown; resolved in run(), on until.
         self._show_status_text = True
+        # Whether snoozed sessions are polled too; re-resolved by every
+        # list_sessions() call, off until then so a parked session is not
+        # refreshed before the user opted in.
+        self._include_snoozed = False
         # Whether the row is the dense form (one-char marks, no words); resolved in
         # run(), off until then so the default payload matches main.
         self._dense_glyphs = False
@@ -336,24 +345,36 @@ class Runtime:
         transient failure must never be read as "no sessions", which would prune
         every session's UI.
 
-        Archived, snoozed, and trashed sessions are dropped here, the single
-        chokepoint every consumer reads (#41): they are inactive by definition, so
-        polling them only burns the user's GitHub quota, and trashed sessions in
-        particular can pile up in the hundreds and exhaust the host's per-plugin
-        UI-state quota, starving live sessions' panes. Filtering at the source (not
-        just in the snapshot) keeps the fast local session tick consistent, it
-        compares these ids against the pushed set, so a snapshot-only filter would
-        diff the inactive session forever and refresh every tick. A previously-pushed
-        session that becomes inactive simply drops out of the list and the refresh
+        Archived and trashed sessions are dropped here, the single chokepoint every
+        consumer reads (#41): they are inactive by definition, so polling them only
+        burns the user's GitHub quota, and trashed sessions in particular can pile
+        up in the hundreds and exhaust the host's per-plugin UI-state quota,
+        starving live sessions' panes. Filtering at the source (not just in the
+        snapshot) keeps the fast local session tick consistent, it compares these
+        ids against the pushed set, so a snapshot-only filter would diff the dropped
+        session forever and refresh every tick. A previously-pushed session that
+        becomes archived or trashed simply drops out of the list and the refresh
         reconcile removes its UI slots, same path as a vanished session.
+
+        Snoozed sessions are dropped the same way unless ``include_snoozed_sessions``
+        opts in. The host keeps storing and serving ``row-badge``/``row-column`` for
+        a snoozed session (the row is only sunk, not hidden), so a user who wants a
+        parked row to keep tracking PR state can opt in; the default treats a snooze
+        as the "stop spending quota on this" signal it usually is.
 
         The ``exclude`` param filters server-side so the host never even
         enumerates those sessions; a host too old to honor it ignores the param and
-        returns everything, so the client-side filter below still drops archived
-        and snoozed sessions (trashed has no per-entry flag, so an old host cannot
-        drop those client-side, which is exactly the exhaustion the host-side
-        ``exclude`` fixes)."""
-        result = self.call_host(SESSIONS_LIST, {"exclude": ["archived", "snoozed", "trashed"]}, timeout=timeout)
+        returns everything, so the client-side filter below still drops them (a
+        host that ignores ``exclude`` predates the per-entry ``trashed`` field, so
+        it cannot drop those client-side, which is exactly the exhaustion the
+        host-side ``exclude`` fixes)."""
+        # Re-read the opt-in on every call: the host writes settings without
+        # restarting the worker, so a value cached at startup would never flip.
+        # Its read shares this call's timeout, so the fast tick's short deadline
+        # bounds both RPCs rather than the setting read stalling the tick alone.
+        self._include_snoozed = self.resolve_include_snoozed(timeout)
+        exclude = ["archived", "trashed"] if self._include_snoozed else ["archived", "snoozed", "trashed"]
+        result = self.call_host(SESSIONS_LIST, {"exclude": exclude}, timeout=timeout)
         sessions = result.get("sessions") if isinstance(result, dict) else None
         if not isinstance(sessions, list):
             return None
@@ -362,7 +383,10 @@ class Runtime:
         # pruning live UI; treat a garbage list as "no answer" instead.
         if not all(isinstance(s, dict) and isinstance(s.get("id"), str) for s in sessions):
             return None
-        # Fallback for a host that ignored `exclude`: still drop archived/snoozed.
+        # Fallback for a host that ignored `exclude`: drop archived, and snoozed
+        # too unless the user opted into keeping those parked rows live.
+        if self._include_snoozed:
+            return [s for s in sessions if not s.get("archived")]
         return [s for s in sessions if not s.get("archived") and not s.get("snoozed")]
 
     def _push_snapshot(self, snapshot: dict[str, Any]) -> set[str]:
@@ -546,6 +570,16 @@ class Runtime:
             category for key, category in CHIP_SETTING_KEYS.items() if self._setting_bool(key, default=True)
         )
 
+    def resolve_include_snoozed(self, timeout: float = HOST_RPC_TIMEOUT) -> bool:
+        """Whether snoozed sessions keep being polled (``include_snoozed_sessions``).
+        Off on the first answer: a snoozed row is parked, so polling it spends the
+        user's GitHub quota on state they set aside. A failed read keeps the last
+        value instead, because dropping the snoozed ids changes the session
+        topology: the fast tick then runs a full refresh whose prune removes the
+        parked rows' slots. ``timeout`` bounds the read so a caller on a short
+        deadline (the fast session tick) is not stalled by the default."""
+        return self._setting_bool(INCLUDE_SNOOZED_SETTING_KEY, default=self._include_snoozed, timeout=timeout)
+
     def resolve_dense_glyphs(self) -> bool:
         """Whether the session row uses the dense form (``dense_row_badge_glyphs``):
         one-character marks on each badge chip and no row-column words. Off by
@@ -577,10 +611,10 @@ class Runtime:
             return graphql.parse_ignored_commenters(result["value"])
         return self._ignored_commenters
 
-    def _setting_bool(self, key: str, *, default: bool) -> bool:
+    def _setting_bool(self, key: str, *, default: bool, timeout: float = HOST_RPC_TIMEOUT) -> bool:
         if self.stopped:
             return default
-        result = self.call_host(CONFIG_GET, {"key": key})
+        result = self.call_host(CONFIG_GET, {"key": key}, timeout=timeout)
         if isinstance(result, dict) and isinstance(result.get("value"), bool):
             return bool(result["value"])
         return default
