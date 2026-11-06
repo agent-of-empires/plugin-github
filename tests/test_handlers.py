@@ -6,6 +6,7 @@ import pytest
 from aoe_github_plugin import errors
 from aoe_github_plugin import handlers
 from aoe_github_plugin.auth import TokenEnvironment
+from aoe_github_plugin.hosts import GitHubHost
 
 
 class _NoTokenEnv(TokenEnvironment):
@@ -33,7 +34,7 @@ def _transport(handler):
 
 
 def test_status_returns_structured_pull(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
 
     def handler(request):
@@ -51,7 +52,7 @@ def test_status_returns_structured_pull(monkeypatch):
 
 
 def test_status_no_open_pr(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
     result = handlers.github_status(
         env=_NoTokenEnv(),
@@ -62,15 +63,15 @@ def test_status_no_open_pr(monkeypatch):
 
 
 def test_status_not_a_github_remote(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: None)
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: None)
     result = handlers.github_status(env=_NoTokenEnv())
     assert result["repo"] is None
     assert result["pulls"] == []
-    assert "not a github.com remote" in result["summary"]
+    assert "not a GitHub remote" in result["summary"]
 
 
 def test_status_is_failsoft_on_api_error(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
     result = handlers.github_status(
         env=_NoTokenEnv(),
@@ -82,7 +83,7 @@ def test_status_is_failsoft_on_api_error(monkeypatch):
 
 
 def test_open_returns_existing_pull(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
     result = handlers.github_open(
         env=_NoTokenEnv(),
@@ -92,7 +93,7 @@ def test_open_returns_existing_pull(monkeypatch):
 
 
 def test_open_falls_back_to_compare_url(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
     result = handlers.github_open(
         env=_NoTokenEnv(),
@@ -102,7 +103,7 @@ def test_open_falls_back_to_compare_url(monkeypatch):
 
 
 def test_open_compare_url_when_api_unreachable(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
 
     def handler(_request):
@@ -113,6 +114,33 @@ def test_open_compare_url_when_api_unreachable(monkeypatch):
 
 
 def test_open_raises_without_github_remote(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: None)
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: None)
     with pytest.raises(errors.GitHubError):
         handlers.github_open(env=_NoTokenEnv())
+
+
+def test_ghes_handlers_share_trust_and_build_compare_link(monkeypatch):
+
+    host = GitHubHost.enterprise("gh.corp")
+    trusted = {host.name: host}
+
+    def owner_repo(path, hosts):
+        assert hosts is trusted
+        return host, "o", "r"
+
+    monkeypatch.setattr(handlers, "remote_owner_repo", owner_repo)
+    monkeypatch.setattr(handlers, "current_branch", lambda _path: "feature/fix")
+
+    def transport(request):
+        assert request.url.host == "gh.corp"
+        assert request.url.path == "/api/v3/repos/o/r/pulls"
+        return httpx.Response(200, json=[])
+
+    status = handlers.github_status(env=_NoTokenEnv(), trusted=trusted, transport=_transport(transport))
+    assert status["host"] == "gh.corp"
+    assert status["repo"] == "o/r"
+    assert status["error"] is None
+    assert handlers.github_open(env=_NoTokenEnv(), trusted=trusted, transport=_transport(transport)) == {
+        "url": "https://gh.corp/o/r/compare/feature%2Ffix?expand=1",
+        "kind": "compare",
+    }
