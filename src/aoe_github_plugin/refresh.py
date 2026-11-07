@@ -10,8 +10,8 @@ error degrades that one repo's entry, never the whole refresh.
 
 Efficiency, against the user token's shared budget (REST 5000 req/hr, GraphQL
 5000 points/hr):
-- repos are deduplicated by ``(host, owner, repo, branch)`` so a branch shared across
-  sessions/workspaces is fetched once per refresh;
+- lookups are deduplicated by host, destination, branch, and head owner/repository,
+  keeping shared workspaces cheap without mixing contributors' same-name branches;
 - a cheap REST conditional request (ETag / ``If-None-Match``) is the PRIMARY
   open-PR poll; a ``304`` is free, so that path costs ~0 when unchanged (native
   stack enrichment is separate and can add calls as its cache expires);
@@ -51,6 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
+from aoe_github_plugin import lookup
 from aoe_github_plugin import graphql
 from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.auth import SystemEnvironment
@@ -131,9 +132,10 @@ BACKOFF_SECS = 60.0
 # worker for an unreasonable stretch.
 MAX_BACKOFF_SECS = 3600.0
 
-RepoKey = tuple[str, str, str, str]  # (host, owner, repo, branch)
-# (host, owner, repo, branch, required_checks_only, ignore_bot_approval_recommendations).
-RichCacheKey = tuple[str, str, str, str, bool, bool]
+# (host, destination owner/repo, branch, head owner/repo)
+RepoKey = tuple[str, str, str, str, str, str]
+CheckoutKey = tuple[str, str, str, str]  # host, origin owner/repo, branch
+RichCacheKey = tuple[str, str, str, str, str, str, bool, bool]
 StackCacheKey = tuple[str, str, str, int]
 StackRepoKey = tuple[str, str, str]
 
@@ -211,6 +213,21 @@ _graphql_budget: dict[str, Any] = defaultdict(lambda: {"remaining": None, "valid
 # every background tick, at the DIGEST tier and for COLD keys too, both of which
 # the old per-entry ``full_retry_at`` could not reach.
 _retry_cooldown: dict[RichCacheKey, float] = {}
+# Per-key deadline (monotonic) before the FULL query may retry a page that came
+# back truncated. Distinct from ``_retry_cooldown``: truncation is not a failure,
+# so it must not feed the error path, but re-asking immediately is guaranteed to
+# truncate again and burns shared GraphQL budget for a result that is discarded.
+GRAPHQL_TRUNCATED_RETRY = 1800.0
+_truncated_until: dict[RichCacheKey, float] = {}
+# Why an owned set stayed unproven. ``TRUNCATION_BOUNDED`` is a page certain to
+# truncate the same way (discovery exhausted its page bound against this tick's
+# fresh REST probe), so the full query cools for ``GRAPHQL_TRUNCATED_RETRY``.
+# ``TRUNCATION_TRANSIENT`` is a one-off request failure (a rate limit, a 5xx on a
+# by-number fetch), or a page bound reached without a live probe to measure it,
+# that a short retry covers, without withholding the rich shape for half an hour
+# after one blip.
+TRUNCATION_BOUNDED = "bounded"
+TRUNCATION_TRANSIENT = "transient"
 
 
 def _snapshot_cache_path() -> Path:
@@ -330,7 +347,7 @@ def discover_checkouts(workspace: str, *, ignore_submodules: bool = True) -> lis
 
 def _identify(
     path: str, trusted: dict[str, GitHubHost], branch_override: str | None = None
-) -> tuple[str | None, str | None, RepoKey | None]:
+) -> tuple[str | None, str | None, CheckoutKey | None]:
     """Resolve the trusted host, repo and key, preferring the session branch.
 
     A non-GitHub origin is a benign skip; a known repo on detached HEAD has no
@@ -345,6 +362,31 @@ def _identify(
     if not branch or branch == "HEAD":
         return host.name, f"{owner}/{repo}", None
     return host.name, f"{owner}/{repo}", (host.name, owner, repo, branch)
+
+
+def _remote_repos(path: str, trusted: dict[str, GitHubHost], host: str | None) -> list[tuple[str, str]]:
+    """Destinations this checkout may target: its configured GitHub remotes.
+
+    Read per checkout, not per session or origin: two worktrees of the same
+    origin can declare different remotes. ``_resolve_checkouts`` unions the
+    reads only across checkouts that share a query key (same origin and
+    branch), which are one query identity anyway; a list shared beyond that
+    key would search destinations another checkout never configured.
+
+    Uses this module's timed ``_git`` rather than ``gitctx``'s: a checkout on a
+    stalled network mount or holding a git lock would otherwise block a
+    ``GIT_WORKERS`` thread with no bound and stall the whole refresh tick, which
+    is exactly what the fail-soft identity helpers exist to prevent. A failure
+    degrades to ``[]``, and ``lookup.repositories`` then falls back to origin.
+    """
+    names = _git(path, "remote")
+    out: list[tuple[str, str]] = []
+    for name in sorted((names or "").split(), key=lambda n: (n != "origin", n)):
+        url = _git(path, "remote", "get-url", name)
+        repo = parse_owner_repo(url, trusted) if url else None
+        if repo is not None and repo[0].name == host and repo[1:] not in out:
+            out.append(repo[1:])
+    return out
 
 
 def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> list[tuple[str, str | None]]:
@@ -381,19 +423,8 @@ def _session_checkouts(session: dict[str, Any], *, ignore_submodules: bool) -> l
 
 
 def _trim(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Open PRs trimmed to the fields the UI renders. Defensive: a malformed
-    entry from a drifting API shape is skipped/defaulted, never raised."""
-    return [
-        {
-            "number": pr.get("number"),
-            "url": pr.get("html_url"),
-            "title": pr.get("title") or "",
-            "state": pr.get("state"),
-            "draft": bool(pr.get("draft", False)),
-        }
-        for pr in raw
-        if isinstance(pr, dict)
-    ]
+    """Basic REST pulls, retaining their actual head identity."""
+    return [lookup.trim_pull(pr) for pr in raw if isinstance(pr, dict)]
 
 
 def _stack_pull(raw: dict[str, Any], owner: str, repo: str, *, web_base: str) -> dict[str, Any] | None:
@@ -718,7 +749,7 @@ def _reset_to_monotonic(reset_at: Any) -> float | None:
     return time.monotonic() + min(delta, MAX_BACKOFF_SECS)
 
 
-def _set_backoff(api: str, reset_at: Any = None, *, host: str = "github.com") -> None:
+def _set_backoff(api: str, reset_at: Any = None, *, host: str) -> None:
     """Arm one budget's backoff gate (``api`` is ``"rest"`` or ``"graphql"``).
     Prefers the GraphQL response's ``resetAt`` (so we wait exactly until the
     budget refills); falls back to a fixed window for the REST path, which has no
@@ -808,15 +839,48 @@ def _forced_rate_limit_notice(*, force: bool) -> dict[str, Any]:
     return {"rate_limit_notice": notice} if notice is not None else {}
 
 
+def _probe_extra_pages(
+    client: GitHubClient, path: str, params: dict[str, str], items: list[dict[str, Any]], page_size: int
+) -> tuple[bool, bool]:
+    """Follow the pages a full first page implies, extending ``items`` in place.
+
+    Returns ``(single_page, fresh)``. ``single_page`` is True only when the FIRST
+    page came back short, which is GitHub saying there is no second one, so that
+    page's ETag validates the whole result. Any extra page read, however short it
+    turns out, means one ETag cannot cover the result: a later page can change
+    without page one's ETag moving. ``fresh`` is False when a later page failed
+    (a rate limit also arms the REST gate) or the page bound ran out with more
+    still pending: a partial list is not this tick's census.
+    """
+    if len(items) < page_size:
+        return True, True
+    for page in range(2, lookup.MAX_PULL_PAGES + 1):
+        try:
+            batch = client.get_json(path, {**params, "page": str(page)})
+        except RateLimitedError:
+            _set_backoff("rest", host=client.host.name)
+            return False, False
+        except GitHubError:
+            return False, False
+        if not isinstance(batch, list):
+            return False, False
+        items.extend(item for item in batch if isinstance(item, dict))
+        if len(batch) < page_size:
+            return False, True
+    return False, False
+
+
 def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str, Any]], bool]:
     """Cheap REST conditional check for one ``(host, owner, repo, branch)``: returns
     ``(changed, pulls, fresh)`` where ``changed`` is ``False`` on a ``304`` (the
     open-PR list is unchanged, the request was free against the primary limit).
-    A ``304`` is still fresh for the basic REST representation. Uses the
-    ETag cache and honors the backoff gate; a blocked or rate-limited probe with
-    a cached value reports ``fresh=False`` because it serves stale fallback, and
-    only raises ``GitHubError`` when there is nothing to fall back on."""
-    host, owner, repo, branch = key
+    A ``304`` is still fresh for the basic REST representation, and a paginated
+    result (which no single ETag can validate) reports the same answer by
+    comparing its open-PR set with the cached one. Uses the ETag cache and honors
+    the backoff gate; a blocked or rate-limited probe with a cached value reports
+    ``fresh=False`` because it serves stale fallback, and only raises
+    ``GitHubError`` when there is nothing to fall back on."""
+    host, owner, repo, branch, head_owner, _ = key
     with _cache_lock:
         cached = _etag_cache.get(key)
         blocked = time.monotonic() < _backoff[host]["rest"]["until"]
@@ -825,7 +889,8 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
             return False, cached["pulls"], False
         raise RateLimitedError(client.host)
     etag = cached["etag"] if cached else None
-    params = {"state": "open", "head": f"{owner}:{branch}", "per_page": "10"}
+    page_size = 100
+    params = {"state": "open", "head": f"{head_owner}:{branch}", "per_page": str(page_size)}
     try:
         status, new_etag, raw = client.get_json_conditional(f"/repos/{owner}/{repo}/pulls", params, etag)
     except RateLimitedError:
@@ -835,10 +900,30 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
         raise
     if status == 304 and cached is not None:
         return False, cached["pulls"], True
-    pulls = _trim(raw or [])
+    items = [pr for pr in raw or [] if isinstance(pr, dict)]
+    # ``head=owner:branch`` matches that branch in EVERY repository the owner
+    # has, so another checkout's PRs can fill the first page and hide this one
+    # (#130 review). A full page means later pages may exist, and those can
+    # change without page one's ETag moving, so they are read unconditionally
+    # and the result then stores no ETag.
+    single_page, fresh = _probe_extra_pages(client, f"/repos/{owner}/{repo}/pulls", params, items, page_size)
+    pulls = _trim([pr for pr in items if lookup.matches_head(pr.get("head"), key[1:])])
+    if not fresh:
+        # A partial census must not become the cached list: an owned PR past the
+        # failed page would vanish from every later fallback. Serve the last
+        # complete list, or this tick's partial one flagged stale, and leave the
+        # cache alone.
+        return (False, cached["pulls"], False) if cached is not None else (True, pulls, False)
     with _cache_lock:
-        _etag_cache[key] = {"etag": new_etag, "pulls": pulls}
-    return True, pulls, True
+        _etag_cache[key] = {"etag": new_etag if single_page else None, "pulls": pulls}
+    if single_page:
+        return True, pulls, True
+    # A multi-page result stores no ETag, so derive the answer a 304 would have
+    # given: unchanged exactly when this tick's open-PR set matches the cached
+    # one. Without it every paginated key would look changed on every tick and
+    # re-spend the full query.
+    before = {p.get("url") for p in cached["pulls"]} if cached is not None else None
+    return before != {p.get("url") for p in pulls}, pulls, True
 
 
 def _fetch_key(client: GitHubClient, key: RepoKey) -> tuple[list[dict[str, Any]], bool]:
@@ -894,8 +979,7 @@ def _error_entry(exc: GitHubError) -> dict[str, Any]:
 
 
 def _rich_cache_key(key: RepoKey, *, flags: _NormalizeFlags) -> RichCacheKey:
-    host, owner, repo, branch = key
-    return host, owner, repo, branch, flags.required_checks_only, flags.ignore_bot_approval_recommendations
+    return (*key, flags.required_checks_only, flags.ignore_bot_approval_recommendations)
 
 
 def _is_active(pulls: list[dict[str, Any]]) -> bool:
@@ -917,9 +1001,7 @@ def _is_active(pulls: list[dict[str, Any]]) -> bool:
     return False
 
 
-def _observe_rate_limit(
-    rate_info: dict[str, Any], *, host: str = "github.com", kind: str, repo: str, aliases: int
-) -> None:
+def _observe_rate_limit(rate_info: dict[str, Any], *, host: str, kind: str, repo: str, aliases: int) -> None:
     """Record a query's ``rateLimit`` payload: log the spend (the #69 telemetry
     gap; ``cost`` used to be selected and thrown away) and remember ``remaining``
     for budget-pressure pacing, valid until the window resets."""
@@ -935,7 +1017,7 @@ def _observe_rate_limit(
         _graphql_budget[host]["valid_until"] = _reset_to_monotonic(rate_info.get("resetAt"))
 
 
-def _budget_multiplier(now: float, *, host: str = "github.com") -> float:
+def _budget_multiplier(now: float, *, host: str) -> float:
     """Ceiling stretch under budget pressure: ``BUDGET_PRESSURE_MULTIPLIER`` when
     the last-seen GraphQL ``remaining`` (still within its window) is low, else 1.
     An observation whose window has reset is discarded; the budget refilled."""
@@ -951,7 +1033,7 @@ def _budget_multiplier(now: float, *, host: str = "github.com") -> float:
     return BUDGET_PRESSURE_MULTIPLIER if remaining < BUDGET_PRESSURE_REMAINING else 1.0
 
 
-def _digest_stale(rich: dict[str, Any], now: float, *, host: str = "github.com") -> bool:
+def _digest_stale(rich: dict[str, Any], now: float, *, host: str) -> bool:
     """Whether the cached rich result wants digest revalidation: aged past the
     short active ceiling (#26) or the 300s one since it was last fetched OR
     digest-validated, stretched under budget pressure."""
@@ -960,7 +1042,7 @@ def _digest_stale(rich: dict[str, Any], now: float, *, host: str = "github.com")
     return (now - validated) >= ceiling * _budget_multiplier(now, host=host)
 
 
-def _full_stale(rich: dict[str, Any], now: float, *, host: str = "github.com") -> bool:
+def _full_stale(rich: dict[str, Any], now: float, *, host: str) -> bool:
     """Whether the cached rich result is past the HARD full-fetch ceiling: only a
     real full query resets this clock, so digest false negatives (fields the
     signature cannot see) are bounded rather than permanent."""
@@ -1025,6 +1107,22 @@ def _paginate_threads(client: GitHubClient, pull_node: dict[str, Any]) -> None:
         return
 
 
+def _same_pull_set(basic: list[dict[str, Any]], rich: dict[str, Any] | None) -> bool:
+    """Whether the REST probe's current open-PR set equals the set of OPEN
+    pulls the cached rich entry was built from. The rich entry is only safe to
+    serve while they agree: a differing set means a PR opened or closed since,
+    and the rich list would hide the new one or resurrect the closed one.
+
+    The rich query also returns MERGED pulls (the pane renders them), so they
+    are excluded here: they are absent from the basic list by construction and
+    would otherwise never match, withholding a rich result that is still
+    correct for every open PR."""
+    if rich is None:
+        return False
+    open_rich = [pr for pr in rich.get("pulls") or [] if not pr.get("merged")]
+    return {pr.get("url") for pr in basic} == {pr.get("url") for pr in open_rich}
+
+
 def _fallback_pulls(pending: dict[str, Any]) -> dict[str, Any]:
     """Per-key result when GraphQL could not produce fresh data: the last-good
     rich cache if present, else the basic REST open-PR pulls. Never an error and
@@ -1035,11 +1133,19 @@ def _fallback_pulls(pending: dict[str, Any]) -> dict[str, Any]:
     one), so serve the fresh basic REST pulls instead. Those lack the rich
     CI/review fields but reflect the current PR set; the next successful GraphQL
     tick restores the rich shape. Without this, a GraphQL rate limit can hide a
-    PR that REST already discovered (#62)."""
+    PR that REST already discovered (#62).
+
+    The rich list is also withheld when the probe's current set disagrees with
+    the set the rich entry was built from even though the ETag still answered
+    304: a changed-probe cooldown followed by an unchanged probe can otherwise
+    keep showing a list a PR has since opened into or closed out of, for as long
+    as the truncation/cooldown window lasts. The rich entry itself is kept, so a
+    later probe error still falls back to it rather than a typed error."""
     rich = pending["rich"]
-    if rich is not None and not pending.get("changed"):
+    basic = pending["basic"]
+    if rich is not None and not pending.get("changed") and _same_pull_set(basic, rich):
         return _pulls_result(rich["pulls"], fresh=False, stale=True)
-    return _pulls_result(pending["basic"], fresh=False, stale=True)
+    return _pulls_result(basic, fresh=False, stale=True)
 
 
 def _chunk_fallback(
@@ -1090,6 +1196,245 @@ def _resolve_null_repository(
             out[key] = _pulls_result([], fresh=True)
 
 
+def _fetch_details(
+    client: GitHubClient, owner: str, repo: str, numbers: set[Any], key: RepoKey
+) -> tuple[list[dict[str, Any]], set[Any]]:
+    """Fetch the rich node for each owned PR the bounded branch page omitted.
+
+    Bounded by what discovery or the REST probe already proved belongs to this
+    checkout, so this is normally empty or a single PR. Returns
+    ``(found, unresolved)``: the rich nodes fetched, plus every number the fetch
+    could not resolve (a failed request, a rate-limit stop, or a response
+    missing the node). A failed fetch must not silently drop an owned OPEN PR
+    from this tick's result: the caller reports truncation on ``unresolved`` so
+    the owner-scoped REST list (which still lists it) is served and no cache
+    records the absence, while the chunk itself stays fail-soft.
+    """
+    found: list[dict[str, Any]] = []
+    unresolved: set[Any] = set()
+    ordered = sorted(n for n in numbers if isinstance(n, int))
+    for index, number in enumerate(ordered):
+        try:
+            data = client.post_graphql(graphql.DETAIL_QUERY, {"owner": owner, "repo": repo, "number": number})
+        except RateLimitedError:
+            _set_backoff("graphql", host=client.host.name)
+            unresolved.update(ordered[index:])
+            break
+        except GitHubError:
+            unresolved.add(number)
+            continue
+        rate_info = (data.get("data") or {}).get("rateLimit") or {}
+        _observe_rate_limit(rate_info, host=client.host.name, kind="detail", repo=f"{owner}/{repo}", aliases=1)
+        if _graphql_rate_limited(data):
+            _set_backoff("graphql", rate_info.get("resetAt"), host=client.host.name)
+            unresolved.update(ordered[index:])
+            break
+        node = ((data.get("data") or {}).get("repository") or {}).get("pullRequest")
+        if isinstance(node, dict) and lookup.matches_head(lookup.graphql_head(node), key[1:]):
+            found.append(node)
+        elif not isinstance(node, dict):
+            # The PR the caller proved ours did not come back: an absence this
+            # code cannot confirm, so report it rather than cache it.
+            unresolved.add(number)
+    return found, unresolved
+
+
+def _needs_discovery(conn: dict[str, Any]) -> bool:
+    """Whether a page could still hide this checkout's own PR past its bounds.
+
+    ``hasNextPage: false`` is the server stating the page is final, so head
+    filtering is the whole answer. Anything else (more pages pending, or no
+    usable ``pageInfo``) needs identity discovery to decide ownership.
+    """
+    page_info = conn.get("pageInfo")
+    return not (isinstance(page_info, dict) and page_info.get("hasNextPage") is False)
+
+
+def _fresh_probe_connection(
+    client: GitHubClient,
+    key: RepoKey,
+    conn: dict[str, Any],
+    filtered: dict[str, Any],
+    basic: list[dict[str, Any]],
+) -> tuple[str | None, dict[str, Any]] | None:
+    """Owned PRs for a crowded page, resolved from this tick's REST probe.
+
+    Returns the resolved ``(reason, conn)`` pair, or ``None`` when the probe is
+    not a usable census: the page shows an owned OPEN PR the probe does not
+    list, so the two sources disagree and identity discovery has to arbitrate.
+    A page whose owned OPEN PRs are all on the probe's list needs no lookup, and
+    the PRs the probe lists but the page omitted are fetched by number.
+    """
+    page_nodes = [node for node in filtered.get("nodes") or [] if isinstance(node, dict)]
+    page_numbers = {node.get("number") for node in page_nodes}
+    rest_numbers = {pr.get("number") for pr in basic if isinstance(pr, dict)}
+    page_open = {node.get("number") for node in page_nodes if node.get("state") == "OPEN"}
+    if page_open - rest_numbers:
+        return None
+    missing = rest_numbers - page_numbers
+    if not missing:
+        return None, filtered
+    details, unresolved = _fetch_details(client, key[1], key[2], missing, key)
+    if unresolved:
+        return TRUNCATION_TRANSIENT, filtered
+    page_nodes.extend(details)
+    return None, {
+        **conn,
+        "pageInfo": {"hasNextPage": False},
+        "nodes": page_nodes,
+        "detail_numbers": {node.get("number") for node in details},
+    }
+
+
+def _owned_connection(
+    client: GitHubClient,
+    key: RepoKey,
+    conn: dict[str, Any],
+    basic: list[dict[str, Any]],
+    *,
+    rest_fresh: bool,
+) -> tuple[str | None, dict[str, Any]]:
+    """Resolve one chunk's page down to the checkout's own PRs.
+
+    Returns ``(reason, owned_conn)``, where ``reason`` is ``None`` when the owned
+    set is proven, ``TRUNCATION_BOUNDED`` when the page cannot be proven and
+    will truncate the same way again, and ``TRUNCATION_TRANSIENT`` when a
+    request failed without proving either answer.
+
+    A final page (``hasNextPage: false``) holds every OPEN/MERGED PR with the
+    branch name, so head filtering IS the answer and no lookup runs. A crowded
+    page is resolved from whichever census actually proves the open set:
+
+    - A FRESH REST probe (``rest_fresh``) was answered by GitHub this tick and
+      is owner-scoped (``head=owner:branch`` plus ``matches_head``), so it is
+      the exact owned OPEN set. Anything it names that the page omitted is
+      fetched by number. That keeps the rich data on a branch name with more
+      same-name PRs than identity discovery's page bound can census, where
+      discovery would otherwise fail forever instead.
+    - A probe served from cache during REST backoff is NOT a census: a PR
+      opened since is absent from it, so an incomplete page can pass its set
+      check trivially. That case falls back to identity discovery
+      (``lookup.discover_pages``) for membership.
+
+    The caller serves the owner-scoped REST list instead of trusting (or
+    caching) the rich page whenever ``reason`` is set, and cools the key by
+    reason: a bounded page measured against this tick's fresh probe deserves the
+    long window; a transient failure, or a bound reached while the probe was a
+    cache entry, only a short retry. A REST-only collision never arms a cooldown,
+    because a collision is not a failure to retry.
+    """
+    filtered = lookup.filter_connection(conn, key[1:])
+    # A final page is self-evident: ``hasNextPage: false`` says it holds every
+    # OPEN/MERGED PR with the branch name, so any lookup would cost a serial
+    # round trip per key per tick for nothing.
+    if not _needs_discovery(conn):
+        return None, filtered
+    if rest_fresh:
+        # GitHub answered the probe this tick, so its open set is the census
+        # this page is resolved against.
+        from_probe = _fresh_probe_connection(client, key, conn, filtered, basic)
+        if from_probe is not None:
+            return from_probe
+    # A backed-off probe is the last good list, not this tick's: a PR opened
+    # since is absent from it, so it cannot stand in for a census. Fall through
+    # to discovery, which proves ownership rather than trusting stale coverage.
+    reason, resolved = _discovered_connection(client, key, conn, filtered)
+    if reason == TRUNCATION_BOUNDED and not rest_fresh:
+        # The crammed destination is real, but without a live probe this tick
+        # cannot know it will still be crammed on the next one. Cooling for the
+        # long window would withhold the rich shape on top of an already stale
+        # REST list, so this cools for the short retry instead.
+        return TRUNCATION_TRANSIENT, resolved
+    return reason, resolved
+
+
+def _discovered_connection(
+    client: GitHubClient, key: RepoKey, conn: dict[str, Any], filtered: dict[str, Any]
+) -> tuple[str | None, dict[str, Any]]:
+    """Ownership for a crowded page, resolved by identity discovery.
+
+    Discovery supplies membership only: the rich page's own nodes are the ones
+    normalised, and an owned OPEN PR the page omitted is fetched by number.
+    ``TRUNCATION_BOUNDED`` means discovery exhausted its page bound with more
+    PRs still pending; ``TRUNCATION_TRANSIENT`` means the lookups themselves
+    failed without proving either answer.
+    """
+    owner, repo, branch = key[1:4]
+
+    def observe(rate_info: dict[str, Any]) -> None:
+        """Record discovery's spend and arm the gate on budget pressure.
+
+        A ``RATE_LIMITED`` envelope is handled by the caller: ``discover_pages``
+        reports it as incomplete and flags it, so the REST fallback serves this
+        tick and the backoff gate stops the next one from retrying into it.
+        """
+        _observe_rate_limit(rate_info, host=client.host.name, kind="discover", repo=f"{owner}/{repo}", aliases=1)
+        remaining = rate_info.get("remaining")
+        if isinstance(remaining, int) and remaining < RATELIMIT_FLOOR:
+            _set_backoff("graphql", rate_info.get("resetAt"), host=client.host.name)
+
+    try:
+        nodes, complete, rate_limited = lookup.discover_pages(client, owner, repo, branch, observe=observe)
+    except (GitHubError, RateLimitedError) as exc:
+        if isinstance(exc, RateLimitedError):
+            # Discovery runs after the chunk's main request has returned, so an
+            # HTTP-level rate limit here would otherwise escape the chunk
+            # handlers, degrade every remaining key to an "internal" error, and
+            # never arm the gate. Arm it and let this key serve REST/stale.
+            _set_backoff("graphql", host=client.host.name)
+        return TRUNCATION_TRANSIENT, filtered
+    if rate_limited:
+        # The envelope itself was an error, so the run proved nothing; the gate
+        # keeps the next tick from retrying into the limit.
+        _set_backoff("graphql", host=client.host.name)
+    if rate_limited or not complete:
+        # Unproven either way. A rate limit is a one-off retry; a page bound
+        # reached with the server still reporting more PRs is a page certain to
+        # truncate the same way, so it cools the full query for the long window.
+        # Either way the owner-scoped REST list is served instead.
+        return (TRUNCATION_TRANSIENT if rate_limited else TRUNCATION_BOUNDED), filtered
+    # Discovery supplies membership only: the rich page's own nodes are the ones
+    # normalised, so CI/review/comment fields are never replaced by the identity
+    # records. A PR discovery proved ours but this bounded page did not carry
+    # (foreign same-name PRs filled ``first: 3``) is fetched by number rather
+    # than reported absent, which would hide a real PR behind an empty result.
+    owned = [node for node in nodes if lookup.matches_head(lookup.graphql_head(node), key[1:])]
+    owned_numbers = {node.get("number") for node in owned}
+    kept = [
+        node
+        for node in conn.get("nodes") or []
+        if isinstance(node, dict)
+        and node.get("number") in owned_numbers
+        and lookup.matches_head(lookup.graphql_head(node), key[1:])
+    ]
+    # Recover only OPEN PRs the page omitted. The rich page legitimately carries
+    # merged PRs as historical selector entries, so recovering every omitted
+    # merged PR would issue one serial detail query each, every tick. A hidden
+    # OPEN PR is still recovered on both tiers: skipping it in the digest tier
+    # would omit it from the signature and promote the key on every digest.
+    missing = {node.get("number") for node in owned if node.get("state") == "OPEN"} - {
+        node.get("number") for node in kept
+    }
+    details, unresolved = _fetch_details(client, owner, repo, missing, key)
+    kept.extend(details)
+    if unresolved:
+        # An owned OPEN PR could not be fetched: caching this page would record
+        # its absence as authoritative. Report a transient failure so the caller
+        # serves the owner-scoped REST list, which still lists it.
+        return TRUNCATION_TRANSIENT, filtered
+    # A complete discovery is authoritative whatever the rich page truncated at,
+    # so nothing is withheld; pagination is off for the promoted thread fetch.
+    # ``detail_numbers`` marks the nodes ``_fetch_details`` supplied, so a
+    # promotion reusing this proof later in the same tick can keep those rich
+    # nodes instead of fetching the same PR by number a second time.
+    return None, {
+        **conn,
+        "pageInfo": {"hasNextPage": False},
+        "nodes": kept,
+        "detail_numbers": {node.get("number") for node in details},
+    }
+
+
 def _apply_aliases(
     client: GitHubClient,
     chunk: list[RepoKey],
@@ -1108,14 +1453,91 @@ def _apply_aliases(
     now = time.monotonic()
     out: dict[RepoKey, dict[str, Any]] = {}
     for i, key in enumerate(chunk):
+        cache_key = _rich_cache_key(key, flags=flags)
         conn = repository.get(f"b{i}")
         if f"b{i}" in failed or not isinstance(conn, dict):
             _arm_retry_cooldown([key], pending, now)
-            out[key] = _fallback_pulls(pending[key])
+            # Serve this key's last-good answer. The digest tier may already have
+            # published an owned PR for this key this tick; a failed alias must
+            # not blank what was already resolved.
+            out.setdefault(key, _fallback_pulls(pending[key]))
             continue
-        # The signature must come from the raw connection BEFORE thread
-        # pagination mutates it, so it compares equal to a later digest response
-        # (which never paginates).
+        # The digest tier resolves ownership for the SAME destination and branch
+        # moments earlier in this tick, and discovery's answer depends only on
+        # those, not on which document carried the nodes. A completed run is
+        # therefore already authoritative here, so a promotion reuses it instead
+        # of paying a second serial lookup (#129). A truncated run proved
+        # nothing and is never handed over. Per-tick scratch, never persisted.
+        proved = pending[key].pop("digest_owned", None)
+        if proved is not None:
+            owned_numbers = {node.get("number") for node in proved.get("nodes") or [] if isinstance(node, dict)}
+            kept = [
+                node
+                for node in conn.get("nodes") or []
+                if isinstance(node, dict) and node.get("number") in owned_numbers
+            ]
+            # A crowded page can leave an owned PR off the node list entirely
+            # (foreign same-name PRs fill ``first: 3``). The proof already
+            # established those exist, so recover them instead of reporting
+            # them absent, matching what ``_owned_connection`` does for its own
+            # page. Only OPEN ones: merged PRs are historical entries the page
+            # carries on its own, and recovering every omitted one costs a
+            # serial query.
+            missing = {
+                node.get("number")
+                for node in proved.get("nodes") or []
+                if isinstance(node, dict) and node.get("state") == "OPEN"
+            } - {node.get("number") for node in kept}
+            unresolved: set[Any] = set()
+            if missing:
+                # The digest pass may already have fetched some of these by
+                # number in this very tick (they are in ``detail_numbers``):
+                # reuse those rich nodes rather than paying the same
+                # DETAIL_QUERY twice for one refresh.
+                proved_details = proved.get("detail_numbers") or set()
+                reuse = [
+                    node
+                    for node in proved.get("nodes") or []
+                    if isinstance(node, dict) and node.get("number") in missing and node.get("number") in proved_details
+                ]
+                kept.extend(reuse)
+                missing -= {node.get("number") for node in reuse}
+            if missing:
+                details, unresolved = _fetch_details(client, key[1], key[2], missing, key)
+                kept.extend(details)
+            conn = {**conn, "nodes": kept, "pageInfo": {"hasNextPage": False, "endCursor": None}}
+            # An owned OPEN PR stayed unfetchable: never cache a fresh result
+            # that omits it. Report truncation so the REST list (which has it)
+            # is served instead.
+            truncated = TRUNCATION_TRANSIENT if unresolved else None
+        else:
+            truncated, conn = _owned_connection(
+                client,
+                key,
+                conn,
+                pending[key]["basic"],
+                rest_fresh=pending[key]["rest_fresh"],
+            )
+        if truncated is not None:
+            # The page could not prove the checkout's own PR set (foreign
+            # same-name PRs exhausted it, discovery failed, or an owned PR's
+            # detail fetch did not resolve), so it cannot prove absence either.
+            # The owner-scoped REST probe already lists the open set; serve
+            # that, reporting the probe's own freshness rather than asserting
+            # fresh for a backoff-served cache. Remember why so the next tick
+            # neither re-spends a full query that is certain to truncate the
+            # same way nor withholds the rich shape for half an hour over one
+            # transient failure.
+            with _cache_lock:
+                if truncated == TRUNCATION_BOUNDED:
+                    _truncated_until[cache_key] = now + GRAPHQL_TRUNCATED_RETRY
+                else:
+                    _retry_cooldown[cache_key] = now + GRAPHQL_RETRY_COOLDOWN
+            out[key] = _pulls_result(
+                pending[key]["basic"], fresh=pending[key]["rest_fresh"], stale=not pending[key]["rest_fresh"]
+            )
+            continue
+        # Compute the ownership-filtered signature before thread pagination.
         digest = graphql.digest_signature(conn)
         for node in conn.get("nodes") or []:
             if isinstance(node, dict):
@@ -1125,7 +1547,6 @@ def _apply_aliases(
             required_checks_only=flags.required_checks_only,
             ignore_bot_approval_recommendations=flags.ignore_bot_approval_recommendations,
         )
-        cache_key = _rich_cache_key(key, flags=flags)
         with _cache_lock:
             _graphql_cache[cache_key] = {
                 "pulls": pulls,
@@ -1134,6 +1555,7 @@ def _apply_aliases(
                 "validated_at": now,
             }
             _retry_cooldown.pop(cache_key, None)
+            _truncated_until.pop(cache_key, None)
         out[key] = _pulls_result(pulls, fresh=True)
     return out
 
@@ -1152,7 +1574,7 @@ def _fetch_chunk(
     key in ``chunk``, isolating failures: a blocked/rate-limited query or a single
     failed alias falls back per key (rich cache, then basic REST), never
     group-wide."""
-    host, owner, repo, _ = chunk[0]
+    host, owner, repo = chunk[0][:3]
     with _cache_lock:
         blocked = time.monotonic() < _backoff[host]["graphql"]["until"]
     if blocked:
@@ -1193,6 +1615,7 @@ def _fetch_chunk(
 
 
 def _apply_digest_aliases(
+    client: GitHubClient,
     chunk: list[RepoKey],
     pending: dict[RepoKey, dict[str, Any]],
     data: dict[str, Any],
@@ -1200,14 +1623,38 @@ def _apply_digest_aliases(
 ) -> list[RepoKey]:
     """Compare each alias's digest signature against its cached one. A match
     revalidates the rich cache (bumps ``validated_at``, serves it fresh, like a
-    304); a failed or malformed alias serves the stale cache. Returns the
-    mismatched keys, which the caller promotes to the full query."""
+    304); a failed, malformed, or unproven alias serves the stale cache and arms
+    the retry cooldown, so a crowded name cannot re-spend its discovery pages on
+    every tick. Returns the mismatched keys, which the caller promotes to the
+    full query."""
     repository = (data.get("data") or {}).get("repository") or {}
     failed = _error_aliases(data)
     now = time.monotonic()
     promoted: list[RepoKey] = []
     for i, key in enumerate(chunk):
-        signature = None if f"b{i}" in failed else graphql.digest_signature(repository.get(f"b{i}"))
+        conn = repository.get(f"b{i}")
+        signature = None
+        if f"b{i}" not in failed and isinstance(conn, dict):
+            reason, owned = _owned_connection(
+                client,
+                key,
+                conn,
+                pending[key]["basic"],
+                rest_fresh=pending[key]["rest_fresh"],
+            )
+            if reason is not None:
+                # Ownership stayed unproven, so this page proves nothing. Serve
+                # the stale cache, like the other digest-tier failures:
+                # promoting here would spend a full-query point after every
+                # failed discovery, which is the burn this tier prevents. Cool
+                # the key too: nothing bumps ``validated_at`` on this path, so
+                # without a cooldown an incomplete discovery re-runs its serial
+                # pages on every network tick.
+                with _cache_lock:
+                    _retry_cooldown[pending[key]["cache_key"]] = now + GRAPHQL_RETRY_COOLDOWN
+                out[key] = _fallback_pulls(pending[key])
+                continue
+            signature = graphql.digest_signature(owned)
         rich = pending[key]["rich"]  # never None on the digest path (classification requires a cache)
         if signature is None:
             # A failed or malformed digest alias arms the cooldown so it does not
@@ -1219,6 +1666,12 @@ def _apply_digest_aliases(
                 rich["validated_at"] = now
             out[key] = _pulls_result(rich["pulls"], fresh=True)
         else:
+            # A mismatch promotes to the full query. Its ownership answer depends
+            # only on destination and branch, which this tick just resolved the
+            # same way, so hand over the completed set and let the promotion skip
+            # a duplicate lookup. An unproven run never reaches here: it served
+            # the stale cache above.
+            pending[key]["digest_owned"] = owned
             promoted.append(key)
     return promoted
 
@@ -1235,7 +1688,7 @@ def _fetch_digest_chunk(
     mismatch promotes the key into ``full_pending`` for the rich query. Failures
     (blocked gate, rate limit, malformed alias) serve the stale cache; they
     never promote to full, so a flaky digest cannot burn full-query points."""
-    host, owner, repo, _ = chunk[0]
+    host, owner, repo = chunk[0][:3]
     with _cache_lock:
         blocked = time.monotonic() < _backoff[host]["graphql"]["until"]
     if blocked:
@@ -1272,7 +1725,7 @@ def _fetch_digest_chunk(
         _chunk_fallback(chunk, pending, out)
         return
 
-    for key in _apply_digest_aliases(chunk, pending, data, out):
+    for key in _apply_digest_aliases(client, chunk, pending, data, out):
         full_pending[key] = pending[key]
 
 
@@ -1288,7 +1741,7 @@ def _run_chunked(
     for key in pending:
         groups[(key[0], key[1], key[2])].append(key)
     for gkeys in groups.values():
-        gkeys.sort(key=lambda k: k[3])
+        gkeys.sort()
         for start in range(0, len(gkeys), MAX_GRAPHQL_ALIASES):
             chunk = gkeys[start : start + MAX_GRAPHQL_ALIASES]
             try:
@@ -1337,14 +1790,29 @@ def _fetch_rich(
             out[key] = stale if stale is not None else _error_entry(probe)
             continue
         changed, basic, _fresh = probe
-        entry = {"basic": basic, "rich": rich, "changed": changed, "cache_key": cache_key}
+        entry = {"basic": basic, "rich": rich, "changed": changed, "cache_key": cache_key, "rest_fresh": _fresh}
         with _cache_lock:
             cooling = now < _retry_cooldown.get(cache_key, 0.0)
+            truncated = now < _truncated_until.get(cache_key, 0.0)
         if not force and cooling:
             # A recent non-rate failure for this key: serve what we have and
             # spend nothing until the cooldown lapses (#71). A forced refresh
             # bypasses it, since the user asked for a live attempt.
             out[key] = _fallback_pulls(entry)
+        elif not force and truncated and rich is not None and _same_pull_set(basic, rich):
+            # The REST probe's current open-PR set equals the set the rich entry
+            # was built from, so that entry is still accurate even though no
+            # query ran; hiding it would drop every rich field for the whole
+            # window. A differing set means a PR opened or closed since, and the
+            # rich list would hide the new one or resurrect the closed one, so
+            # the current basic pulls are served instead.
+            out[key] = _pulls_result(rich["pulls"], fresh=False, stale=True)
+        elif not force and truncated:
+            # This page truncated recently: another full query would spend
+            # budget to be discarded again. A changed REST probe still reflects
+            # the current PR set, so prefer it; otherwise serve the basic pulls,
+            # reporting the probe's own freshness rather than asserting fresh.
+            out[key] = _pulls_result(basic, fresh=_fresh, stale=not _fresh)
         elif rich is None or force or changed or rich.get("digest") is None or _full_stale(rich, now, host=key[0]):
             full_pending[key] = entry
         elif _digest_stale(rich, now, host=key[0]):
@@ -1370,14 +1838,14 @@ def _fetch_rich(
     return out
 
 
-def _session_fingerprint(keys: list[RepoKey]) -> tuple[RepoKey, ...]:
+def _session_fingerprint(keys: list[CheckoutKey]) -> tuple[CheckoutKey, ...]:
     """Stable identity for the GitHub data a session pane displays."""
     return tuple(sorted(set(keys)))
 
 
 def _session_freshness(
     session_id: Any,
-    fingerprint: tuple[RepoKey, ...],
+    fingerprint: tuple[CheckoutKey, ...],
     results: list[dict[str, Any]],
     refreshed_at: str,
 ) -> dict[str, Any] | None:
@@ -1405,16 +1873,16 @@ def _session_freshness(
     return None
 
 
-def _fetch_all(  # noqa: PLR0913 - explicit token, host, transport, and polling seams
-    keys: set[RepoKey],
+def _fetch_all(  # noqa: PLR0913 - explicit environment, host, transport and normalization seams
+    destinations: dict[CheckoutKey, list[tuple[str, str]]],
     env: TokenEnvironment | None,
     transport: httpx.BaseTransport | None,
     *,
     force: bool = False,
     flags: _NormalizeFlags = DEFAULT_NORMALIZE_FLAGS,
     trusted: dict[str, GitHubHost],
-) -> tuple[dict[RepoKey, dict[str, Any]], dict[str, bool]]:
-    """Fetch every unique key. Returns ``(results, token_present_by_host)`` where results
+) -> tuple[dict[CheckoutKey, dict[str, Any]], dict[str, bool]]:
+    """Fetch origin and upstream candidates, preserving per-host authentication.
     is ``key -> {"pulls": [...]}`` or ``key -> {"error": {...}}``. With a token,
     keys go through the REST-conditional-gated rich path and same-repo branches
     that need GraphQL share one batched query (``_fetch_rich``); without one we
@@ -1425,35 +1893,112 @@ def _fetch_all(  # noqa: PLR0913 - explicit token, host, transport, and polling 
     concurrently. GraphQL stays serialized within each host to respect its
     secondary limits. Results are collected in sorted host order;
     none of this touches stdin or host RPCs."""
-    results: dict[RepoKey, dict[str, Any]] = {}
+    results: dict[CheckoutKey, dict[str, Any]] = {}
     present: dict[str, bool] = {}
-    by_host: dict[str, list[RepoKey]] = defaultdict(list)
-    for key in sorted(keys):
+    by_host: dict[str, list[CheckoutKey]] = defaultdict(list)
+    for key in sorted(destinations):
         by_host[key[0]].append(key)
     if not by_host:
         return results, present
 
-    def fetch_host(item: tuple[str, list[RepoKey]]) -> tuple[str, bool, dict[RepoKey, dict[str, Any]]]:
-        host_name, ordered = item
-        host = trusted[host_name]
-        token = _resolve_optional_token(env, host)
-        with GitHubClient(host=host, token=token, transport=transport) as client:
+    def fetch_host(item: tuple[str, list[CheckoutKey]]) -> tuple[str, bool, dict[CheckoutKey, dict[str, Any]]]:
+        host_name, checkouts = item
+        token = _resolve_optional_token(env, trusted[host_name])
+        by_checkout: dict[CheckoutKey, list[RepoKey]] = {}
+        for key in checkouts:
+            candidates = lookup.pull_keys(lookup.repositories(key[1:3], destinations[key]), key[3])
+            by_checkout[key] = [(host_name, *candidate) for candidate in candidates]
+        ordered = sorted({candidate for candidates in by_checkout.values() for candidate in candidates})
+        with GitHubClient(host=trusted[host_name], token=token, transport=transport) as client:
             if token is not None:
-                out = _fetch_rich(client, ordered, force=force, flags=flags)
-                _attach_stacks(client, ordered, out, force=force)
+                fetched = _fetch_rich(client, ordered, force=force, flags=flags)
+                _attach_stacks(client, ordered, fetched, force=force)
             else:
                 with ThreadPoolExecutor(max_workers=REST_PROBE_WORKERS) as pool:
-                    out = dict(zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True))
-        return host_name, token is not None, out
+                    fetched = dict(
+                        zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True)
+                    )
+        return host_name, token is not None, _checkout_results(by_checkout, fetched)
 
-    with ThreadPoolExecutor(max_workers=min(HOST_FETCH_WORKERS, len(by_host))) as hosts_pool:
-        for host_name, has_token, out in hosts_pool.map(fetch_host, sorted(by_host.items())):
+    with ThreadPoolExecutor(max_workers=min(HOST_FETCH_WORKERS, len(by_host))) as pool:
+        for host_name, has_token, out in pool.map(fetch_host, sorted(by_host.items())):
             present[host_name] = has_token
             results.update(out)
     return results, present
 
 
-def build_snapshot(  # noqa: PLR0913 - explicit environment, transport, settings, and trust seams
+def _checkout_results(
+    by_checkout: dict[CheckoutKey, list[RepoKey]], fetched: dict[RepoKey, dict[str, Any]]
+) -> dict[CheckoutKey, dict[str, Any]]:
+    """Union discovered PRs without letting optional remotes degrade origin state."""
+    results: dict[CheckoutKey, dict[str, Any]] = {}
+    for key, candidates in by_checkout.items():
+        origin = fetched[candidates[0]]
+        pulls = {}
+        for candidate in candidates:
+            for pull in fetched[candidate].get("pulls", []):
+                pulls[pull["url"]] = pull
+        result = _pulls_result(list(pulls.values()), fresh=not origin.get("_stale"), stale=bool(origin.get("_stale")))
+        if origin.get("error"):
+            result["error"] = origin["error"]
+        results[key] = result
+    return results
+
+
+@dataclass(frozen=True)
+class _Resolved:
+    """One checkout's query identity plus the destinations it may target."""
+
+    path_key: tuple[str, str | None]
+    host: str | None
+    repo: str | None
+    key: CheckoutKey | None
+    remotes: list[tuple[str, str]]
+
+
+def _resolve_checkouts(
+    sessions: list[dict[str, Any]], settings: SnapshotSettings, trusted: dict[str, GitHubHost]
+) -> tuple[
+    list[tuple[dict[str, Any], list[tuple[str, str | None]]]],
+    dict[tuple[str, str | None], tuple[str | None, str | None, CheckoutKey | None]],
+    dict[CheckoutKey, list[tuple[str, str]]],
+]:
+    """Discover each session's checkouts, then each checkout's identity and remotes.
+
+    Returns the per-session checkout pairs, the identity map keyed by
+    ``(realpath, branch)``, and the destinations keyed by query key. Remotes are
+    read per checkout: two worktrees of one origin can declare different ones, so
+    a shared list would search destinations another checkout never configured.
+    """
+
+    def _discover(session: dict[str, Any]) -> list[tuple[str, str | None]]:
+        return _session_checkouts(session, ignore_submodules=settings.ignore_submodules)
+
+    def _checkout(item: tuple[tuple[str, str | None], str]) -> _Resolved:
+        """Identity and remotes for one checkout, read once in the shared pool."""
+        (path, branch), checkout = item
+        host, repo, key = _identify(checkout, trusted, branch)
+        return _Resolved((path, branch), host, repo, key, _remote_repos(checkout, trusted, host))
+
+    with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
+        per_session = list(zip(sessions, pool.map(_discover, sessions), strict=True))
+        reps: dict[tuple[str, str | None], str] = {}
+        for _, checkouts in per_session:
+            for checkout, branch in checkouts:
+                reps.setdefault((os.path.realpath(checkout), branch), checkout)
+        resolved: list[_Resolved] = list(pool.map(_checkout, reps.items()))
+    ident = {found.path_key: (found.host, found.repo, found.key) for found in resolved}
+    # Union, not overwrite: two worktrees of one origin share a query key but
+    # can declare different remotes. Both are real destinations for that key.
+    destinations: dict[CheckoutKey, list[tuple[str, str]]] = {}
+    for found in resolved:
+        if found.key is not None:
+            merged = destinations.setdefault(found.key, [])
+            merged.extend(repo for repo in found.remotes if repo not in merged)
+    return per_session, ident, destinations
+
+
+def build_snapshot(  # noqa: PLR0913 - explicit environment, host, transport and settings seams
     sessions: list[dict[str, Any]],
     env: TokenEnvironment | None = None,
     transport: httpx.BaseTransport | None = None,
@@ -1483,22 +2028,9 @@ def build_snapshot(  # noqa: PLR0913 - explicit environment, transport, settings
     """
 
     trusted = trusted if trusted is not None else discover_trusted_hosts(env or SystemEnvironment())
-
-    def _discover(session: dict[str, Any]) -> list[tuple[str, str | None]]:
-        return _session_checkouts(session, ignore_submodules=settings.ignore_submodules)
-
-    with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
-        per_session = list(zip(sessions, pool.map(_discover, sessions), strict=True))
-        reps: dict[tuple[str, str | None], str] = {}
-        for _, checkouts in per_session:
-            for checkout, branch in checkouts:
-                reps.setdefault((os.path.realpath(checkout), branch), checkout)
-        ident: dict[tuple[str, str | None], tuple[str | None, str | None, RepoKey | None]] = dict(
-            zip(reps.keys(), pool.map(lambda item: _identify(item[1], trusted, item[0][1]), reps.items()), strict=True)
-        )
-    keys: set[RepoKey] = {key for _, _, key in ident.values() if key is not None}
+    per_session, ident, destinations = _resolve_checkouts(sessions, settings, trusted)
     fetched, auth_present = _fetch_all(
-        keys,
+        destinations,
         env,
         transport,
         force=force,
@@ -1512,7 +2044,7 @@ def build_snapshot(  # noqa: PLR0913 - explicit environment, transport, settings
     out_sessions: list[dict[str, Any]] = []
     for session, checkouts in per_session:
         repos: list[dict[str, Any]] = []
-        session_keys: list[RepoKey] = []
+        session_keys: list[CheckoutKey] = []
         for checkout, branch in checkouts:
             host_name, repo_str, key = ident[(os.path.realpath(checkout), branch)]
             entry: dict[str, Any] = {

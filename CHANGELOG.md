@@ -26,8 +26,17 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
   rebuilds the old cache.
 
 
-## [2.4.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.4.0) - 2026-11-03
 
+### Bug Fixes
+
+- **discovery:** Find upstream-targeting PRs from fork checkouts in web snapshots and direct-worker status/open handlers, using the GitHub remotes each checkout configures (no metadata or fork-lineage calls). The permitted head is always the checkout's own repo (upstream is only a destination), so unrelated same-name branches are rejected; caches, PR selection, and stack navigation stay destination-aware, and destination GraphQL pages are bounded to a single page with owner-scoped REST fallback (#129).
+- **discovery:** Treat an error-envelope discovery response as unknown rather than an empty census: a 200 carrying `RATE_LIMITED` or any other `errors`, or a missing repository connection, now serves the fallback instead of caching "no owned PRs". Discovery's `rateLimit` spend is recorded and a rate-limited envelope arms the shared GraphQL gate.
+- **discovery:** Reuse a *completed* digest ownership result when a key promotes to the full query: ownership depends only on destination and branch, so a crowded page no longer pays a second serial lookup, and owned PRs missing from that page are still fetched by number. Truncated lookups prove nothing and are never handed over, so those still resolve separately.
+- **pull request:** Read PRs fetched by number through the same shared node fragment as branch pages, so review, issue, and workflow fields no longer arrive partial: a requested-changes review older than the head commit now reads "pushed since review" instead of "changes requested".
+- **refresh:** Read a checkout's remotes through the bounded git helper, so a stalled mount or held git lock cannot block a refresh worker and stall the whole tick.
+- **discovery:** Resolve a crowded destination page from the owner-scoped REST probe: when a fresh probe names the owned open PRs and the bounded page omits some, fetch those by number instead of paying serial identity discovery that a heavily used branch name can exhaust for good, and never treat a cache-served probe during REST backoff as a census. Unresolved detail fetches and rate limits cool the key on the short retry window while the long window stays for a page that is certain to truncate again, which needs this tick's live probe: a page bound reached while the probe served a cache entry cools short as well. The digest tier arms that cooldown when ownership stays unproven, and a promotion reuses the digest pass's detail nodes instead of fetching the same PR twice in one tick (#130).
+
+## [2.4.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.4.0) - 2026-11-03
 
 
 ### Bug Fixes

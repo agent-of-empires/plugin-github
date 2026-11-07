@@ -70,9 +70,12 @@ and applicable token family; dotcom guidance explains `GH_TOKEN` precedence.
 
 ## Refresh, state and UI
 
-Network identity is `(host, owner, repo, branch)`. ETags, rich GraphQL caches,
-retry cooldowns, REST/GraphQL backoff and budget observations are partitioned by
-host. Native stack data and unsupported-endpoint caches also include the host;
+Network lookup identity is `(host, destination owner, destination repo, branch,
+head owner, head repo)`. Destinations come from configured remotes on the same
+trusted host; the permitted head repository is always the checkout's origin.
+This finds upstream PRs without mixing contributors' same-name branches. ETags,
+rich GraphQL caches, ownership/truncation retries, REST/GraphQL backoff and budget
+observations are partitioned by host. Native stack data and unsupported-endpoint caches also include the host;
 stack retry backoff is per host and separate from primary REST backoff. One host's
 low budget stretches only its own freshness intervals. Shared state is protected
 by the existing cache lock.
@@ -94,7 +97,8 @@ Snapshots use version 2, repo records include `host`, and authentication is
 first refresh; in-memory caches rebuild at worker startup. Tokens never enter
 either cache format.
 
-PR selection keys include the host as well as owner/repo/PR number. Auth notices
+PR selection keys include the host and the PR's actual destination repository
+as well as its number, including for upstream PRs and stack navigation. Auth notices
 follow the selected repo's host, including repos without PRs. Single-host
 rate-limit notices name that host and budget; multi-host notices use aggregate
 wording. Forced refreshes announce at most one unannounced host at a time,

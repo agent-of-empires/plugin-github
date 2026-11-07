@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 import httpx
 
+from aoe_github_plugin import lookup
 from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.auth import SystemEnvironment
 from aoe_github_plugin.auth import resolve_token
@@ -25,6 +26,7 @@ from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import GitHubAuthError
 from aoe_github_plugin.utils.gitctx import current_branch
 from aoe_github_plugin.utils.gitctx import remote_owner_repo
+from aoe_github_plugin.utils.gitctx import remote_owner_repos
 
 
 def _resolve_optional_token(env: TokenEnvironment | None, host: GitHubHost | None = None) -> str | None:
@@ -37,29 +39,6 @@ def _resolve_optional_token(env: TokenEnvironment | None, host: GitHubHost | Non
         token, _ = resolve_token(env or SystemEnvironment(), host)
         return token
     return None
-
-
-def _open_pulls_for_branch(
-    client: GitHubClient,
-    owner: str,
-    repo: str,
-    branch: str,
-) -> list[dict[str, Any]]:
-    """Open PRs whose head is ``branch``, trimmed to the fields a UI renders."""
-    raw = client.get_json(
-        f"/repos/{owner}/{repo}/pulls",
-        params={"state": "open", "head": f"{owner}:{branch}", "per_page": "10"},
-    )
-    return [
-        {
-            "number": pr["number"],
-            "url": pr["html_url"],
-            "title": pr["title"],
-            "state": pr["state"],
-            "draft": bool(pr.get("draft", False)),
-        }
-        for pr in raw
-    ]
 
 
 def github_status(
@@ -85,9 +64,8 @@ def github_status(
         "error": None,
     }
     try:
-        owner_repo = remote_owner_repo(
-            path, trusted if trusted is not None else discover_trusted_hosts(env or SystemEnvironment())
-        )
+        hosts = trusted if trusted is not None else discover_trusted_hosts(env or SystemEnvironment())
+        owner_repo = remote_owner_repo(path, hosts)
         if owner_repo is None:
             result["summary"] = "GitHub: not a GitHub remote"
             return result
@@ -98,10 +76,17 @@ def github_status(
         result["branch"] = branch
         token = _resolve_optional_token(env, host)
         with GitHubClient(host=host, token=token, transport=transport) as client:
-            pulls = _open_pulls_for_branch(client, owner, repo, branch)
+            # lookup keys omit host identity, so scope them before using this
+            # host's client and credentials, even for other trusted hosts.
+            remotes = [
+                (owner, repo) for remote_host, owner, repo in remote_owner_repos(path, hosts) if remote_host == host
+            ]
+            repos = lookup.repositories((owner, repo), remotes)
+            pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         result["pulls"] = pulls
         if pulls:
-            result["summary"] = f"{owner}/{repo}: PR #{pulls[0]['number']} open for {branch}"
+            where = "/".join(lookup.destination_of(pulls[0].get("url"), (owner, repo)))
+            result["summary"] = f"{where}: PR #{pulls[0]['number']} open for {branch}"
         else:
             result["summary"] = f"{owner}/{repo}: no open PR for {branch}"
     except GitHubError as exc:
@@ -124,9 +109,8 @@ def github_open(
     an existing PR is best-effort: any API failure falls back to the compare
     URL so opening still works offline / unauthenticated.
     """
-    owner_repo = remote_owner_repo(
-        path, trusted if trusted is not None else discover_trusted_hosts(env or SystemEnvironment())
-    )
+    hosts = trusted if trusted is not None else discover_trusted_hosts(env or SystemEnvironment())
+    owner_repo = remote_owner_repo(path, hosts)
     if owner_repo is None:
         raise GitHubError("not a GitHub remote; cannot open in GitHub")
     host, owner, repo = owner_repo
@@ -134,7 +118,13 @@ def github_open(
     with contextlib.suppress(GitHubError):
         token = _resolve_optional_token(env, host)
         with GitHubClient(host=host, token=token, transport=transport) as client:
-            pulls = _open_pulls_for_branch(client, owner, repo, branch)
+            # lookup keys omit host identity, so scope them before using this
+            # host's client and credentials, even for other trusted hosts.
+            remotes = [
+                (owner, repo) for remote_host, owner, repo in remote_owner_repos(path, hosts) if remote_host == host
+            ]
+            repos = lookup.repositories((owner, repo), remotes)
+            pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         if pulls:
             return {"url": pulls[0]["url"], "kind": "pull"}
     quoted = quote(branch, safe="")
