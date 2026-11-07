@@ -4,7 +4,7 @@
 raises), so a status poll always has something to show (issue #1667).
 ``github.open`` is an explicit user action: it resolves the URL to open and may
 raise a typed ``GitHubError`` carrying an actionable hint when the checkout has
-no github.com remote.
+no trusted GitHub remote.
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ from aoe_github_plugin import lookup
 from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.auth import SystemEnvironment
 from aoe_github_plugin.auth import resolve_token
+from aoe_github_plugin.hosts import GitHubHost
+from aoe_github_plugin.hosts import discover_trusted_hosts
 from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import GitHubAuthError
@@ -27,14 +29,14 @@ from aoe_github_plugin.utils.gitctx import remote_owner_repo
 from aoe_github_plugin.utils.gitctx import remote_owner_repos
 
 
-def _resolve_optional_token(env: TokenEnvironment | None) -> str | None:
+def _resolve_optional_token(env: TokenEnvironment | None, host: GitHubHost | None = None) -> str | None:
     """A token if one is configured, else ``None`` (unauthenticated requests).
 
     Auth is optional for read-only status: a missing token is not an error, so
     ``GitHubAuthError`` is swallowed and we fall through to public requests.
     """
     with contextlib.suppress(GitHubAuthError):
-        token, _ = resolve_token(env or SystemEnvironment())
+        token, _ = resolve_token(env or SystemEnvironment(), host)
         return token
     return None
 
@@ -43,6 +45,7 @@ def github_status(
     path: str = ".",
     env: TokenEnvironment | None = None,
     transport: httpx.BaseTransport | None = None,
+    trusted: dict[str, GitHubHost] | None = None,
 ) -> dict[str, Any]:
     """Structured GitHub summary for the checkout at ``path``.
 
@@ -55,26 +58,34 @@ def github_status(
     result: dict[str, Any] = {
         "summary": "",
         "repo": None,
+        "host": None,
         "branch": None,
         "pulls": [],
         "error": None,
     }
     try:
-        owner_repo = remote_owner_repo(path)
+        hosts = trusted if trusted is not None else discover_trusted_hosts(env or SystemEnvironment())
+        owner_repo = remote_owner_repo(path, hosts)
         if owner_repo is None:
-            result["summary"] = "GitHub: not a github.com remote"
+            result["summary"] = "GitHub: not a GitHub remote"
             return result
-        owner, repo = owner_repo
+        host, owner, repo = owner_repo
         branch = current_branch(path)
+        result["host"] = host.name
         result["repo"] = f"{owner}/{repo}"
         result["branch"] = branch
-        token = _resolve_optional_token(env)
-        with GitHubClient(token=token, transport=transport) as client:
-            repos = lookup.repositories(owner_repo, remote_owner_repos(path))
+        token = _resolve_optional_token(env, host)
+        with GitHubClient(host=host, token=token, transport=transport) as client:
+            # lookup keys omit host identity, so scope them before using this
+            # host's client and credentials, even for other trusted hosts.
+            remotes = [
+                (owner, repo) for remote_host, owner, repo in remote_owner_repos(path, hosts) if remote_host == host
+            ]
+            repos = lookup.repositories((owner, repo), remotes)
             pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         result["pulls"] = pulls
         if pulls:
-            where = "/".join(lookup.destination_of(pulls[0].get("url"), owner_repo))
+            where = "/".join(lookup.destination_of(pulls[0].get("url"), (owner, repo)))
             result["summary"] = f"{where}: PR #{pulls[0]['number']} open for {branch}"
         else:
             result["summary"] = f"{owner}/{repo}: no open PR for {branch}"
@@ -88,26 +99,33 @@ def github_open(
     path: str = ".",
     env: TokenEnvironment | None = None,
     transport: httpx.BaseTransport | None = None,
+    trusted: dict[str, GitHubHost] | None = None,
 ) -> dict[str, Any]:
     """Resolve the GitHub URL to open for the checkout at ``path``.
 
     Returns ``{"url", "kind"}`` where ``kind`` is ``"pull"`` (an open PR exists
     for the branch) or ``"compare"`` (the create-PR page for the branch).
-    Raises ``GitHubError`` only when there is no github.com remote. Looking up
+    Raises ``GitHubError`` only when there is no trusted GitHub remote. Looking up
     an existing PR is best-effort: any API failure falls back to the compare
     URL so opening still works offline / unauthenticated.
     """
-    owner_repo = remote_owner_repo(path)
+    hosts = trusted if trusted is not None else discover_trusted_hosts(env or SystemEnvironment())
+    owner_repo = remote_owner_repo(path, hosts)
     if owner_repo is None:
-        raise GitHubError("not a github.com remote; cannot open in GitHub")
-    owner, repo = owner_repo
+        raise GitHubError("not a GitHub remote; cannot open in GitHub")
+    host, owner, repo = owner_repo
     branch = current_branch(path)
     with contextlib.suppress(GitHubError):
-        token = _resolve_optional_token(env)
-        with GitHubClient(token=token, transport=transport) as client:
-            repos = lookup.repositories(owner_repo, remote_owner_repos(path))
+        token = _resolve_optional_token(env, host)
+        with GitHubClient(host=host, token=token, transport=transport) as client:
+            # lookup keys omit host identity, so scope them before using this
+            # host's client and credentials, even for other trusted hosts.
+            remotes = [
+                (owner, repo) for remote_host, owner, repo in remote_owner_repos(path, hosts) if remote_host == host
+            ]
+            repos = lookup.repositories((owner, repo), remotes)
             pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         if pulls:
             return {"url": pulls[0]["url"], "kind": "pull"}
     quoted = quote(branch, safe="")
-    return {"url": f"https://github.com/{owner}/{repo}/compare/{quoted}?expand=1", "kind": "compare"}
+    return {"url": f"{host.web_base}/{owner}/{repo}/compare/{quoted}?expand=1", "kind": "compare"}

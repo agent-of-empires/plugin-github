@@ -44,7 +44,7 @@ icon_asset = "assets/icon.png"
 
 # Capability grants are prompted at install and pinned to the manifest hash.
 # Declare only what the worker actually uses so the prompt stays honest.
-#   net           - real GitHub API calls (api.github.com); also shells out to
+#   net           - GitHub.com and trusted GHES API calls; also shells out to
 #                   `git` and `gh`.
 #   runtime.worker - host RPCs the worker initiates: it pushes PR state to the
 #                   rendered UI slots via `ui.state.set` (#2366) and reads its

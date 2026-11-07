@@ -10,7 +10,7 @@ error degrades that one repo's entry, never the whole refresh.
 
 Efficiency, against the user token's shared budget (REST 5000 req/hr, GraphQL
 5000 points/hr):
-- lookups are deduplicated by destination, branch, and head owner/repository,
+- lookups are deduplicated by host, destination, branch, and head owner/repository,
   keeping shared workspaces cheap without mixing contributors' same-name branches;
 - a cheap REST conditional request (ETag / ``If-None-Match``) is the PRIMARY
   open-PR poll; a ``304`` is free, so that path costs ~0 when unchanged (native
@@ -24,7 +24,7 @@ Efficiency, against the user token's shared budget (REST 5000 req/hr, GraphQL
 - local git identity and the REST probes fan out on small bounded pools (#70);
   GraphQL queries stay serial to stay clear of the secondary/concurrency
   limits;
-- a ``403``/``429``/``RATE_LIMITED`` on primary queries trips global backoff;
+- a ``403``/``429``/``RATE_LIMITED`` on primary queries trips per-host backoff;
   cached values are served instead of hammering the API;
 - native stack enrichment requires a token and uses its own cache and cooldown;
   stack failures do not extend primary REST backoff.
@@ -54,6 +54,9 @@ import httpx
 from aoe_github_plugin import lookup
 from aoe_github_plugin import graphql
 from aoe_github_plugin.auth import TokenEnvironment
+from aoe_github_plugin.auth import SystemEnvironment
+from aoe_github_plugin.hosts import GitHubHost
+from aoe_github_plugin.hosts import discover_trusted_hosts
 from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import NotFoundError
@@ -68,10 +71,12 @@ GIT_TIMEOUT = 2.0
 # rate-limit interaction, so it parallelizes freely; the REST conditional
 # probes are independent per key and 304s are free, but the pool stays small to
 # keep well under GitHub's ~100-concurrent secondary-limit guidance. GraphQL
-# chunks stay serial on purpose: post-#69 they are few and cheap, and they are
-# the piece the secondary limits actually watch (#22).
+# chunks stay serial within each host: post-#69 they are few and cheap, and
+# they are the piece the secondary limits actually watch (#22).
 GIT_WORKERS = 16
 REST_PROBE_WORKERS = 6
+# Keep independent hosts moving without creating one thread per configured server.
+HOST_FETCH_WORKERS = 4
 # Back off proactively once the GraphQL point budget (5000/hr) is nearly spent,
 # so a busy workspace degrades to stale data rather than hard rate-limit errors.
 RATELIMIT_FLOOR = 50
@@ -127,13 +132,12 @@ BACKOFF_SECS = 60.0
 # worker for an unreasonable stretch.
 MAX_BACKOFF_SECS = 3600.0
 
-RepoKey = lookup.PullKey
-CheckoutKey = tuple[str, str, str]  # origin owner/repo, branch; remotes are per-checkout
-# (destination owner, destination repo, branch, head owner, head repo,
-# required_checks_only, ignore_bot_approval_recommendations).
-RichCacheKey = tuple[str, str, str, str, str, bool, bool]
-StackCacheKey = tuple[str, str, int]
-StackRepoKey = tuple[str, str]
+# (host, destination owner/repo, branch, head owner/repo)
+RepoKey = tuple[str, str, str, str, str, str]
+CheckoutKey = tuple[str, str, str, str]  # host, origin owner/repo, branch
+RichCacheKey = tuple[str, str, str, str, str, str, bool, bool]
+StackCacheKey = tuple[str, str, str, int]
+StackRepoKey = tuple[str, str, str]
 
 
 class _UnsupportedStackEndpointError(Exception):
@@ -165,7 +169,7 @@ class SnapshotSettings:
 
 DEFAULT_SNAPSHOT_SETTINGS = SnapshotSettings()
 
-# Cross-refresh ETag cache and a single rate-limit backoff gate. The HTTP
+# Cross-refresh ETag cache and per-host rate-limit backoff gates. The HTTP
 # fan-out threads read/write both, so guard with a lock.
 _cache_lock = threading.Lock()
 _etag_cache: dict[RepoKey, dict[str, Any]] = {}  # key -> {"etag", "pulls"}
@@ -178,7 +182,7 @@ _stack_cache: dict[StackCacheKey, dict[str, Any]] = {}
 STACK_CACHE_TTL = 300.0
 # Isolate the optional stack endpoint from primary open-PR polling.
 STACK_RETRY_COOLDOWN = 300.0
-_stack_backoff = {"until": 0.0}
+_stack_backoff: dict[str, float] = defaultdict(float)
 # Some repositories do not support the native stack endpoint.
 STACK_UNSUPPORTED_TTL = 3600.0
 _stack_unsupported: dict[StackRepoKey, float] = {}
@@ -193,19 +197,14 @@ _session_refresh_cache: dict[str, dict[str, Any]] = {}
 #   until        - time.monotonic() seconds; that budget's HTTP is skipped until then.
 #   reset_known  - True iff `until` came from a parsed GraphQL `resetAt` (so the
 #                  countdown is real); False for the fixed REST fallback.
-# ``notified`` is shared: one user-facing notice per continuous backoff WINDOW
-# (the span where either gate is active), so a forced refresh announces at most once.
+# ``notified`` belongs to each host: one notice per continuous backoff window
+# spanning that host's REST and GraphQL gates.
 _BACKOFF_KINDS = ("rest", "graphql")
-_backoff: dict[str, Any] = {
-    "rest": {"until": 0.0, "reset_known": False},
-    "graphql": {"until": 0.0, "reset_known": False},
-    "notified": False,
-}
-# Last GraphQL budget observation, from any query's ``rateLimit`` payload (#69).
-# ``valid_until`` is the window's reset as a monotonic deadline (or None when
-# resetAt was unusable); past it the observation is discarded, since the budget
-# refilled.
-_graphql_budget: dict[str, Any] = {"remaining": None, "valid_until": None}
+_backoff: dict[str, Any] = defaultdict(
+    lambda: {**{api: {"until": 0.0, "reset_known": False} for api in _BACKOFF_KINDS}, "notified": False}
+)
+# Observations and deadlines are isolated by canonical API host.
+_graphql_budget: dict[str, Any] = defaultdict(lambda: {"remaining": None, "valid_until": None})
 # Per-key cooldown deadline (monotonic) after a NON-rate GraphQL failure, keyed
 # by ``RichCacheKey`` so it is independent of whether a rich cache entry exists
 # (#71). A rate-limit trip already arms the shared backoff gate; this covers the
@@ -265,11 +264,12 @@ def load_snapshot() -> dict[str, Any] | None:
     """The persisted snapshot, or ``None`` if it is missing, corrupt, or the
     wrong shape. Never raises: a bad cache is simply ignored, and the normal
     refresh repopulates. Structural validation (plus the caller filtering by the
-    live session list) is enough; no version envelope is needed."""
+    live session list) includes version 2, since older auth and repo shapes
+    cannot safely be replayed."""
     with contextlib.suppress(Exception):
         with _snapshot_cache_path().open(encoding="utf-8") as fh:
             data = json.load(fh)
-        if isinstance(data, dict) and isinstance(data.get("sessions"), list):
+        if isinstance(data, dict) and data.get("version") == 2 and isinstance(data.get("sessions"), list):
             return data
     return None
 
@@ -345,24 +345,26 @@ def discover_checkouts(workspace: str, *, ignore_submodules: bool = True) -> lis
     return out
 
 
-def _identify(path: str, branch_override: str | None = None) -> tuple[str | None, CheckoutKey | None]:
-    """Resolve the origin repo and branch, preferring the host's session branch.
+def _identify(
+    path: str, trusted: dict[str, GitHubHost], branch_override: str | None = None
+) -> tuple[str | None, str | None, CheckoutKey | None]:
+    """Resolve the trusted host, repo and key, preferring the session branch.
 
     A non-GitHub origin is a benign skip; a known repo on detached HEAD has no
     branch key to query. Discovery-only checkouts read their branch from Git.
     """
     remote = _git(path, "remote", "get-url", "origin")
-    owner_repo = parse_owner_repo(remote) if remote else None
+    owner_repo = parse_owner_repo(remote, trusted) if remote else None
     if owner_repo is None:
-        return None, None
-    owner, repo = owner_repo
+        return None, None, None
+    host, owner, repo = owner_repo
     branch = branch_override or _git(path, "rev-parse", "--abbrev-ref", "HEAD")
     if not branch or branch == "HEAD":
-        return f"{owner}/{repo}", None
-    return f"{owner}/{repo}", (owner, repo, branch)
+        return host.name, f"{owner}/{repo}", None
+    return host.name, f"{owner}/{repo}", (host.name, owner, repo, branch)
 
 
-def _remote_repos(path: str) -> list[tuple[str, str]]:
+def _remote_repos(path: str, trusted: dict[str, GitHubHost], host: str | None) -> list[tuple[str, str]]:
     """Destinations this checkout may target: its configured GitHub remotes.
 
     Read per checkout, not per session or origin: two worktrees of the same
@@ -381,9 +383,9 @@ def _remote_repos(path: str) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     for name in sorted((names or "").split(), key=lambda n: (n != "origin", n)):
         url = _git(path, "remote", "get-url", name)
-        repo = parse_owner_repo(url) if url else None
-        if repo is not None and repo not in out:
-            out.append(repo)
+        repo = parse_owner_repo(url, trusted) if url else None
+        if repo is not None and repo[0].name == host and repo[1:] not in out:
+            out.append(repo[1:])
     return out
 
 
@@ -425,7 +427,7 @@ def _trim(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [lookup.trim_pull(pr) for pr in raw if isinstance(pr, dict)]
 
 
-def _stack_pull(raw: dict[str, Any], owner: str, repo: str) -> dict[str, Any] | None:
+def _stack_pull(raw: dict[str, Any], owner: str, repo: str, *, web_base: str) -> dict[str, Any] | None:
     """Trim one full REST PR response for stack navigation and readiness."""
     number = raw.get("number")
     head = raw.get("head")
@@ -435,7 +437,7 @@ def _stack_pull(raw: dict[str, Any], owner: str, repo: str) -> dict[str, Any] | 
         return None
     return {
         "number": number,
-        "url": raw.get("html_url") or f"https://github.com/{owner}/{repo}/pull/{number}",
+        "url": raw.get("html_url") or f"{web_base}/{owner}/{repo}/pull/{number}",
         "title": raw.get("title") or "",
         "state": raw.get("state"),
         "draft": bool(raw.get("draft")),
@@ -470,12 +472,12 @@ def _fetch_stack_members(client: GitHubClient, key: RepoKey, members: Any) -> li
         if not isinstance(number, int) or isinstance(number, bool):
             return None
         raw = client.get_json(
-            f"/repos/{key[0]}/{key[1]}/pulls/{number}",
+            f"/repos/{key[1]}/{key[2]}/pulls/{number}",
             api_version=STACK_API_VERSION,
         )
         if not isinstance(raw, dict):
             return None
-        trimmed = _stack_pull(raw, key[0], key[1])
+        trimmed = _stack_pull(raw, key[1], key[2], web_base=client.host.web_base)
         if trimmed is None:
             return None
         pulls.append(trimmed)
@@ -489,7 +491,7 @@ def _cache_stack(key: StackCacheKey, pulls: list[dict[str, Any]], fetched_at: fl
         previous_pulls = previous.get("pulls") if previous is not None else None
         if isinstance(previous_pulls, list):
             for member in previous_pulls:
-                old_key = (key[0], key[1], member["number"])
+                old_key = (*key[:3], member["number"])
                 entry = _stack_cache.get(old_key)
                 if (
                     member["number"] not in member_numbers
@@ -507,7 +509,7 @@ def _cache_stack(key: StackCacheKey, pulls: list[dict[str, Any]], fetched_at: fl
         }
         if pulls:
             for pull in pulls:
-                _stack_cache[(key[0], key[1], pull["number"])] = entry
+                _stack_cache[(*key[:3], pull["number"])] = entry
         else:
             _stack_cache[key] = entry
 
@@ -535,7 +537,7 @@ def _stale_stack(
         if pulls is not None:
             cached["stale"] = True
             for member in pulls:
-                member_key = (cache_key[0], cache_key[1], member["number"])
+                member_key = (*cache_key[:3], member["number"])
                 entry = _stack_cache.get(member_key)
                 if entry is not None and entry.get("pulls") is pulls:
                     entry["retry_at"] = now + STACK_CACHE_TTL
@@ -551,7 +553,7 @@ def _fetch_stack_with_state(
     force: bool = False,
 ) -> tuple[list[dict[str, Any]] | None, bool]:
     """Return stack data and whether it is stale fallback data."""
-    cache_key: StackCacheKey = (key[0], key[1], number)
+    cache_key: StackCacheKey = (*key[:3], number)
     now = time.monotonic()
     with _cache_lock:
         cached = _stack_cache.get(cache_key)
@@ -564,11 +566,11 @@ def _fetch_stack_with_state(
     try:
         pulls = _fetch_stack_response(client, key, number)
     except RateLimitedError:
-        _set_stack_backoff(now)
+        _set_stack_backoff(now, host=key[0])
         pulls = None
     except _UnsupportedStackEndpointError:
         with _cache_lock:
-            _stack_unsupported[(key[0], key[1])] = now + STACK_UNSUPPORTED_TTL
+            _stack_unsupported[key[:3]] = now + STACK_UNSUPPORTED_TTL
         pulls = None
     except GitHubError:
         pulls = None
@@ -595,9 +597,9 @@ def _stack_cache_shortcut(
     cached: dict[str, Any] | None,
     now: float,
 ) -> tuple[list[dict[str, Any]] | None, bool] | None:
-    repo_key = (cache_key[0], cache_key[1])
+    repo_key = cache_key[:3]
     with _cache_lock:
-        blocked = now < _backoff["rest"]["until"] or now < _stack_backoff["until"]
+        blocked = now < _backoff[cache_key[0]]["rest"]["until"] or now < _stack_backoff[cache_key[0]]
         unsupported_until = _stack_unsupported.get(repo_key)
         if unsupported_until is not None and unsupported_until <= now:
             del _stack_unsupported[repo_key]
@@ -614,15 +616,15 @@ def _stack_cache_shortcut(
     return None
 
 
-def _set_stack_backoff(now: float) -> None:
+def _set_stack_backoff(now: float, *, host: str) -> None:
     with _cache_lock:
-        _stack_backoff["until"] = max(_stack_backoff["until"], now + STACK_RETRY_COOLDOWN)
+        _stack_backoff[host] = max(_stack_backoff[host], now + STACK_RETRY_COOLDOWN)
 
 
 def _fetch_stack_response(client: GitHubClient, key: RepoKey, number: int) -> list[dict[str, Any]] | None:
     try:
         response = client.get_json(
-            f"/repos/{key[0]}/{key[1]}/stacks",
+            f"/repos/{key[1]}/{key[2]}/stacks",
             {"pull_request": str(number)},
             api_version=STACK_API_VERSION,
         )
@@ -674,7 +676,7 @@ def _fetch_stack_for_pull(
     number = pull.get("number")
     if not isinstance(number, int) or isinstance(number, bool):
         return None, False
-    cache_key = (key[0], key[1], number)
+    cache_key = (*key[:3], number)
     stack, stale = _fetch_stack_with_state(
         client,
         key,
@@ -682,7 +684,7 @@ def _fetch_stack_for_pull(
         force=force and cache_key not in refreshed,
     )
     if stack:
-        refreshed.update((key[0], key[1], member["number"]) for member in stack)
+        refreshed.update((*key[:3], member["number"]) for member in stack)
     return stack, stale
 
 
@@ -747,15 +749,15 @@ def _reset_to_monotonic(reset_at: Any) -> float | None:
     return time.monotonic() + min(delta, MAX_BACKOFF_SECS)
 
 
-def _set_backoff(api: str, reset_at: Any = None) -> None:
+def _set_backoff(api: str, reset_at: Any = None, *, host: str) -> None:
     """Arm one budget's backoff gate (``api`` is ``"rest"`` or ``"graphql"``).
     Prefers the GraphQL response's ``resetAt`` (so we wait exactly until the
     budget refills); falls back to a fixed window for the REST path, which has no
     usable reset.
 
-    A fresh WINDOW (both gates already expired) clears the shared ``notified``
+    A fresh host window (both of its gates already expired) clears its ``notified``
     flag so the next user-initiated refresh announces it once; an overlapping trip
-    of the other budget never re-opens the notice. Re-arming an already-active
+    of the same host's other budget never re-opens the notice. Re-arming an already-active
     gate only extends the deadline and upgrades ``reset_known``; it never shortens
     the wait or downgrades a real reset to the fallback (the fan-out calls this
     repeatedly per window)."""
@@ -764,10 +766,10 @@ def _set_backoff(api: str, reset_at: Any = None) -> None:
     new_until = until if until is not None else now + BACKOFF_SECS
     new_known = until is not None
     with _cache_lock:
-        # Fresh window only when neither budget is currently backed off.
-        if all(now >= _backoff[k]["until"] for k in _BACKOFF_KINDS):
-            _backoff["notified"] = False
-        gate = _backoff[api]
+        # Only this host's gates determine whether its notification window is new.
+        if _active_backoff_locked(now, host=host) is None:
+            _backoff[host]["notified"] = False
+        gate = _backoff[host][api]
         if new_until > gate["until"]:  # arm or extend; never shorten
             gate["until"] = new_until
             gate["reset_known"] = new_known
@@ -775,19 +777,27 @@ def _set_backoff(api: str, reset_at: Any = None) -> None:
             gate["reset_known"] = gate["reset_known"] or new_known
 
 
-def _active_backoff_locked(now: float) -> dict[str, Any] | None:
+def _active_backoff_locked(now: float, *, host: str) -> dict[str, Any] | None:
     """The active gate that stays limited LONGEST (the point the whole plugin is
     clear again), as ``{"seconds", "reset_known", "budget"}``, or ``None`` when
     neither budget is backed off. ``budget`` is ``"mixed"`` when both are active.
     Caller must hold ``_cache_lock``. ``reset_known`` is that one gate's flag, not
     an OR: a known 20s GraphQL reset behind an unknown 60s REST fallback is still
     an unknown overall clear time."""
-    active = [(k, _backoff[k]) for k in _BACKOFF_KINDS if now < _backoff[k]["until"]]
+    active = [(k, _backoff[host][k]) for k in _BACKOFF_KINDS if now < _backoff[host][k]["until"]]
     if not active:
         return None
     _kind, gate = max(active, key=lambda item: item[1]["until"])
     budget = active[0][0] if len(active) == 1 else "mixed"
     return {"seconds": gate["until"] - now, "reset_known": bool(gate["reset_known"]), "budget": budget}
+
+
+def _all_backoff_locked(now: float) -> dict[str, Any] | None:
+    active = [(host, status) for host in _backoff if (status := _active_backoff_locked(now, host=host)) is not None]
+    if not active:
+        return None
+    host, status = max(active, key=lambda item: item[1]["seconds"])
+    return {**status, **({"host": host} if len(active) == 1 else {"hosts": sorted(h for h, _ in active)})}
 
 
 def _rate_limit_status() -> dict[str, Any] | None:
@@ -796,22 +806,27 @@ def _rate_limit_status() -> dict[str, Any] | None:
     so the background pane can reflect the degraded state without spending the
     forced-refresh toast's one-shot."""
     with _cache_lock:
-        return _active_backoff_locked(time.monotonic())
+        return _all_backoff_locked(time.monotonic())
 
 
 def _consume_rate_limit_notice() -> dict[str, Any] | None:
-    """Claim this backoff window's one user-facing notice. Returns
-    ``{"seconds", "reset_known", "budget"}`` the first time it is called while a
-    backoff is active and unannounced (then marks the window announced), else
-    ``None``. Only a user-initiated (forced) refresh consumes it; background ticks
-    never do, so a rate-limited workspace is not nagged on every poll."""
+    """Claim one unannounced host window, preferring the longest remaining wait.
+
+    Only the announced host is marked notified. Other hosts remain eligible on
+    a later forced refresh; background refreshes never consume these notices.
+    """
     now = time.monotonic()
     with _cache_lock:
-        status = _active_backoff_locked(now)
-        if status is None or _backoff["notified"]:
+        active = [
+            (host, status)
+            for host in sorted(_backoff)
+            if not _backoff[host]["notified"] and (status := _active_backoff_locked(now, host=host)) is not None
+        ]
+        if not active:
             return None
-        _backoff["notified"] = True
-        return status
+        host, status = max(active, key=lambda item: item[1]["seconds"])
+        _backoff[host]["notified"] = True
+        return {**status, "host": host}
 
 
 def _forced_rate_limit_notice(*, force: bool) -> dict[str, Any]:
@@ -843,7 +858,7 @@ def _probe_extra_pages(
         try:
             batch = client.get_json(path, {**params, "page": str(page)})
         except RateLimitedError:
-            _set_backoff("rest")
+            _set_backoff("rest", host=client.host.name)
             return False, False
         except GitHubError:
             return False, False
@@ -856,7 +871,7 @@ def _probe_extra_pages(
 
 
 def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str, Any]], bool]:
-    """Cheap REST conditional check for one ``(owner, repo, branch)``: returns
+    """Cheap REST conditional check for one ``(host, owner, repo, branch)``: returns
     ``(changed, pulls, fresh)`` where ``changed`` is ``False`` on a ``304`` (the
     open-PR list is unchanged, the request was free against the primary limit).
     A ``304`` is still fresh for the basic REST representation, and a paginated
@@ -865,21 +880,21 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
     the backoff gate; a blocked or rate-limited probe with a cached value reports
     ``fresh=False`` because it serves stale fallback, and only raises
     ``GitHubError`` when there is nothing to fall back on."""
-    owner, repo, branch, head_owner, _ = key
+    host, owner, repo, branch, head_owner, _ = key
     with _cache_lock:
         cached = _etag_cache.get(key)
-        blocked = time.monotonic() < _backoff["rest"]["until"]
+        blocked = time.monotonic() < _backoff[host]["rest"]["until"]
     if blocked:
         if cached is not None:
             return False, cached["pulls"], False
-        raise RateLimitedError
+        raise RateLimitedError(client.host)
     etag = cached["etag"] if cached else None
     page_size = 100
     params = {"state": "open", "head": f"{head_owner}:{branch}", "per_page": str(page_size)}
     try:
         status, new_etag, raw = client.get_json_conditional(f"/repos/{owner}/{repo}/pulls", params, etag)
     except RateLimitedError:
-        _set_backoff("rest")
+        _set_backoff("rest", host=host)
         if cached is not None:
             return False, cached["pulls"], False
         raise
@@ -892,7 +907,7 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
     # change without page one's ETag moving, so they are read unconditionally
     # and the result then stores no ETag.
     single_page, fresh = _probe_extra_pages(client, f"/repos/{owner}/{repo}/pulls", params, items, page_size)
-    pulls = _trim([pr for pr in items if lookup.matches_head(pr.get("head"), key)])
+    pulls = _trim([pr for pr in items if lookup.matches_head(pr.get("head"), key[1:])])
     if not fresh:
         # A partial census must not become the cached list: an owned PR past the
         # failed page would vanish from every later fallback. Serve the last
@@ -912,7 +927,7 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
 
 
 def _fetch_key(client: GitHubClient, key: RepoKey) -> tuple[list[dict[str, Any]], bool]:
-    """Open PRs for one ``(owner, repo, branch)`` via the basic REST path (no
+    """Open PRs for one ``(host, owner, repo, branch)`` via the basic REST path (no
     token). The conditional probe is the whole job here; the change flag only
     matters on the token path, which gates GraphQL on it."""
     _, pulls, fresh = _rest_probe(client, key)
@@ -986,51 +1001,53 @@ def _is_active(pulls: list[dict[str, Any]]) -> bool:
     return False
 
 
-def _observe_rate_limit(rate_info: dict[str, Any], *, kind: str, repo: str, aliases: int) -> None:
+def _observe_rate_limit(rate_info: dict[str, Any], *, host: str, kind: str, repo: str, aliases: int) -> None:
     """Record a query's ``rateLimit`` payload: log the spend (the #69 telemetry
     gap; ``cost`` used to be selected and thrown away) and remember ``remaining``
     for budget-pressure pacing, valid until the window resets."""
     cost = rate_info.get("cost")
     remaining = rate_info.get("remaining")
-    _LOG.info("graphql kind=%s repo=%s aliases=%d cost=%s remaining=%s", kind, repo, aliases, cost, remaining)
+    _LOG.info(
+        "graphql host=%s kind=%s repo=%s aliases=%d cost=%s remaining=%s", host, kind, repo, aliases, cost, remaining
+    )
     if not isinstance(remaining, int):
         return
     with _cache_lock:
-        _graphql_budget["remaining"] = remaining
-        _graphql_budget["valid_until"] = _reset_to_monotonic(rate_info.get("resetAt"))
+        _graphql_budget[host]["remaining"] = remaining
+        _graphql_budget[host]["valid_until"] = _reset_to_monotonic(rate_info.get("resetAt"))
 
 
-def _budget_multiplier(now: float) -> float:
+def _budget_multiplier(now: float, *, host: str) -> float:
     """Ceiling stretch under budget pressure: ``BUDGET_PRESSURE_MULTIPLIER`` when
     the last-seen GraphQL ``remaining`` (still within its window) is low, else 1.
     An observation whose window has reset is discarded; the budget refilled."""
     with _cache_lock:
-        remaining = _graphql_budget["remaining"]
-        valid_until = _graphql_budget["valid_until"]
+        remaining = _graphql_budget[host]["remaining"]
+        valid_until = _graphql_budget[host]["valid_until"]
         if remaining is None:
             return 1.0
         if valid_until is not None and now >= valid_until:
-            _graphql_budget["remaining"] = None
-            _graphql_budget["valid_until"] = None
+            _graphql_budget[host]["remaining"] = None
+            _graphql_budget[host]["valid_until"] = None
             return 1.0
     return BUDGET_PRESSURE_MULTIPLIER if remaining < BUDGET_PRESSURE_REMAINING else 1.0
 
 
-def _digest_stale(rich: dict[str, Any], now: float) -> bool:
+def _digest_stale(rich: dict[str, Any], now: float, *, host: str) -> bool:
     """Whether the cached rich result wants digest revalidation: aged past the
     short active ceiling (#26) or the 300s one since it was last fetched OR
     digest-validated, stretched under budget pressure."""
     ceiling = GRAPHQL_ACTIVE_DIGEST_STALE if _is_active(rich["pulls"]) else GRAPHQL_DIGEST_STALE
     validated = rich.get("validated_at", rich["fetched_at"])
-    return (now - validated) >= ceiling * _budget_multiplier(now)
+    return (now - validated) >= ceiling * _budget_multiplier(now, host=host)
 
 
-def _full_stale(rich: dict[str, Any], now: float) -> bool:
+def _full_stale(rich: dict[str, Any], now: float, *, host: str) -> bool:
     """Whether the cached rich result is past the HARD full-fetch ceiling: only a
     real full query resets this clock, so digest false negatives (fields the
     signature cannot see) are bounded rather than permanent."""
     ceiling = GRAPHQL_ACTIVE_FULL_MAX_STALE if _is_active(rich["pulls"]) else GRAPHQL_FULL_MAX_STALE
-    return (now - rich["fetched_at"]) >= ceiling * _budget_multiplier(now)
+    return (now - rich["fetched_at"]) >= ceiling * _budget_multiplier(now, host=host)
 
 
 def _error_aliases(data: dict[str, Any]) -> set[str]:
@@ -1054,6 +1071,7 @@ def _paginate_threads(client: GitHubClient, pull_node: dict[str, Any]) -> None:
     PLACE, so the normalizer counts every unresolved comment. Bounded by
     ``MAX_REVIEW_THREADS`` and fail-soft: any error keeps the first page rather
     than blanking comments (the next refresh retries the tail)."""
+    host = client.host.name
     threads = pull_node.get("reviewThreads")
     node_id = pull_node.get("id")
     if not isinstance(threads, dict) or not isinstance(node_id, str):
@@ -1066,12 +1084,14 @@ def _paginate_threads(client: GitHubClient, pull_node: dict[str, Any]) -> None:
     try:
         while page.get("hasNextPage") and isinstance(cursor, str) and len(nodes) < MAX_REVIEW_THREADS:
             with _cache_lock:
-                if time.monotonic() < _backoff["graphql"]["until"]:
+                if time.monotonic() < _backoff[host]["graphql"]["until"]:
                     return  # the GraphQL gate tripped (e.g. the batched query armed it); stop here
             data = client.post_graphql(graphql.THREADS_PAGE_QUERY, {"id": node_id, "cursor": cursor})
-            _observe_rate_limit(((data.get("data") or {}).get("rateLimit") or {}), kind="threads", repo="-", aliases=1)
+            _observe_rate_limit(
+                ((data.get("data") or {}).get("rateLimit") or {}), host=host, kind="threads", repo="-", aliases=1
+            )
             if _graphql_rate_limited(data):
-                _set_backoff("graphql", ((data.get("data") or {}).get("rateLimit") or {}).get("resetAt"))
+                _set_backoff("graphql", ((data.get("data") or {}).get("rateLimit") or {}).get("resetAt"), host=host)
                 return
             conn = ((data.get("data") or {}).get("node") or {}).get("reviewThreads") or {}
             more = [n for n in (conn.get("nodes") or []) if isinstance(n, dict)]
@@ -1081,7 +1101,7 @@ def _paginate_threads(client: GitHubClient, pull_node: dict[str, Any]) -> None:
             page = conn.get("pageInfo") or {}
             cursor = page.get("endCursor")
     except RateLimitedError:
-        _set_backoff("graphql")
+        _set_backoff("graphql", host=host)
         return
     except GitHubError:
         return
@@ -1197,20 +1217,20 @@ def _fetch_details(
         try:
             data = client.post_graphql(graphql.DETAIL_QUERY, {"owner": owner, "repo": repo, "number": number})
         except RateLimitedError:
-            _set_backoff("graphql")
+            _set_backoff("graphql", host=client.host.name)
             unresolved.update(ordered[index:])
             break
         except GitHubError:
             unresolved.add(number)
             continue
         rate_info = (data.get("data") or {}).get("rateLimit") or {}
-        _observe_rate_limit(rate_info, kind="detail", repo=f"{owner}/{repo}", aliases=1)
+        _observe_rate_limit(rate_info, host=client.host.name, kind="detail", repo=f"{owner}/{repo}", aliases=1)
         if _graphql_rate_limited(data):
-            _set_backoff("graphql", rate_info.get("resetAt"))
+            _set_backoff("graphql", rate_info.get("resetAt"), host=client.host.name)
             unresolved.update(ordered[index:])
             break
         node = ((data.get("data") or {}).get("repository") or {}).get("pullRequest")
-        if isinstance(node, dict) and lookup.matches_head(lookup.graphql_head(node), key):
+        if isinstance(node, dict) and lookup.matches_head(lookup.graphql_head(node), key[1:]):
             found.append(node)
         elif not isinstance(node, dict):
             # The PR the caller proved ours did not come back: an absence this
@@ -1254,7 +1274,7 @@ def _fresh_probe_connection(
     missing = rest_numbers - page_numbers
     if not missing:
         return None, filtered
-    details, unresolved = _fetch_details(client, key[0], key[1], missing, key)
+    details, unresolved = _fetch_details(client, key[1], key[2], missing, key)
     if unresolved:
         return TRUNCATION_TRANSIENT, filtered
     page_nodes.extend(details)
@@ -1303,7 +1323,7 @@ def _owned_connection(
     cache entry, only a short retry. A REST-only collision never arms a cooldown,
     because a collision is not a failure to retry.
     """
-    filtered = lookup.filter_connection(conn, key)
+    filtered = lookup.filter_connection(conn, key[1:])
     # A final page is self-evident: ``hasNextPage: false`` says it holds every
     # OPEN/MERGED PR with the branch name, so any lookup would cost a serial
     # round trip per key per tick for nothing.
@@ -1339,7 +1359,7 @@ def _discovered_connection(
     PRs still pending; ``TRUNCATION_TRANSIENT`` means the lookups themselves
     failed without proving either answer.
     """
-    owner, repo, branch = key[:3]
+    owner, repo, branch = key[1:4]
 
     def observe(rate_info: dict[str, Any]) -> None:
         """Record discovery's spend and arm the gate on budget pressure.
@@ -1348,10 +1368,10 @@ def _discovered_connection(
         reports it as incomplete and flags it, so the REST fallback serves this
         tick and the backoff gate stops the next one from retrying into it.
         """
-        _observe_rate_limit(rate_info, kind="discover", repo=f"{owner}/{repo}", aliases=1)
+        _observe_rate_limit(rate_info, host=client.host.name, kind="discover", repo=f"{owner}/{repo}", aliases=1)
         remaining = rate_info.get("remaining")
         if isinstance(remaining, int) and remaining < RATELIMIT_FLOOR:
-            _set_backoff("graphql", rate_info.get("resetAt"))
+            _set_backoff("graphql", rate_info.get("resetAt"), host=client.host.name)
 
     try:
         nodes, complete, rate_limited = lookup.discover_pages(client, owner, repo, branch, observe=observe)
@@ -1361,12 +1381,12 @@ def _discovered_connection(
             # HTTP-level rate limit here would otherwise escape the chunk
             # handlers, degrade every remaining key to an "internal" error, and
             # never arm the gate. Arm it and let this key serve REST/stale.
-            _set_backoff("graphql")
+            _set_backoff("graphql", host=client.host.name)
         return TRUNCATION_TRANSIENT, filtered
     if rate_limited:
         # The envelope itself was an error, so the run proved nothing; the gate
         # keeps the next tick from retrying into the limit.
-        _set_backoff("graphql")
+        _set_backoff("graphql", host=client.host.name)
     if rate_limited or not complete:
         # Unproven either way. A rate limit is a one-off retry; a page bound
         # reached with the server still reporting more PRs is a page certain to
@@ -1378,14 +1398,14 @@ def _discovered_connection(
     # records. A PR discovery proved ours but this bounded page did not carry
     # (foreign same-name PRs filled ``first: 3``) is fetched by number rather
     # than reported absent, which would hide a real PR behind an empty result.
-    owned = [node for node in nodes if lookup.matches_head(lookup.graphql_head(node), key)]
+    owned = [node for node in nodes if lookup.matches_head(lookup.graphql_head(node), key[1:])]
     owned_numbers = {node.get("number") for node in owned}
     kept = [
         node
         for node in conn.get("nodes") or []
         if isinstance(node, dict)
         and node.get("number") in owned_numbers
-        and lookup.matches_head(lookup.graphql_head(node), key)
+        and lookup.matches_head(lookup.graphql_head(node), key[1:])
     ]
     # Recover only OPEN PRs the page omitted. The rich page legitimately carries
     # merged PRs as historical selector entries, so recovering every omitted
@@ -1483,7 +1503,7 @@ def _apply_aliases(
                 kept.extend(reuse)
                 missing -= {node.get("number") for node in reuse}
             if missing:
-                details, unresolved = _fetch_details(client, key[0], key[1], missing, key)
+                details, unresolved = _fetch_details(client, key[1], key[2], missing, key)
                 kept.extend(details)
             conn = {**conn, "nodes": kept, "pageInfo": {"hasNextPage": False, "endCursor": None}}
             # An owned OPEN PR stayed unfetchable: never cache a fresh result
@@ -1554,20 +1574,20 @@ def _fetch_chunk(
     key in ``chunk``, isolating failures: a blocked/rate-limited query or a single
     failed alias falls back per key (rich cache, then basic REST), never
     group-wide."""
-    owner, repo = chunk[0][:2]
+    host, owner, repo = chunk[0][:3]
     with _cache_lock:
-        blocked = time.monotonic() < _backoff["graphql"]["until"]
+        blocked = time.monotonic() < _backoff[host]["graphql"]["until"]
     if blocked:
         _chunk_fallback(chunk, pending, out)
         return
 
     variables: dict[str, Any] = {"owner": owner, "repo": repo}
     for i, key in enumerate(chunk):
-        variables[f"b{i}"] = key[2]
+        variables[f"b{i}"] = key[3]
     try:
         data = client.post_graphql(graphql.build_query(len(chunk)), variables)
     except RateLimitedError:
-        _set_backoff("graphql")
+        _set_backoff("graphql", host=host)
         _chunk_fallback(chunk, pending, out)
         return
     except GitHubError:
@@ -1581,12 +1601,12 @@ def _fetch_chunk(
     payload = data.get("data") or {}
     rate_info = payload.get("rateLimit") or {}
     repository = payload.get("repository")
-    _observe_rate_limit(rate_info, kind="full", repo=f"{owner}/{repo}", aliases=len(chunk))
+    _observe_rate_limit(rate_info, host=host, kind="full", repo=f"{owner}/{repo}", aliases=len(chunk))
     # Arm backoff for the next refresh on a riding rate-limit error or a low
     # remaining budget, after caching whatever good data this response carries.
     remaining = rate_info.get("remaining")
     if _graphql_rate_limited(data) or (isinstance(remaining, int) and remaining < RATELIMIT_FLOOR):
-        _set_backoff("graphql", rate_info.get("resetAt"))
+        _set_backoff("graphql", rate_info.get("resetAt"), host=host)
 
     if not isinstance(repository, dict):
         _resolve_null_repository(chunk, pending, data, out)
@@ -1668,20 +1688,20 @@ def _fetch_digest_chunk(
     mismatch promotes the key into ``full_pending`` for the rich query. Failures
     (blocked gate, rate limit, malformed alias) serve the stale cache; they
     never promote to full, so a flaky digest cannot burn full-query points."""
-    owner, repo = chunk[0][:2]
+    host, owner, repo = chunk[0][:3]
     with _cache_lock:
-        blocked = time.monotonic() < _backoff["graphql"]["until"]
+        blocked = time.monotonic() < _backoff[host]["graphql"]["until"]
     if blocked:
         _chunk_fallback(chunk, pending, out)
         return
 
     variables: dict[str, Any] = {"owner": owner, "repo": repo}
     for i, key in enumerate(chunk):
-        variables[f"b{i}"] = key[2]
+        variables[f"b{i}"] = key[3]
     try:
         data = client.post_graphql(graphql.build_digest_query(len(chunk)), variables)
     except RateLimitedError:
-        _set_backoff("graphql")
+        _set_backoff("graphql", host=host)
         _chunk_fallback(chunk, pending, out)
         return
     except GitHubError:
@@ -1693,10 +1713,10 @@ def _fetch_digest_chunk(
 
     payload = data.get("data") or {}
     rate_info = payload.get("rateLimit") or {}
-    _observe_rate_limit(rate_info, kind="digest", repo=f"{owner}/{repo}", aliases=len(chunk))
+    _observe_rate_limit(rate_info, host=host, kind="digest", repo=f"{owner}/{repo}", aliases=len(chunk))
     remaining = rate_info.get("remaining")
     if _graphql_rate_limited(data) or (isinstance(remaining, int) and remaining < RATELIMIT_FLOOR):
-        _set_backoff("graphql", rate_info.get("resetAt"))
+        _set_backoff("graphql", rate_info.get("resetAt"), host=host)
     if _graphql_rate_limited(data):
         _chunk_fallback(chunk, pending, out)  # backoff gate handles the retry cadence
         return
@@ -1717,9 +1737,9 @@ def _run_chunked(
     """Group ``pending`` by ``(owner, repo)``, chunk to ``MAX_GRAPHQL_ALIASES``
     (#25), and run each chunk fail-soft: an unexpected error degrades its own
     chunk's keys, never the whole refresh."""
-    groups: dict[tuple[str, str], list[RepoKey]] = defaultdict(list)
+    groups: dict[tuple[str, str, str], list[RepoKey]] = defaultdict(list)
     for key in pending:
-        groups[(key[0], key[1])].append(key)
+        groups[(key[0], key[1], key[2])].append(key)
     for gkeys in groups.values():
         gkeys.sort()
         for start in range(0, len(gkeys), MAX_GRAPHQL_ALIASES):
@@ -1793,9 +1813,9 @@ def _fetch_rich(
             # the current PR set, so prefer it; otherwise serve the basic pulls,
             # reporting the probe's own freshness rather than asserting fresh.
             out[key] = _pulls_result(basic, fresh=_fresh, stale=not _fresh)
-        elif rich is None or force or changed or rich.get("digest") is None or _full_stale(rich, now):
+        elif rich is None or force or changed or rich.get("digest") is None or _full_stale(rich, now, host=key[0]):
             full_pending[key] = entry
-        elif _digest_stale(rich, now):
+        elif _digest_stale(rich, now, host=key[0]):
             digest_pending[key] = entry
         else:
             # ``_fresh`` distinguishes a real 304 (GitHub confirmed the data is
@@ -1853,63 +1873,76 @@ def _session_freshness(
     return None
 
 
-def _fetch_all(
+def _fetch_all(  # noqa: PLR0913 - explicit environment, host, transport and normalization seams
     destinations: dict[CheckoutKey, list[tuple[str, str]]],
     env: TokenEnvironment | None,
     transport: httpx.BaseTransport | None,
     *,
     force: bool = False,
     flags: _NormalizeFlags = DEFAULT_NORMALIZE_FLAGS,
-) -> tuple[dict[CheckoutKey, dict[str, Any]], bool]:
-    """Fetch every unique key. Returns ``(results, token_present)`` where results
+    trusted: dict[str, GitHubHost],
+) -> tuple[dict[CheckoutKey, dict[str, Any]], dict[str, bool]]:
+    """Fetch origin and upstream candidates, preserving per-host authentication.
     is ``key -> {"pulls": [...]}`` or ``key -> {"error": {...}}``. With a token,
     keys go through the REST-conditional-gated rich path and same-repo branches
     that need GraphQL share one batched query (``_fetch_rich``); without one we
-    keep the basic REST open-PR path and report ``token_present=False`` so the UI
+    keep the basic REST open-PR path and report ``token_present_by_host[host]=False`` so the UI
     can show the "token needed" banner. ``force`` (a manual refresh) bypasses the
     staleness gate on the token path. REST probes fan out on a small bounded
-    pool (#70); GraphQL is batched per repo and stays serialized (sorted for
-    determinism), to stay under GitHub's secondary/concurrency limits (#22);
+    pool (#70); a separate bounded pool fetches independent host groups
+    concurrently. GraphQL stays serialized within each host to respect its
+    secondary limits. Results are collected in sorted host order;
     none of this touches stdin or host RPCs."""
-    if not destinations:
-        return {}, True
-    token = _resolve_optional_token(env)
-    present = token is not None
-    by_checkout: dict[CheckoutKey, list[RepoKey]] = {}
-    with GitHubClient(token=token, transport=transport) as client:
-        for key in sorted(destinations):
-            # ``key[:2]`` IS this checkout's origin, so anchoring here is exact
-            # even when the remote read returns nothing: ``pull_keys`` on an
-            # empty list yields no candidate to index, and an ``IndexError``
-            # would abort every session's snapshot instead of searching origin.
-            by_checkout[key] = lookup.pull_keys(lookup.repositories(key[:2], destinations[key]), key[2])
+    results: dict[CheckoutKey, dict[str, Any]] = {}
+    present: dict[str, bool] = {}
+    by_host: dict[str, list[CheckoutKey]] = defaultdict(list)
+    for key in sorted(destinations):
+        by_host[key[0]].append(key)
+    if not by_host:
+        return results, present
+
+    def fetch_host(item: tuple[str, list[CheckoutKey]]) -> tuple[str, bool, dict[CheckoutKey, dict[str, Any]]]:
+        host_name, checkouts = item
+        token = _resolve_optional_token(env, trusted[host_name])
+        by_checkout: dict[CheckoutKey, list[RepoKey]] = {}
+        for key in checkouts:
+            candidates = lookup.pull_keys(lookup.repositories(key[1:3], destinations[key]), key[3])
+            by_checkout[key] = [(host_name, *candidate) for candidate in candidates]
         ordered = sorted({candidate for candidates in by_checkout.values() for candidate in candidates})
-        if present:
-            fetched = _fetch_rich(client, ordered, force=force, flags=flags)
-            _attach_stacks(client, ordered, fetched, force=force)
-        else:
-            with ThreadPoolExecutor(max_workers=REST_PROBE_WORKERS) as pool:
-                fetched = dict(zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True))
+        with GitHubClient(host=trusted[host_name], token=token, transport=transport) as client:
+            if token is not None:
+                fetched = _fetch_rich(client, ordered, force=force, flags=flags)
+                _attach_stacks(client, ordered, fetched, force=force)
+            else:
+                with ThreadPoolExecutor(max_workers=REST_PROBE_WORKERS) as pool:
+                    fetched = dict(
+                        zip(ordered, pool.map(lambda key: _fetch_one_basic(client, key), ordered), strict=True)
+                    )
+        return host_name, token is not None, _checkout_results(by_checkout, fetched)
+
+    with ThreadPoolExecutor(max_workers=min(HOST_FETCH_WORKERS, len(by_host))) as pool:
+        for host_name, has_token, out in pool.map(fetch_host, sorted(by_host.items())):
+            present[host_name] = has_token
+            results.update(out)
+    return results, present
+
+
+def _checkout_results(
+    by_checkout: dict[CheckoutKey, list[RepoKey]], fetched: dict[RepoKey, dict[str, Any]]
+) -> dict[CheckoutKey, dict[str, Any]]:
+    """Union discovered PRs without letting optional remotes degrade origin state."""
     results: dict[CheckoutKey, dict[str, Any]] = {}
     for key, candidates in by_checkout.items():
-        # The origin candidate (destination == head == checkout origin) is
-        # authoritative for freshness and error. An optional upstream that
-        # fails must never degrade a healthy origin result; it only adds
-        # visibility on top of what origin confirms.
         origin = fetched[candidates[0]]
         pulls = {}
         for candidate in candidates:
             for pull in fetched[candidate].get("pulls", []):
                 pulls[pull["url"]] = pull
-        result = _pulls_result(
-            list(pulls.values()),
-            fresh=not origin.get("_stale"),
-            stale=bool(origin.get("_stale")),
-        )
+        result = _pulls_result(list(pulls.values()), fresh=not origin.get("_stale"), stale=bool(origin.get("_stale")))
         if origin.get("error"):
             result["error"] = origin["error"]
         results[key] = result
-    return results, present
+    return results
 
 
 @dataclass(frozen=True)
@@ -1917,16 +1950,17 @@ class _Resolved:
     """One checkout's query identity plus the destinations it may target."""
 
     path_key: tuple[str, str | None]
+    host: str | None
     repo: str | None
     key: CheckoutKey | None
     remotes: list[tuple[str, str]]
 
 
 def _resolve_checkouts(
-    sessions: list[dict[str, Any]], settings: SnapshotSettings
+    sessions: list[dict[str, Any]], settings: SnapshotSettings, trusted: dict[str, GitHubHost]
 ) -> tuple[
     list[tuple[dict[str, Any], list[tuple[str, str | None]]]],
-    dict[tuple[str, str | None], tuple[str | None, CheckoutKey | None]],
+    dict[tuple[str, str | None], tuple[str | None, str | None, CheckoutKey | None]],
     dict[CheckoutKey, list[tuple[str, str]]],
 ]:
     """Discover each session's checkouts, then each checkout's identity and remotes.
@@ -1943,8 +1977,8 @@ def _resolve_checkouts(
     def _checkout(item: tuple[tuple[str, str | None], str]) -> _Resolved:
         """Identity and remotes for one checkout, read once in the shared pool."""
         (path, branch), checkout = item
-        repo, key = _identify(checkout, branch)
-        return _Resolved((path, branch), repo, key, _remote_repos(checkout))
+        host, repo, key = _identify(checkout, trusted, branch)
+        return _Resolved((path, branch), host, repo, key, _remote_repos(checkout, trusted, host))
 
     with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
         per_session = list(zip(sessions, pool.map(_discover, sessions), strict=True))
@@ -1953,7 +1987,7 @@ def _resolve_checkouts(
             for checkout, branch in checkouts:
                 reps.setdefault((os.path.realpath(checkout), branch), checkout)
         resolved: list[_Resolved] = list(pool.map(_checkout, reps.items()))
-    ident = {found.path_key: (found.repo, found.key) for found in resolved}
+    ident = {found.path_key: (found.host, found.repo, found.key) for found in resolved}
     # Union, not overwrite: two worktrees of one origin share a query key but
     # can declare different remotes. Both are real destinations for that key.
     destinations: dict[CheckoutKey, list[tuple[str, str]]] = {}
@@ -1964,35 +1998,37 @@ def _resolve_checkouts(
     return per_session, ident, destinations
 
 
-def build_snapshot(
+def build_snapshot(  # noqa: PLR0913 - explicit environment, host, transport and settings seams
     sessions: list[dict[str, Any]],
     env: TokenEnvironment | None = None,
     transport: httpx.BaseTransport | None = None,
     *,
     force: bool = False,
     settings: SnapshotSettings = DEFAULT_SNAPSHOT_SETTINGS,
+    trusted: dict[str, GitHubHost] | None = None,
 ) -> dict[str, Any]:
     """Assemble the host-session snapshot consumed by the UI mapper.
 
     Returns ``{"sessions": [{session_id, title, project_path, repos: [...]}],
-    "auth": {"present": bool}}``; each repo is
-    ``{path, name, repo, branch, pulls, error}``. Token-backed pulls include
+    "auth": {host: {"present": bool}}, "version": 2}``; each repo is
+    ``{path, name, host, repo, branch, pulls, error}``. Token-backed pulls include
     rich review/CI/comment state; without a token they use the basic REST shape
-    and ``auth.present`` is false. An optional ``freshness`` record summarizes
+    and ``auth[host].present`` is false. An optional ``freshness`` record summarizes
     cached data, and ``rate_limit`` reports current backoff state.
 
     Host ``workspace_repos`` paths and branches are authoritative when usable;
     otherwise shallow checkout discovery under ``project_path`` supplies the
     compatibility path. Discovery and Git identity use bounded local pools
-    (#70), while GraphQL remains serialized to avoid secondary limits.
-    ``force`` bypasses the GraphQL TTL; a forced rate-limited refresh adds a
-    one-shot ``rate_limit_notice`` (``{"seconds", "reset_known"}``) for the main
-    loop to surface (issue #20). The always-on rate-limit state (#62) does not
-    consume that notice. This function performs no host-channel I/O; ``env`` and
-    ``transport`` are test seams.
+    (#70), while GraphQL remains serialized within each GitHub host to avoid
+    secondary limits. ``force`` bypasses the GraphQL TTL; a forced rate-limited
+    refresh adds a one-shot ``rate_limit_notice`` (``{"seconds", "reset_known"}``)
+    for the main loop to surface (issue #20). The always-on rate-limit state
+    (#62) does not consume that notice. This function performs no host-channel
+    I/O; ``env`` and ``transport`` are test seams.
     """
 
-    per_session, ident, destinations = _resolve_checkouts(sessions, settings)
+    trusted = trusted if trusted is not None else discover_trusted_hosts(env or SystemEnvironment())
+    per_session, ident, destinations = _resolve_checkouts(sessions, settings, trusted)
     fetched, auth_present = _fetch_all(
         destinations,
         env,
@@ -2002,6 +2038,7 @@ def build_snapshot(
             required_checks_only=settings.required_checks_only,
             ignore_bot_approval_recommendations=settings.ignore_bot_approval_recommendations,
         ),
+        trusted=trusted,
     )
     refreshed_at = _utc_now_iso()
     out_sessions: list[dict[str, Any]] = []
@@ -2009,12 +2046,13 @@ def build_snapshot(
         repos: list[dict[str, Any]] = []
         session_keys: list[CheckoutKey] = []
         for checkout, branch in checkouts:
-            repo_str, key = ident[(os.path.realpath(checkout), branch)]
+            host_name, repo_str, key = ident[(os.path.realpath(checkout), branch)]
             entry: dict[str, Any] = {
                 "path": checkout,
                 "name": Path(checkout).name or checkout,
                 "repo": repo_str,
-                "branch": key[2] if key else branch,
+                "host": host_name,
+                "branch": key[3] if key else branch,
                 "pulls": [],
                 "error": None,
             }
@@ -2054,8 +2092,9 @@ def build_snapshot(
     # one-shot notice.
     rate_limit = _rate_limit_status()
     return {
+        "version": 2,
         "sessions": out_sessions,
-        "auth": {"present": auth_present},
+        "auth": {host: {"present": present} for host, present in auth_present.items()},
         **({"rate_limit": rate_limit} if rate_limit is not None else {}),
         **_forced_rate_limit_notice(force=force),
     }

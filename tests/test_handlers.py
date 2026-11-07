@@ -8,6 +8,7 @@ import pytest
 from aoe_github_plugin import errors
 from aoe_github_plugin import handlers
 from aoe_github_plugin.auth import TokenEnvironment
+from aoe_github_plugin.hosts import GitHubHost
 
 
 class _NoTokenEnv(TokenEnvironment):
@@ -36,7 +37,7 @@ def _transport(handler):
 
 
 def test_status_returns_structured_pull(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
 
     def handler(request):
@@ -54,7 +55,7 @@ def test_status_returns_structured_pull(monkeypatch):
 
 
 def test_status_no_open_pr(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
     result = handlers.github_status(
         env=_NoTokenEnv(),
@@ -65,15 +66,15 @@ def test_status_no_open_pr(monkeypatch):
 
 
 def test_status_not_a_github_remote(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: None)
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: None)
     result = handlers.github_status(env=_NoTokenEnv())
     assert result["repo"] is None
     assert result["pulls"] == []
-    assert "not a github.com remote" in result["summary"]
+    assert "not a GitHub remote" in result["summary"]
 
 
 def test_status_is_failsoft_on_api_error(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
     result = handlers.github_status(
         env=_NoTokenEnv(),
@@ -85,7 +86,7 @@ def test_status_is_failsoft_on_api_error(monkeypatch):
 
 
 def test_open_returns_existing_pull(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
     result = handlers.github_open(
         env=_NoTokenEnv(),
@@ -95,7 +96,7 @@ def test_open_returns_existing_pull(monkeypatch):
 
 
 def test_open_falls_back_to_compare_url(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
     result = handlers.github_open(
         env=_NoTokenEnv(),
@@ -105,7 +106,7 @@ def test_open_falls_back_to_compare_url(monkeypatch):
 
 
 def test_open_compare_url_when_api_unreachable(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
 
     def handler(_request):
@@ -116,9 +117,36 @@ def test_open_compare_url_when_api_unreachable(monkeypatch):
 
 
 def test_open_raises_without_github_remote(monkeypatch):
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: None)
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: None)
     with pytest.raises(errors.GitHubError):
         handlers.github_open(env=_NoTokenEnv())
+
+
+def test_ghes_handlers_share_trust_and_build_compare_link(monkeypatch):
+
+    host = GitHubHost.enterprise("gh.corp")
+    trusted = {host.name: host}
+
+    def owner_repo(path, hosts):
+        assert hosts is trusted
+        return host, "o", "r"
+
+    monkeypatch.setattr(handlers, "remote_owner_repo", owner_repo)
+    monkeypatch.setattr(handlers, "current_branch", lambda _path: "feature/fix")
+
+    def transport(request):
+        assert request.url.host == "gh.corp"
+        assert request.url.path == "/api/v3/repos/o/r/pulls"
+        return httpx.Response(200, json=[])
+
+    status = handlers.github_status(env=_NoTokenEnv(), trusted=trusted, transport=_transport(transport))
+    assert status["host"] == "gh.corp"
+    assert status["repo"] == "o/r"
+    assert status["error"] is None
+    assert handlers.github_open(env=_NoTokenEnv(), trusted=trusted, transport=_transport(transport)) == {
+        "url": "https://gh.corp/o/r/compare/feature%2Ffix?expand=1",
+        "kind": "compare",
+    }
 
 
 def test_open_returns_upstream_pull_when_origin_errors(monkeypatch):
@@ -126,8 +154,12 @@ def test_open_returns_upstream_pull_when_origin_errors(monkeypatch):
     # keeps the origin error only when nothing found the PR, so `github.open`
     # resolves the upstream PR instead of falling back to the origin compare
     # URL that would claim no PR exists.
-    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p: ("alice", "r"))
-    monkeypatch.setattr(handlers, "remote_owner_repos", lambda _p: [("alice", "r"), ("upstream", "r")])
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "alice", "r"))
+    monkeypatch.setattr(
+        handlers,
+        "remote_owner_repos",
+        lambda _p, _trusted: [(GitHubHost.dotcom(), "alice", "r"), (GitHubHost.dotcom(), "upstream", "r")],
+    )
     monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
 
     def handler(request):
@@ -201,3 +233,99 @@ def test_status_discovers_fork_pull_targeting_configured_upstream(tmp_path):
     result = handlers.github_status(str(tmp_path), env=_NoTokenEnv(), transport=_transport(handler))
     assert result["repo"] == "alice/r"
     assert result["pulls"][0]["url"] == "https://github.com/upstream/r/pull/7"
+
+
+@pytest.mark.parametrize("method", [handlers.github_status, handlers.github_open])
+@pytest.mark.parametrize("other_trusted", [False, True])
+@pytest.mark.parametrize("origin_name", ["gh.corp", "github.com"])
+def test_fork_lookup_stays_on_origin_host(tmp_path, method, other_trusted, origin_name):
+    host = GitHubHost.dotcom() if origin_name == "github.com" else GitHubHost.enterprise(origin_name)
+    other = GitHubHost.enterprise("gh.other")
+    trusted = {"github.com": GitHubHost.dotcom(), host.name: host}
+    if other_trusted:
+        trusted[other.name] = other
+    subprocess.run(["git", "init", "-q", "-b", "feature", str(tmp_path)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+        check=True,
+    )
+    for name, url in {
+        "origin": f"https://{host.name}/alice/r.git",
+        "upstream": f"git@{host.name}:upstream/r.git",
+        "other": "https://gh.other/foreign/secret.git",
+        "untrusted": "https://unknown.example/untrusted/secret.git",
+    }.items():
+        subprocess.run(["git", "-C", str(tmp_path), "remote", "add", name, url], check=True)
+
+    class HostTokenEnv(_NoTokenEnv):
+        def __init__(self):
+            self.token_hosts = []
+
+        def gh_available(self):
+            return True
+
+        def gh_auth_token(self, hostname="github.com"):
+            self.token_hosts.append(hostname)
+            return True, f"token-{hostname}", ""
+
+    env = HostTokenEnv()
+    requests = []
+    prefix = "/api/v3" if host.kind == "ghes" else ""
+
+    def handler(request):
+        requests.append(request)
+        assert request.url.host == ("api.github.com" if host.kind == "dotcom" else host.name)
+        assert request.headers["authorization"] == f"Bearer token-{host.name}"
+        assert request.url.path in (f"{prefix}/repos/alice/r/pulls", f"{prefix}/repos/upstream/r/pulls")
+        assert request.url.params["head"] == "alice:feature"
+        if request.url.path == f"{prefix}/repos/upstream/r/pulls":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        **_pr(),
+                        "html_url": f"{host.web_base}/upstream/r/pull/7",
+                        "head": {"ref": "feature", "repo": {"name": "r", "owner": {"login": "alice"}}},
+                    }
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    result = method(str(tmp_path), env=env, trusted=trusted, transport=_transport(handler))
+    if method is handlers.github_status:
+        assert result["host"] == host.name
+        assert result["repo"] == "alice/r"
+        assert result["pulls"][0]["url"] == f"{host.web_base}/upstream/r/pull/7"
+        assert result["summary"] == "upstream/r: PR #7 open for feature"
+        assert result["error"] is None
+    else:
+        assert result == {"url": f"{host.web_base}/upstream/r/pull/7", "kind": "pull"}
+    assert env.token_hosts == [host.name]
+    assert len(requests) == 2
+
+
+def test_status_summary_falls_back_to_origin_for_missing_pull_url(monkeypatch):
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repos", lambda _p, _trusted: [])
+    monkeypatch.setattr(handlers, "current_branch", lambda _p: "feature")
+    result = handlers.github_status(
+        env=_NoTokenEnv(),
+        transport=_transport(lambda _r: httpx.Response(200, json=[{**_pr(), "html_url": None}])),
+    )
+    assert result["summary"] == "o/r: PR #7 open for feature"
+    assert result["error"] is None

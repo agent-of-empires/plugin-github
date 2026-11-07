@@ -6,6 +6,27 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## Unreleased
 
+### Features
+
+- Support GitHub Enterprise Server alongside github.com, using hosts registered
+  in GitHub CLI's `hosts.yml` and isolated credentials, caches and rate limits.
+
+### Bug Fixes
+
+- Rate-limit notifications are isolated per host; one server's active backoff
+  cannot suppress another server's notice.
+
+### Compatibility
+
+- On github.com, `GH_TOKEN` now takes precedence over `GITHUB_TOKEN`, matching
+  GitHub CLI. If both are set, the plugin uses `GH_TOKEN`.
+- Enterprise environment tokens require a matching `GH_HOST` and a server
+  registered in `hosts.yml`. They never apply to other servers.
+- The snapshot cache moves to version 2; the first refresh after upgrading
+  rebuilds the old cache.
+
+
+
 ### Bug Fixes
 
 - **discovery:** Find upstream-targeting PRs from fork checkouts in web snapshots and direct-worker status/open handlers, using the GitHub remotes each checkout configures (no metadata or fork-lineage calls). The permitted head is always the checkout's own repo (upstream is only a destination), so unrelated same-name branches are rejected; caches, PR selection, and stack navigation stay destination-aware, and destination GraphQL pages are bounded to a single page with owner-scoped REST fallback (#129).

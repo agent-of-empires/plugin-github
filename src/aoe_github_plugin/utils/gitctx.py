@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import subprocess
 
+from aoe_github_plugin.hosts import GitHubHost
+from aoe_github_plugin.hosts import remote_parts
 from aoe_github_plugin.errors import GitHubError
 
 
@@ -21,29 +23,25 @@ def _git(path: str, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def parse_owner_repo(remote_url: str) -> tuple[str, str] | None:
-    """Extract ``(owner, repo)`` from a GitHub remote URL, or ``None`` if it is
-    not a recognizable github.com remote. Handles ssh and https, with/without
-    a ``.git`` suffix.
-    """
-    url = remote_url.strip()
-    prefixes = ("git@github.com:", "https://github.com/", "ssh://git@github.com/")
-    path = next((url[len(p) :] for p in prefixes if url.startswith(p)), None)
-    if path is None:
+def parse_owner_repo(
+    remote_url: str, trusted: dict[str, GitHubHost] | None = None
+) -> tuple[GitHubHost, str, str] | None:
+    """Extract a trusted GitHub host, owner, and repository from a remote."""
+    parts = remote_parts(remote_url)
+    if parts is None:
         return None
-    path = path.removesuffix(".git")
-    parts = path.split("/")
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        return None
-    return parts[0], parts[1]
+    name, owner, repo = parts
+    hosts = trusted if trusted is not None else {"github.com": GitHubHost.dotcom()}
+    host = hosts.get(name)
+    return (host, owner, repo) if host is not None else None
 
 
-def remote_owner_repo(path: str) -> tuple[str, str] | None:
-    return parse_owner_repo(_git(path, "remote", "get-url", "origin"))
+def remote_owner_repo(path: str, trusted: dict[str, GitHubHost] | None = None) -> tuple[GitHubHost, str, str] | None:
+    return parse_owner_repo(_git(path, "remote", "get-url", "origin"), trusted)
 
 
-def remote_owner_repos(path: str) -> list[tuple[str, str]]:
-    """Every configured GitHub remote's ``(owner, repo)``, origin first.
+def remote_owner_repos(path: str, trusted: dict[str, GitHubHost] | None = None) -> list[tuple[GitHubHost, str, str]]:
+    """Every configured trusted GitHub remote's ``(host, owner, repo)``, origin first.
 
     The checkout's own PR may live against any of them: a fork's PR targets the
     upstream repository, so only searching origin misses it (#129). Non-GitHub
@@ -53,10 +51,10 @@ def remote_owner_repos(path: str) -> list[tuple[str, str]]:
         names = _git(path, "remote").split()
     except GitHubError:
         return []
-    out: list[tuple[str, str]] = []
+    out: list[tuple[GitHubHost, str, str]] = []
     for name in sorted(names, key=lambda n: (n != "origin", n)):
         try:
-            repo = parse_owner_repo(_git(path, "remote", "get-url", name))
+            repo = parse_owner_repo(_git(path, "remote", "get-url", name), trusted)
         except GitHubError:
             continue
         if repo is not None and repo not in out:

@@ -180,11 +180,12 @@ def _caches():
         refresh._retry_cooldown.clear()
         refresh._stack_cache.clear()
         refresh._stack_unsupported.clear()
-        refresh._stack_backoff["until"] = 0.0
-        refresh._graphql_budget.update({"remaining": None, "valid_until": None})
+        refresh._stack_backoff.clear()
+        refresh._graphql_budget.clear()
+        refresh._backoff.clear()
         for kind in ("rest", "graphql"):
-            refresh._backoff[kind].update({"until": 0.0, "reset_known": False})
-        refresh._backoff["notified"] = False
+            refresh._backoff["github.com"][kind].update({"until": 0.0, "reset_known": False})
+        refresh._backoff["github.com"]["notified"] = False
 
     reset()
     yield
@@ -339,7 +340,7 @@ def test_web_selection_preserves_equal_numbers_in_fork_and_upstream(tmp_path):
     )
     snapshot = _snapshot([path], api)
     session_id = str(path)
-    params = uistate.snapshot_ui_state_params(snapshot, selected={session_id: "upstream/r#7"})
+    params = uistate.snapshot_ui_state_params(snapshot, selected={session_id: "github.com/upstream/r#7"})
     pane = next(p for p in params if p["slot"] == "pane")
     rows = [
         row
@@ -347,7 +348,10 @@ def test_web_selection_preserves_equal_numbers_in_fork_and_upstream(tmp_path):
         for row in section.get("children", [])
         if row.get("method") == "github.select_pr"
     ]
-    assert {row["params"]["pr"]: row["selected"] for row in rows} == {"alice/r#7": False, "upstream/r#7": True}
+    assert {row["params"]["pr"]: row["selected"] for row in rows} == {
+        "github.com/alice/r#7": False,
+        "github.com/upstream/r#7": True,
+    }
     assert {row["href"] for row in rows} == {
         "https://github.com/alice/r/pull/7",
         "https://github.com/upstream/r/pull/7",
@@ -556,11 +560,11 @@ def test_truncated_key_reports_probe_freshness_not_fresh(tmp_path):
     # A probe that fails (error or rate limit) takes the fail-soft branch and
     # never consults the marker, so the marker branch is driven directly: a
     # changed-nowhere probe whose own list came from the backoff-served cache.
-    key = lookup.pull_keys([("team", "r")], "feature")[0]
+    key = ("github.com", *lookup.pull_keys([("team", "r")], "feature")[0])
     refresh._graphql_cache.clear()
     refresh._truncated_until = {refresh._rich_cache_key(key, flags=refresh.DEFAULT_NORMALIZE_FLAGS): float("inf")}
     refresh._etag_cache[key] = {"etag": '"etag"', "pulls": [_rest(team_pull)]}
-    refresh._backoff["rest"]["until"] = float("inf")
+    refresh._backoff["github.com"]["rest"]["until"] = float("inf")
     stub = _StubClient()
     repo = refresh._fetch_rich(stub, [key], force=False, flags=refresh.DEFAULT_NORMALIZE_FLAGS)[key]
     assert stub.asked == []  # the marker suppressed the full query entirely
@@ -575,7 +579,7 @@ def test_truncated_window_serves_rest_when_rich_set_diverged(tmp_path):
     # During a truncation window a 304 reports changed=False. If a PR opened in
     # the meantime the rich entry no longer matches the REST set, and serving it
     # would hide the new PR for the whole window. Only a matching set may serve.
-    key = lookup.pull_keys([("team", "r")], "feature")[0]
+    key = ("github.com", *lookup.pull_keys([("team", "r")], "feature")[0])
     cache_key = refresh._rich_cache_key(key, flags=refresh.DEFAULT_NORMALIZE_FLAGS)
     old = _rest(_node("team/r", "team/r", 2))
     new = _rest(_node("team/r", "team/r", 3, branch="feature"))
@@ -647,9 +651,9 @@ def test_truncated_window_with_rest_backoff_keeps_freshness_stamp(tmp_path):
     # A page certain to truncate again (a discovery that hit its page bound)
     # holds the full query for the long window; a tick served from the REST
     # backoff cache must not spend or revalidate anything during it.
-    key = lookup.pull_keys([("team", "r")], "feature")[0]
+    key = ("github.com", *lookup.pull_keys([("team", "r")], "feature")[0])
     refresh._truncated_until[refresh._rich_cache_key(key, flags=refresh.DEFAULT_NORMALIZE_FLAGS)] = float("inf")
-    refresh._backoff["rest"]["until"] = float("inf")
+    refresh._backoff["github.com"]["rest"]["until"] = float("inf")
     second = refresh.build_snapshot([{"id": "s", "project_path": str(path)}], env=_Env(token=True), transport=transport)
     repo = second["sessions"][0]["repos"][0]
     assert len(queries) == 1  # no GraphQL query spent
