@@ -202,6 +202,29 @@ def test_gh_destination_supplements_snapshot_matching(tmp_path, monkeypatch):
     assert result["pulls"][0]["url"] == "https://github.com/upstream/r/pull/12"
 
 
+def test_gh_failure_removes_unconfigured_destination_from_snapshot(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _make_repo(repo)
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda _path: ("upstream", "r"))
+
+    def handler(request):
+        if request.url.path == "/repos/upstream/r/pulls":
+            return httpx.Response(200, json=[{**_pull(), "html_url": "https://github.com/upstream/r/pull/12"}])
+        return httpx.Response(200, json=[])
+
+    sessions = [{"id": "s", "project_path": str(repo)}]
+    transport = httpx.MockTransport(handler)
+    first = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
+    assert first["sessions"][0]["repos"][0]["pulls"][0]["number"] == 12
+
+    def failure(_path):
+        raise refresh.gh_cache.GhDiscoveryError
+
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", failure)
+    second = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport, force=True)
+    assert second["sessions"][0]["repos"][0]["pulls"] == []
+
+
 def test_gh_destination_cache_respects_expiry_force_and_backoff(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda path: calls.append(path) or ("upstream", "r"))
@@ -224,7 +247,7 @@ def test_gh_destination_cache_respects_expiry_force_and_backoff(tmp_path, monkey
     assert len(calls) == 4
 
 
-def test_gh_destination_keeps_last_good_on_failure_and_clears_on_closed(tmp_path, monkeypatch):
+def test_gh_destination_discards_cached_result_on_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda _path: ("upstream", "r"))
     path = str(tmp_path)
     assert refresh._gh_destination(path, "feature", force=True) == ("upstream", "r")
@@ -233,7 +256,8 @@ def test_gh_destination_keeps_last_good_on_failure_and_clears_on_closed(tmp_path
         raise refresh.gh_cache.GhDiscoveryError
 
     monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", failure)
-    assert refresh._gh_destination(path, "feature", force=True) == ("upstream", "r")
+    assert refresh._gh_destination(path, "feature", force=True) is None
+    assert refresh._gh_destination(path, "feature", force=False) is None
     monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda _path: None)
     assert refresh._gh_destination(path, "feature", force=True) is None
     assert refresh._gh_destination(path, "feature", force=False) is None

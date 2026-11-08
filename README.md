@@ -129,9 +129,9 @@ session-less `github.refresh` cover every session and prune vanished ones:
    or any other GitHub remote that checkout configures (an `upstream` remote, a
    differently named one, or several). When available, `gh pr view` also
    supplies the destination of the checkout's open PR. If `gh` is unavailable
-   or cannot resolve a PR, discovery uses configured remotes and any last-good
-   destination. Refresh and direct handlers share a bounded cache of successful
-   results per checkout and branch for five minutes and cool down failed lookups.
+   or cannot resolve a PR, discovery uses configured remotes. Refresh and direct
+   handlers share a bounded cache of successful results per checkout and branch
+   for five minutes and cool down failed lookups.
    Refresh reuses the last-good result during GitHub backoff; a forced refresh
    retries outside backoff.
    The head is always the checkout's own origin

@@ -23,7 +23,7 @@ def _bound(entries: dict) -> None:
 
 
 def destination(path: str, branch: str, *, force: bool = False, blocked: bool = False) -> tuple[str, str] | None:
-    """Resolve a destination once per TTL, retaining last-good data on failure."""
+    """Resolve a destination once per TTL, falling back on discovery failure."""
     key = (os.path.realpath(path), branch)
     now = time.monotonic()
     with _lock:
@@ -35,9 +35,10 @@ def destination(path: str, branch: str, *, force: bool = False, blocked: bool = 
         result = gh_pr_repository(path)
     except GhDiscoveryError:
         with _lock:
+            _cache.pop(key, None)
             _failures[key] = time.monotonic() + FAILURE_COOLDOWN
             _bound(_failures)
-        return cached[1] if cached is not None else None
+        return None
     with _lock:
         _cache[key] = (time.monotonic(), result)
         _bound(_cache)
