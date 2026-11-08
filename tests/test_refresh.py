@@ -3625,6 +3625,40 @@ def test_replay_does_not_show_a_previous_worktree_link(tmp_path, monkeypatch):
     assert messages == []
 
 
+def test_legacy_branch_sharing_linked_checkout_refreshes_and_replays(tmp_path, monkeypatch):
+    repo = tmp_path / "review"
+    _make_repo(repo)
+    _link_file(repo).write_text("https://github.com/upstream/project/pull/17\n")
+    sessions = [
+        {"id": "direct", "project_path": str(repo)},
+        {
+            "id": "legacy",
+            "project_path": str(tmp_path / "workspace"),
+            "workspace_repos": [{"source_path": str(repo), "branch": "feature"}],
+        },
+    ]
+
+    def handler(request):
+        if request.url.path == "/repos/upstream/project/pulls/17":
+            return httpx.Response(200, json={**_pull(17), "html_url": "https://github.com/upstream/project/pull/17"})
+        assert request.url.path == "/repos/o/r/pulls"
+        return httpx.Response(200, json=[_pull(4)])
+
+    snapshot = refresh.build_snapshot(sessions, env=_NoToken(), transport=httpx.MockTransport(handler))
+    direct, legacy = [session["repos"][0] for session in snapshot["sessions"]]
+    assert (direct["pulls"][0]["number"], direct["error"]) == (17, None)
+    assert (legacy["pulls"][0]["number"], legacy["error"]) == (4, None)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    refresh.save_snapshot(snapshot)
+    runtime = main.Runtime(send=lambda _message: None)
+    runtime._replay_cached(sessions)
+    assert {session["session_id"] for session in runtime._last_snapshot["sessions"]} == {"direct", "legacy"}
+    sessions[1]["workspace_repos"][0]["worktree_path"] = str(repo)
+    runtime = main.Runtime(send=lambda _message: None)
+    runtime._replay_cached(sessions)
+    assert [session["session_id"] for session in runtime._last_snapshot["sessions"]] == ["direct"]
+
+
 def test_linked_pr_with_missing_url_reports_api_error(tmp_path):
     repo = tmp_path / "review"
     _make_repo(repo)

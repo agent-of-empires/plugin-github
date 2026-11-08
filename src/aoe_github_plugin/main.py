@@ -435,11 +435,15 @@ class Runtime:
             snapshot = refresh.load_snapshot()
             if snapshot is None:
                 return
-            live_ids = {s["id"] for s in sessions if isinstance(s, dict) and isinstance(s.get("id"), str)}
+            live = {s["id"]: s for s in sessions if isinstance(s, dict) and isinstance(s.get("id"), str)}
 
-            candidates = [s for s in snapshot["sessions"] if isinstance(s, dict) and s.get("session_id") in live_ids]
+            candidates = [s for s in snapshot["sessions"] if isinstance(s, dict) and s.get("session_id") in live]
             repos = [repo for session in candidates for repo in session.get("repos", [])]
-            paths = {repo["path"] for repo in repos if isinstance(repo, dict) and isinstance(repo.get("path"), str)}
+            paths = {
+                repo["path"]
+                for repo in repos
+                if isinstance(repo, dict) and isinstance(repo.get("path"), str) and not repo.get("_pr_link_ignored")
+            }
 
             def read_link(path: str) -> list[Any] | None | refresh.GitHubError:
                 try:
@@ -450,14 +454,32 @@ class Runtime:
 
             with ThreadPoolExecutor(max_workers=refresh.GIT_WORKERS) as pool:
                 links = dict(zip(paths, pool.map(read_link, paths), strict=True))
+
+            def matches_legacy_source(session: dict[str, Any], repo: dict[str, Any]) -> bool:
+                current = live[session["session_id"]].get("workspace_repos")
+                if not isinstance(current, list):
+                    return False
+                return any(
+                    isinstance(item, dict)
+                    and not item.get("worktree_path")
+                    and isinstance(item.get("source_path"), str)
+                    and os.path.realpath(item["source_path"]) == os.path.realpath(repo["path"])
+                    and item.get("branch") == repo.get("branch")
+                    for item in current
+                )
+
             cached = [
                 session
                 for session in candidates
                 if all(
                     isinstance(repo, dict)
                     and isinstance(repo.get("path"), str)
-                    and not isinstance(links[repo["path"]], refresh.GitHubError)
-                    and links[repo["path"]] == repo.get("_pr_link")
+                    and (
+                        matches_legacy_source(session, repo)
+                        if repo.get("_pr_link_ignored")
+                        else not isinstance(links[repo["path"]], refresh.GitHubError)
+                        and links[repo["path"]] == repo.get("_pr_link")
+                    )
                     for repo in session.get("repos", [])
                 )
             ]

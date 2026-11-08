@@ -2085,7 +2085,7 @@ def build_snapshot(  # noqa: C901
                 "error": link_error,
             }
             expected_link = (key[0], key[1], int(key[2][4:])) if key and key[2].startswith(":pr/") else None
-            current_link = links.get(checkout)
+            current_link = links.get(checkout) if branch is None else None
             if isinstance(current_link, GitHubError):
                 entry["error"] = {"kind": current_link.kind, "hint": str(current_link)}
                 key = None
@@ -2094,6 +2094,8 @@ def build_snapshot(  # noqa: C901
                 key = None
             if expected_link is not None:
                 entry["_pr_link"] = list(expected_link)
+            if branch is not None:
+                entry["_pr_link_ignored"] = True
             if key is not None:
                 session_keys.append(key)
                 result = fetched.get(key, {})

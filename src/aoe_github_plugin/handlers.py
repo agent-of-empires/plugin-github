@@ -122,11 +122,10 @@ def github_open(
 ) -> dict[str, Any]:
     """Resolve the GitHub URL to open for the checkout at ``path``.
 
-    Returns ``{"url", "kind"}`` where ``kind`` is ``"pull"`` (an open PR exists
-    for the branch) or ``"compare"`` (the create-PR page for the branch).
-    Raises ``GitHubError`` only when there is no github.com remote. Looking up
-    an existing PR is best-effort: any API failure falls back to the compare
-    URL so opening still works offline / unauthenticated.
+    Returns ``{"url", "kind"}``, selecting an explicit linked PR when present.
+    Otherwise, a branch PR lookup is best-effort and API failures fall back to
+    the compare page. An invalid or inaccessible explicit link raises a typed
+    ``GitHubError`` rather than opening an unrelated compare page.
     """
     link = worktree_pr_link(path)
     if link is not None:
