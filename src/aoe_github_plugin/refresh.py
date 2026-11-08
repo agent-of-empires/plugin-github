@@ -889,13 +889,19 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
             return False, cached["pulls"], False
         raise
     except NotFoundError:
-        with _cache_lock:
-            _etag_cache.pop(key, None)
+        if linked:
+            with _cache_lock:
+                _etag_cache.pop(key, None)
         raise
     if status == 304 and cached is not None:
         return False, cached["pulls"], True
     if linked:
-        if not isinstance(raw, dict) or raw.get("number") != int(branch[4:]):
+        if (
+            not isinstance(raw, dict)
+            or raw.get("number") != int(branch[4:])
+            or not isinstance(raw.get("html_url"), str)
+            or not raw["html_url"]
+        ):
             raise ApiError(200, "unexpected linked pull request")
         pulls = _trim([raw])
         pulls[0]["merged"] = bool(raw.get("merged_at"))
@@ -1117,8 +1123,9 @@ def _same_pull_set(basic: list[dict[str, Any]], rich: dict[str, Any] | None) -> 
     correct for every open PR."""
     if rich is None:
         return False
+    open_basic = [pr for pr in basic if not pr.get("merged")]
     open_rich = [pr for pr in rich.get("pulls") or [] if not pr.get("merged")]
-    return {pr.get("url") for pr in basic} == {pr.get("url") for pr in open_rich}
+    return {pr.get("url") for pr in open_basic} == {pr.get("url") for pr in open_rich}
 
 
 def _fallback_pulls(pending: dict[str, Any]) -> dict[str, Any]:

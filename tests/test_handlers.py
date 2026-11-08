@@ -238,3 +238,14 @@ def test_missing_linked_pr_never_opens_unrelated_branch(monkeypatch):
     assert handlers.github_status(env=_NoTokenEnv(), transport=transport)["error"]["kind"] == "not_found"
     with pytest.raises(errors.NotFoundError):
         handlers.github_open(env=_NoTokenEnv(), transport=transport)
+
+
+def test_linked_pr_with_missing_url_reports_error(monkeypatch):
+    monkeypatch.setattr(handlers, "worktree_pr_link", lambda _path: ("upstream", "project", 42))
+    monkeypatch.setattr(handlers, "current_branch", lambda _path: "review")
+    pull = _pr(42)
+    del pull["html_url"]
+    transport = _transport(lambda _request: httpx.Response(200, json=pull))
+    assert handlers.github_status(env=_NoTokenEnv(), transport=transport)["error"]["kind"] == "github_error"
+    with pytest.raises(errors.GitHubError):
+        handlers.github_open(env=_NoTokenEnv(), transport=transport)

@@ -217,6 +217,29 @@ def test_etag_304_reuses_cached_pulls(tmp_path):
     assert second["sessions"][0]["repos"][0]["pulls"][0]["number"] == 99
 
 
+def test_branch_404_preserves_conditional_cache(tmp_path):
+    repo = tmp_path / "repo"
+    _make_repo(repo)
+    sessions = [{"id": "s", "project_path": str(repo)}]
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(200, headers={"ETag": '"v1"'}, json=[_pull(7)])
+        if len(requests) == 2:
+            return httpx.Response(404)
+        assert request.headers.get("If-None-Match") == '"v1"'
+        return httpx.Response(304)
+
+    transport = httpx.MockTransport(handler)
+    refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
+    failed = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
+    assert failed["sessions"][0]["repos"][0]["error"]["kind"] == "not_found"
+    recovered = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
+    assert recovered["sessions"][0]["repos"][0]["pulls"][0]["number"] == 7
+
+
 def test_backoff_serves_cached_and_skips_http(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -3526,6 +3549,36 @@ def test_linked_rich_lookup_uses_exact_number_and_cache(tmp_path):
     assert sum(request.method == "POST" for request in requests) == 1
 
 
+def test_merged_link_keeps_rich_cache_on_graphql_failure(tmp_path):
+    repo = tmp_path / "repo"
+    _make_repo(repo)
+    _link_file(repo).write_text("https://github.com/o/r/pull/17\n")
+    queries = []
+    node = _gql_node(17, state="MERGED", merged=True)
+
+    def handler(request):
+        if request.url.path.endswith("/stacks"):
+            return httpx.Response(404)
+        if request.method == "GET":
+            if request.headers.get("If-None-Match"):
+                return httpx.Response(304)
+            return httpx.Response(
+                200, headers={"ETag": '"v1"'}, json={**_pull(17), "state": "closed", "merged_at": "2026-01-01"}
+            )
+        queries.append(request)
+        if len(queries) > 1:
+            return httpx.Response(500)
+        return httpx.Response(200, json={"data": {"repository": {"b0": node}, "rateLimit": {}}})
+
+    sessions = [{"id": "s", "project_path": str(repo)}]
+    transport = httpx.MockTransport(handler)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    result = refresh.build_snapshot(sessions, env=_Env(), transport=transport, force=True)
+    pull = result["sessions"][0]["repos"][0]["pulls"][0]
+    assert pull["merged"] is True
+    assert pull["review_state"] == "approved"
+
+
 def test_linked_worktree_snapshot_reaches_runtime_ui(tmp_path):
     source = tmp_path / "source"
     repo = tmp_path / "outside" / "review"
@@ -3570,6 +3623,22 @@ def test_replay_does_not_show_a_previous_worktree_link(tmp_path, monkeypatch):
     messages = []
     main.Runtime(send=messages.append)._replay_cached(sessions)
     assert messages == []
+
+
+def test_linked_pr_with_missing_url_reports_api_error(tmp_path):
+    repo = tmp_path / "review"
+    _make_repo(repo)
+    _link_file(repo).write_text("https://github.com/upstream/project/pull/17\n")
+    pull = _pull(17)
+    del pull["html_url"]
+    snapshot = refresh.build_snapshot(
+        [{"id": "s", "project_path": str(repo)}],
+        env=_NoToken(),
+        transport=_transport(pull),
+    )
+    result = snapshot["sessions"][0]["repos"][0]
+    assert result["pulls"] == []
+    assert result["error"]["kind"] == "api_error"
 
 
 @pytest.mark.parametrize(

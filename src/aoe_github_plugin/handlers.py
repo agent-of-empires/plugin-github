@@ -42,7 +42,12 @@ def _resolve_optional_token(env: TokenEnvironment | None) -> str | None:
 
 def _linked_pull(client: GitHubClient, owner: str, repo: str, number: int) -> dict[str, Any]:
     raw = client.get_json(f"/repos/{owner}/{repo}/pulls/{number}")
-    if not isinstance(raw, dict) or raw.get("number") != number:
+    if (
+        not isinstance(raw, dict)
+        or raw.get("number") != number
+        or not isinstance(raw.get("html_url"), str)
+        or not raw["html_url"]
+    ):
         raise GitHubError("GitHub returned an invalid linked pull request")
     return {
         "number": number,
