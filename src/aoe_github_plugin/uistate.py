@@ -62,16 +62,11 @@ worker had a GitHub token; without one the snapshot's ``auth.present`` is
 note telling the user a token unlocks the rest.
 
 The PR affordance and review glyphs are viewer-scoped (``viewer_role`` /
-``viewer_review`` from ``graphql``): on a PR the viewer authored the arrow marks
-their own branch and an outstanding review reads as a wait on someone else, while
-a PR they are reviewing takes the plain PR glyph and turns that outstanding
-review into an eye -- the one glyph that is theirs to act on.
-
-The PR affordance and review glyphs are viewer-scoped (``viewer_role`` /
-``viewer_review`` from ``graphql``): on a PR the viewer authored the arrow marks
-their own branch and an outstanding review reads as a wait on someone else, while
-a PR they are reviewing takes the plain PR glyph and turns that outstanding
-review into an eye -- the one glyph that is theirs to act on.
+``viewer_review`` / ``viewer_review_requested`` from ``graphql``): on a PR the
+viewer authored the arrow marks their own branch and an outstanding review reads
+as a wait on someone else, while a PR they are reviewing takes the plain PR glyph
+and turns a review GitHub is still requesting of them into an eye -- the one glyph
+that is theirs to act on.
 
 Icons are lucide names (the web frontend already depends on ``lucide-react``);
 ``tone`` is one of the host's ``Tone`` set and colors the icon, while ``color``
@@ -335,9 +330,10 @@ def _review_visual(pull: dict[str, Any]) -> tuple[str, str, str] | None:
         return base
     own = pull.get("viewer_review")
     submitted = own if isinstance(own, str) and own in _VIEWER_REVIEW_LABEL else None
-    if submitted is None and state != "changes-requested":
-        # No submitted review (`pending` is an unsubmitted draft), so the request
-        # is on the viewer: this is the glyph they act on.
+    if submitted is None and pull.get("viewer_review_requested") is True and state != "changes-requested":
+        # A request is outstanding and it is on the viewer: this is the glyph they
+        # act on. Without one (a dismissed review leaves no request), the shared
+        # state's glyph stands rather than claiming work that is not theirs.
         return (_ICON_YOUR_REVIEW, "warn", "awaiting your review")
     if base is not None and submitted is not None and submitted == state:
         icon, tone, _label = base

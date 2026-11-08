@@ -768,6 +768,7 @@ def test_badge_concatenates_chips_across_repos():
 def _reviewer_pull(**kwargs):
     pull = _rich_pull(**kwargs)
     pull["viewer_role"] = "reviewer"
+    pull["viewer_review_requested"] = True
     return pull
 
 
@@ -786,6 +787,18 @@ def test_reviewer_pr_gets_the_plain_glyph_and_an_eye_for_its_open_request():
     assert [i["tone"] for i in items] == ["info", "warn"]
     assert "(reviewing)" in items[0]["tooltip"]
     assert items[1]["tooltip"].endswith("(awaiting your review)")
+
+
+def test_reviewer_without_an_outstanding_request_keeps_the_shared_clock():
+    # A dismissed review makes the viewer a reviewer without asking for anything:
+    # the shared "awaiting review" clock stands, the eye would claim their move.
+    pull = _reviewer_pull(review="waiting")
+    pull["viewer_review_requested"] = False
+    pull["viewer_review"] = "pending"
+    items = _badge_items_for([_repo(pulls=[pull])])
+    assert [i["icon"] for i in items] == ["git-pull-request", "clock"]
+    assert items[1]["tone"] == "neutral"
+    assert items[1]["tooltip"].endswith("(awaiting review)")
 
 
 def test_authored_pr_keeps_the_arrow_and_the_waiting_clock():

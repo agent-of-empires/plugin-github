@@ -757,6 +757,14 @@ def test_viewer_review_maps_the_viewers_own_position():
     assert graphql.viewer_review({}) is None
 
 
+def test_viewer_review_requested_needs_an_actual_request():
+    assert graphql.viewer_review_requested({"viewerLatestReviewRequest": {"id": "r1"}}) is True
+    # A dismissed review is no longer a request: the viewer owes nothing here.
+    assert graphql.viewer_review_requested({"viewerLatestReview": {"state": "DISMISSED"}}) is False
+    assert graphql.viewer_review_requested({"viewerLatestReviewRequest": None}) is False
+    assert graphql.viewer_review_requested({}) is False
+
+
 def test_normalize_pull_carries_the_viewer_role():
     pr = _pr(decision="APPROVED")
     pr["viewerDidAuthor"] = False
@@ -764,6 +772,7 @@ def test_normalize_pull_carries_the_viewer_role():
     out = graphql.normalize_connection(_conn(pr))[0]
     assert out["viewer_role"] == "reviewer"
     assert out["viewer_review"] is None
+    assert out["viewer_review_requested"] is True
 
 
 def test_review_summary_reads_the_way_github_does():

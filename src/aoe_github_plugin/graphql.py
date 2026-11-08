@@ -941,6 +941,14 @@ def viewer_review(pr: dict[str, Any]) -> str | None:
     return _REVIEW_NODE_STATE.get(review.get("state") or "", "pending")
 
 
+def viewer_review_requested(pr: dict[str, Any]) -> bool:
+    """True when GitHub is still asking the viewer for a review. A dismissed
+    review leaves ``viewerLatestReview`` as ``DISMISSED`` without asking again, so
+    the request -- not the absence of a submitted position -- is what makes a
+    review outstanding for this viewer."""
+    return isinstance(pr.get("viewerLatestReviewRequest"), dict)
+
+
 def diff_summary(pr: dict[str, Any]) -> dict[str, int] | None:
     """``{"added", "removed", "files"}`` for the PR, or ``None`` when GitHub did
     not report them (the no-token REST shape, or a drifted response)."""
@@ -1067,6 +1075,7 @@ def _normalize_pull(
         "author": (pr.get("author") or {}).get("login") or "",
         "viewer_role": viewer_role(pr),
         "viewer_review": viewer_review(pr),
+        "viewer_review_requested": viewer_review_requested(pr),
         "base": pr.get("baseRefName"),
         "reviewers": people,
         "head_approved": head_approved(pr),

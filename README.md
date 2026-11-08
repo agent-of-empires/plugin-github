@@ -182,8 +182,9 @@ session-less `github.refresh` cover every session and prune vanished ones:
    (`viewerDidAuthor` / `viewerLatestReview` / `viewerLatestReviewRequest`): a PR
    you authored keeps the arrow and reads an outstanding review as someone else's
    move (a clock), while a PR you are reviewing takes the plain PR glyph in an
-   info tone and turns that outstanding review into a warn eye, "awaiting your
-   review"; a review you already submitted is labelled as yours ("approved by
+   info tone and turns a review GitHub still has pending on them (a request on
+   `viewerLatestReviewRequest`, so a dismissed review is not one) into a warn eye,
+   "awaiting your review"; a review you already submitted is labelled as yours ("approved by
    you")), a `row-column`
    (`{text, tone, tooltip, sort_value?, filter_values?}`, or `{}` to clear -- one deterministic
    words summary of the session's most-urgent PR signal so the list is scannable
