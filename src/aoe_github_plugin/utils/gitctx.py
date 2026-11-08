@@ -4,6 +4,7 @@ working copy, so a handler can talk about the right repository.
 
 from __future__ import annotations
 
+import os
 import re
 import json
 import subprocess
@@ -11,9 +12,30 @@ import subprocess
 from aoe_github_plugin.errors import GitHubError
 
 
+def checkout_environment() -> dict[str, str]:
+    """Keep auth/config while ensuring Git and gh resolve the requested checkout."""
+    excluded = {
+        "GH_REPO",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_SHALLOW_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+    }
+    return {key: value for key, value in os.environ.items() if key not in excluded}
+
+
 def _git(path: str, *args: str) -> str:
     proc = subprocess.run(
         ["git", "-C", path, *args],
+        env=checkout_environment(),
         capture_output=True,
         text=True,
         check=False,
@@ -50,12 +72,15 @@ def gh_pr_repository(path: str) -> tuple[str, str] | None:
         proc = subprocess.run(
             ["gh", "pr", "view", "--json", "url,state"],
             cwd=path,
+            env=checkout_environment(),
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
         if proc.returncode:
+            if re.fullmatch(r'no pull requests found for branch "(?:[^"\\\n]|\\.)+"\s*', proc.stderr):
+                return None
             raise GhDiscoveryError
         result = json.loads(proc.stdout)
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:

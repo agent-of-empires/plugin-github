@@ -187,7 +187,7 @@ def test_build_snapshot_aggregates_a_session(tmp_path):
 def test_gh_destination_supplements_snapshot_matching(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _make_repo(repo)
-    monkeypatch.setattr(refresh, "gh_pr_repository", lambda _path: ("upstream", "r"))
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda _path: ("upstream", "r"))
 
     def handler(request):
         if request.url.path == "/repos/upstream/r/pulls":
@@ -204,7 +204,7 @@ def test_gh_destination_supplements_snapshot_matching(tmp_path, monkeypatch):
 
 def test_gh_destination_cache_respects_expiry_force_and_backoff(tmp_path, monkeypatch):
     calls = []
-    monkeypatch.setattr(refresh, "gh_pr_repository", lambda path: calls.append(path) or ("upstream", "r"))
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda path: calls.append(path) or ("upstream", "r"))
     now = [1000.0]
     monkeypatch.setattr(refresh.time, "monotonic", lambda: now[0])
 
@@ -225,16 +225,16 @@ def test_gh_destination_cache_respects_expiry_force_and_backoff(tmp_path, monkey
 
 
 def test_gh_destination_keeps_last_good_on_failure_and_clears_on_closed(tmp_path, monkeypatch):
-    monkeypatch.setattr(refresh, "gh_pr_repository", lambda _path: ("upstream", "r"))
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda _path: ("upstream", "r"))
     path = str(tmp_path)
     assert refresh._gh_destination(path, "feature", force=True) == ("upstream", "r")
 
     def failure(_path):
-        raise refresh.GhDiscoveryError
+        raise refresh.gh_cache.GhDiscoveryError
 
-    monkeypatch.setattr(refresh, "gh_pr_repository", failure)
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", failure)
     assert refresh._gh_destination(path, "feature", force=True) == ("upstream", "r")
-    monkeypatch.setattr(refresh, "gh_pr_repository", lambda _path: None)
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda _path: None)
     assert refresh._gh_destination(path, "feature", force=True) is None
     assert refresh._gh_destination(path, "feature", force=False) is None
 
@@ -244,15 +244,31 @@ def test_gh_failure_cooldown_avoids_repeated_calls(tmp_path, monkeypatch):
 
     def failure(path):
         calls.append(path)
-        raise refresh.GhDiscoveryError
+        raise refresh.gh_cache.GhDiscoveryError
 
-    monkeypatch.setattr(refresh, "gh_pr_repository", failure)
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", failure)
     path = str(tmp_path)
     assert refresh._gh_destination(path, "feature", force=False) is None
     assert refresh._gh_destination(path, "feature", force=False) is None
     assert len(calls) == 1
     refresh._gh_destination(path, "feature", force=True)
     assert len(calls) == 2
+
+
+def test_gh_cache_bounds_success_and_failure_entries(tmp_path, monkeypatch):
+    monkeypatch.setattr(refresh.gh_cache, "MAX_ENTRIES", 2)
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda _path: None)
+    for branch in ("one", "two", "three"):
+        refresh._gh_destination(str(tmp_path), branch, force=False)
+    assert len(refresh.gh_cache._cache) == 2
+
+    def failure(_path):
+        raise refresh.gh_cache.GhDiscoveryError
+
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", failure)
+    for branch in ("four", "five", "six"):
+        refresh._gh_destination(str(tmp_path), branch, force=False)
+    assert len(refresh.gh_cache._failures) == 2
 
 
 def test_tokenless_refresh_skips_native_stack_requests(tmp_path):

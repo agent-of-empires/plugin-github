@@ -2,13 +2,11 @@
 
 import pytest
 
-from aoe_github_plugin import refresh
-from aoe_github_plugin import handlers
+from aoe_github_plugin.utils import gh_cache
 
 
 @pytest.fixture(autouse=True)
 def _isolate_gh_discovery(monkeypatch):
-    monkeypatch.setattr(handlers, "gh_pr_repository", lambda _path: None)
-    monkeypatch.setattr(refresh, "gh_pr_repository", lambda _path: None)
-    refresh._gh_destination_cache.clear()
-    refresh._gh_failure_until.clear()
+    monkeypatch.setattr(gh_cache, "gh_pr_repository", lambda _path: None)
+    gh_cache._cache.clear()
+    gh_cache._failures.clear()
