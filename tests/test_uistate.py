@@ -712,21 +712,22 @@ def test_session_pull_selection_deduplicates_stack_only_copy_and_keeps_stack():
     assert not any(block.get("kind") == "note" for block in blocks)
 
 
-def test_badge_emits_pr_review_ci_comment_chip_sequence():
+def test_badge_emits_affordance_then_only_the_top_state_chip():
     checks = {"state": "failing", "runs": [{"name": "t", "state": "failing"}]}
     comments = {"unresolved": 3, "items": [{"author": "a", "body": "x", "resolved": False}]}
     items = _badge_items_for([_repo(pulls=[_rich_pull(review="changes-requested", checks=checks, comments=comments)])])
-    # PR affordance, then review (changes-requested), CI (failing), comments.
-    assert [i["icon"] for i in items] == ["git-pull-request-arrow", "circle-x", "circle-x", "message-square"]
-    assert [i["tone"] for i in items] == ["success", "danger", "danger", "warn"]
+    # The affordance, then only the winning signal: changes requested outranks
+    # failing CI and unresolved comments, which would otherwise triple the strip.
+    assert [i["icon"] for i in items] == ["git-pull-request-arrow", "circle-x"]
+    assert [i["tone"] for i in items] == ["success", "danger"]
     assert all(i["href"] == "https://github.com/o/r/pull/5" for i in items)
 
 
 def test_badge_healthy_pr_has_no_comment_chip():
     checks = {"state": "succeeded", "runs": [{"name": "t", "state": "succeeded"}]}
     items = _badge_items_for([_repo(pulls=[_rich_pull(review="approved", checks=checks)])])
-    # PR + approved review + passing CI; no comment chip when nothing unresolved.
-    assert [i["icon"] for i in items] == ["git-pull-request-arrow", "badge-check", "circle-check"]
+    # The affordance + the approval; passing CI adds no chip of its own.
+    assert [i["icon"] for i in items] == ["git-pull-request-arrow", "badge-check"]
     assert "message-square" not in [i["icon"] for i in items]
 
 
@@ -757,8 +758,70 @@ def test_badge_concatenates_chips_across_repos():
         _repo(name="b", repo="o/b", pulls=[_rich_pull(review="approved", checks=checks)]),
     ]
     icons = [i["icon"] for i in _badge_items_for(repos)]
-    # a: PR + approved ; b: PR + approved + failing CI.
-    assert icons == ["git-pull-request-arrow", "badge-check", "git-pull-request-arrow", "badge-check", "circle-x"]
+    # a: PR + approved ; b: PR + failing CI (which outranks the approval).
+    assert icons == ["git-pull-request-arrow", "badge-check", "git-pull-request-arrow", "circle-x"]
+
+
+# --- author vs reviewer glyphs ---
+
+
+def _reviewer_pull(**kwargs):
+    pull = _rich_pull(**kwargs)
+    pull["viewer_role"] = "reviewer"
+    return pull
+
+
+def _selector_row(pull):
+    blocks = _pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])]))))["payload"][
+        "blocks"
+    ]
+    return _rows(blocks)[0]
+
+
+def test_reviewer_pr_gets_the_plain_glyph_and_an_eye_for_its_open_request():
+    # A PR the viewer is reviewing: plain PR glyph in info (not their own branch),
+    # then an eye because the outstanding review is theirs to give.
+    items = _badge_items_for([_repo(pulls=[_reviewer_pull(review="waiting")])])
+    assert [i["icon"] for i in items] == ["git-pull-request", "eye"]
+    assert [i["tone"] for i in items] == ["info", "warn"]
+    assert "(reviewing)" in items[0]["tooltip"]
+    assert items[1]["tooltip"].endswith("(awaiting your review)")
+
+
+def test_authored_pr_keeps_the_arrow_and_the_waiting_clock():
+    pull = _rich_pull(review="waiting")
+    pull["viewer_role"] = "author"
+    items = _badge_items_for([_repo(pulls=[pull])])
+    assert [i["icon"] for i in items] == ["git-pull-request-arrow", "clock"]
+    assert [i["tone"] for i in items] == ["success", "neutral"]
+    assert items[1]["tooltip"].endswith("(awaiting review)")
+
+
+def test_reviewer_review_already_submitted_is_credited_to_them():
+    pull = _reviewer_pull(review="approved")
+    pull["viewer_review"] = "approved"
+    items = _badge_items_for([_repo(pulls=[pull])])
+    assert items[1]["icon"] == "badge-check"
+    assert items[1]["tooltip"].endswith("(approved by you)")
+
+
+def test_reviewer_open_request_never_hides_another_reviewers_blocker():
+    # A pending request of the reviewer's own does not mask a changes-requested
+    # decision someone else made: the danger chip still wins.
+    items = _badge_items_for([_repo(pulls=[_reviewer_pull(review="changes-requested")])])
+    assert [i["icon"] for i in items] == ["git-pull-request", "circle-x"]
+    assert items[1]["tone"] == "danger"
+
+
+def test_selector_row_glyphs_follow_the_viewer_role():
+    authored = _rich_pull(review="waiting")
+    authored["viewer_role"] = "author"
+    row = _selector_row(authored)
+    assert (row["icon"], row["tone"]) == ("git-pull-request-arrow", "success")
+    assert [(b["icon"], b["tone"], b["tooltip"]) for b in row["badges"]] == [("clock", "neutral", "awaiting review")]
+    row = _selector_row(_reviewer_pull(review="waiting"))
+    assert (row["icon"], row["tone"]) == ("git-pull-request", "info")
+    assert [(b["icon"], b["tone"], b["tooltip"]) for b in row["badges"]] == [("eye", "warn", "awaiting your review")]
 
 
 def test_badge_chips_use_single_character_marks():
@@ -772,12 +835,13 @@ def test_badge_chips_use_single_character_marks():
         [_repo(name="a", pulls=[_rich_pull(review="changes-requested", checks=checks, comments=comments)])],
         dense_glyphs=True,
     )
-    assert [i["text"] for i in items] == ["⇄", "✗", "✘", "✉"]
+    # The affordance plus the one winning signal (changes requested outranks the
+    # failing CI and the unresolved comment, so they add no chip of their own).
+    assert [i["text"] for i in items] == ["⇄", "✗"]
     assert all(len(i["text"]) == 1 for i in items)
     assert all(not i["text"].isdigit() for i in items)
     assert items[0]["tooltip"] == "a: PR #5 T"
     assert "changes requested" in items[1]["tooltip"]
-    assert "CI failing" in items[2]["tooltip"]
 
 
 def test_badge_dense_marks_cover_queue_conflict_and_error():
@@ -788,7 +852,8 @@ def test_badge_dense_marks_cover_queue_conflict_and_error():
     conflicted["merge_state"] = "conflicts"
     conflicted["merge_queue"] = queue
     marks = [i["text"] for i in _badge_items_for([_repo(pulls=[conflicted])], dense_glyphs=True)]
-    assert marks[:3] == ["⇄", "⇉", "⊘"]
+    # The queue wins over the (stale, mid-merge) conflict signal.
+    assert marks[:2] == ["⇄", "⇉"]
     assert [i["text"] for i in _badge_items_for([_repo(error={"hint": "boom"})], dense_glyphs=True)] == ["!"]
 
 
@@ -839,6 +904,27 @@ def test_glyph_tables_cover_every_visual_state():
         assert unicodedata.east_asian_width(mark) in {"N", "Na", "H"}, mark
 
 
+def test_badge_chip_tooltips_name_repo_and_state():
+    checks = {"state": "failing", "runs": []}
+    items = _badge_items_for([_repo(name="a", pulls=[_rich_pull(review="changes-requested", checks=checks)])])
+    tips = [i["tooltip"] for i in items]
+    assert len(tips) == 2  # affordance + the one winning signal
+    assert tips[0].startswith("a: PR #5")
+    assert "changes requested" in tips[1]
+
+
+def test_selector_strip_keeps_only_the_most_urgent_glyph():
+    checks = {"state": "failing", "runs": []}
+    comments = {"unresolved": 2, "items": []}
+    row = _selector_row(_rich_pull(review="changes-requested", checks=checks, comments=comments))
+    assert [(b["icon"], b["tone"]) for b in row["badges"]] == [("circle-x", "danger")]
+
+
+def test_selector_strip_counts_unresolved_comments_in_its_one_glyph():
+    row = _selector_row(_rich_pull(review="approved", comments={"unresolved": 3, "items": []}))
+    assert row["badges"] == [{"icon": "message-square", "tone": "warn", "text": "3", "tooltip": "3 unresolved"}]
+
+
 # --- chip-visibility settings (#36 follow-up): per-category toggles ---
 
 
@@ -856,6 +942,7 @@ def test_ci_toggle_off_hides_ci_chip():
     checks = {"state": "failing", "runs": []}
     repos = [_repo(pulls=[_rich_pull(review="approved", checks=checks)])]
     assert "circle-x" in _badge_icons_with(repos, frozenset({"review", "ci", "comments"}))
+    # With CI hidden the approval becomes the winning signal.
     assert _badge_icons_with(repos, frozenset({"review", "comments"})) == ["git-pull-request-arrow", "badge-check"]
 
 

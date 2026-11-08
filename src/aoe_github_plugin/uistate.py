@@ -61,6 +61,18 @@ worker had a GitHub token; without one the snapshot's ``auth.present`` is
 ``False``, the pulls are the basic open-PR shape, and the pane shows a banner
 note telling the user a token unlocks the rest.
 
+The PR affordance and review glyphs are viewer-scoped (``viewer_role`` /
+``viewer_review`` from ``graphql``): on a PR the viewer authored the arrow marks
+their own branch and an outstanding review reads as a wait on someone else, while
+a PR they are reviewing takes the plain PR glyph and turns that outstanding
+review into an eye -- the one glyph that is theirs to act on.
+
+The PR affordance and review glyphs are viewer-scoped (``viewer_role`` /
+``viewer_review`` from ``graphql``): on a PR the viewer authored the arrow marks
+their own branch and an outstanding review reads as a wait on someone else, while
+a PR they are reviewing takes the plain PR glyph and turns that outstanding
+review into an eye -- the one glyph that is theirs to act on.
+
 Icons are lucide names (the web frontend already depends on ``lucide-react``);
 ``tone`` is one of the host's ``Tone`` set and colors the icon, while ``color``
 is an optional validated hex the web applies where a tone cannot name the hue.
@@ -92,6 +104,20 @@ _ICON_OPEN = "git-pull-request-arrow"
 _ICON_DRAFT = "git-pull-request-draft"
 _ICON_MERGED = "git-merge"
 _ICON_ERROR = "circle-alert"
+# A PR the viewer is *reviewing* takes the plain PR glyph (and an info tone),
+# against the arrow that marks their own branch, so the two read apart in a mono
+# chip strip. When the outstanding review is the viewer's own next action, an
+# eye replaces the "awaiting review" clock: the waiting is on them, not someone
+# else, and no clock will move it.
+_ICON_REVIEW = "git-pull-request"
+_ICON_YOUR_REVIEW = "eye"
+# A PR the viewer is *reviewing* takes the plain PR glyph (and an info tone),
+# against the arrow that marks their own branch, so the two read apart in a mono
+# chip strip. When the outstanding review is the viewer's own next action, an
+# eye replaces the "awaiting review" clock: the waiting is on them, not someone
+# else, and no clock will move it.
+_ICON_REVIEW = "git-pull-request"
+_ICON_YOUR_REVIEW = "eye"
 
 # review_state -> (lucide icon, host Tone, human label).
 _REVIEW_VISUAL: dict[str, tuple[str, str, str]] = {
@@ -274,6 +300,83 @@ _KIND_CATEGORY: dict[str, str] = {
 # supplied (keeps the function pure and total for callers/tests that pass none).
 _ALL_CHIPS = frozenset(_KIND_CATEGORY.values())
 
+# The viewer's own submitted position, said from their side. Only used when that
+# position IS the PR's current review state, so another reviewer's request for
+# changes is never relabelled as the viewer's.
+_VIEWER_REVIEW_LABEL: dict[str, str] = {
+    "approved": "approved by you",
+    "changes-requested": "changes requested by you",
+    "commented": "commented by you",
+}
+
+
+def _viewer_role(pull: dict[str, Any]) -> str | None:
+    """``"author"`` / ``"reviewer"`` from ``graphql.viewer_role``, else ``None``.
+    A no-token snapshot carries no viewer fields, so the glyphs keep their
+    role-neutral look rather than claiming a role they cannot see."""
+    role = pull.get("viewer_role")
+    return role if role in ("author", "reviewer") else None
+
+
+def _review_visual(pull: dict[str, Any]) -> tuple[str, str, str] | None:
+    """``(icon, tone, label)`` for the review glyph, or ``None`` with no signal.
+
+    The same review state means different things on either side of a PR. On the
+    viewer's own PR it describes other people ("awaiting review" = still waiting
+    on them). On a PR they are reviewing, an outstanding request is their own next
+    action, so it reads as an eye with a warning tone instead of a clock, and a
+    position they already submitted is credited to them. Anything else falls
+    through to the shared ``_REVIEW_VISUAL`` row, so a blocker another reviewer
+    raised is never hidden behind the viewer's own approval.
+    """
+    state = pull.get("review_state")
+    base = _REVIEW_VISUAL.get(state) if isinstance(state, str) else None
+    if _viewer_role(pull) != "reviewer":
+        return base
+    own = pull.get("viewer_review")
+    submitted = own if isinstance(own, str) and own in _VIEWER_REVIEW_LABEL else None
+    if submitted is None and state != "changes-requested":
+        # No submitted review (`pending` is an unsubmitted draft), so the request
+        # is on the viewer: this is the glyph they act on.
+        return (_ICON_YOUR_REVIEW, "warn", "awaiting your review")
+    if base is not None and submitted is not None and submitted == state:
+        icon, tone, _label = base
+        return icon, tone, _VIEWER_REVIEW_LABEL[submitted]
+    return base
+
+
+def _attention_glyph(pull: dict[str, Any], kind: str) -> tuple[str, str, str]:
+    """``(icon, tone, label)`` for one attention kind. A review kind goes through
+    ``_review_visual`` so the row's one state glyph follows the viewer's role
+    (the eye, the "by you" wording) exactly like the pane's glyph strip does, and
+    a queue kind states the queue's real state rather than the ladder's default."""
+    if kind == "queue":
+        return _queue_label(pull) or ("git-merge", "neutral", "in merge queue")
+    if _KIND_CATEGORY.get(kind) == "review":
+        review = _review_visual(pull)
+        if review is not None:
+            return review
+    _rank, icon, tone, label = _ATTENTION_VISUAL[kind]
+    return icon, tone, label
+
+
+def _attention_mark(pull: dict[str, Any], kind: str) -> str:
+    """The one-character dense mark for an attention kind, mirroring
+    ``_attention_glyph``: the winning state's own mark, so a lone chip in the
+    terminal still names the state it stands for."""
+    if kind == "queue":
+        return _QUEUE_GLYPH
+    if kind == "conflicts":
+        return _CONFLICT_GLYPH
+    if kind == "unresolved":
+        return _COMMENT_GLYPH
+    if _KIND_CATEGORY.get(kind) == "review":
+        state = pull.get("review_state")
+        return _REVIEW_GLYPH.get(state, "?") if isinstance(state, str) else "?"
+    checks = pull.get("checks")
+    cstate = checks.get("state") if isinstance(checks, dict) else None
+    return _CHECK_GLYPH.get(cstate, "?") if isinstance(cstate, str) else "?"
+
 
 def _queue_label(pull: dict[str, Any]) -> tuple[str, str, str] | None:
     queue = pull.get("merge_queue")
@@ -366,7 +469,7 @@ def _badge_tooltip(repo: dict[str, Any], chips: frozenset[str]) -> str:
     if top is None:
         return f"{name}: no open PR"
     pull, kind = top
-    label = _ATTENTION_VISUAL[kind][3]
+    label = _attention_glyph(pull, kind)[2]
     head = f"{name}: PR #{pull.get('number', '?')} {pull.get('title', '')}".rstrip()
     return f"{head} ({label})"
 
@@ -388,12 +491,15 @@ def _chip(icon: str, tone: str, text: str | None, tooltip: str, href: str | None
 def _pr_badge_chips(
     repo_name: str, pull: dict[str, Any], chips_on: frozenset[str], *, dense: bool = False
 ) -> list[dict[str, Any]]:
-    """The chip sequence for one non-merged PR (#36): a PR affordance, then review,
-    CI, and unresolved-comment indicators, each present only when a token supplies
-    that field and its category is enabled (``chips_on``). A no-token PR is the PR
-    chip alone, so the row stays uncluttered. Every href opens the PR. ``dense``
-    adds the one-character mark the terminal row renders; off, the chip is the
-    icon/tone/tooltip shape the web row already had."""
+    """The chip sequence for one non-merged PR (#36): the PR affordance, then at
+    most one state chip for the PR's most-urgent signal, so a session row shows the
+    minimum it takes to scan (whose PR, and what is wrong) rather than one chip per
+    field; the pane keeps the full breakdown. A signal appears only when a token
+    supplies that field and its category is enabled (``chips_on``); queue
+    membership and conflicts are ungated, and a no-token PR is the affordance
+    alone. Every href opens the PR. ``dense`` adds the one-character mark the
+    terminal row renders; off, the chip is the icon/tone/tooltip shape the web row
+    already had."""
     href = pull.get("url")
     number = pull.get("number", "?")
     head = f"{repo_name}: PR #{number} {pull.get('title', '')}".rstrip()
@@ -404,44 +510,31 @@ def _pr_badge_chips(
     if pull.get("draft"):
         # a draft is WIP: skip review/CI/comment noise until it opens.
         return [_chip(_ICON_DRAFT, "warn", mark(_DRAFT_GLYPH), f"{head} (draft)", href)]
-    chips = [_chip(_ICON_OPEN, "success", mark(_PR_GLYPH), head, href)]
+    reviewing = _viewer_role(pull) == "reviewer"
+    icon, tone = (_ICON_REVIEW, "info") if reviewing else (_ICON_OPEN, "success")
+    # The words back up the glyph: a reviewer's affordance says so, since the
+    # plain-vs-arrow shape is a subtle difference in a chip strip.
+    chips = [_chip(icon, tone, mark(_PR_GLYPH), f"{head} (reviewing)" if reviewing else head, href)]
 
+    # One chip for the winning signal, from the same ladder the row-column and the
+    # pane use. Queue membership and conflicts sit before the gated ladder, so they
+    # survive every chip toggle; the queue's position rides in the tooltip.
+    kind = _pull_attention(pull, chips_on)
+    if kind in ("open", "draft"):
+        return chips
+    icon, tone, label = _attention_glyph(pull, kind)
     queue = pull.get("merge_queue")
-    if isinstance(queue, dict):
-        icon, tone, label = _queue_label(pull) or ("git-merge", "neutral", "in merge queue")
-        position = queue.get("position")
-        suffix = f" · position {position}" if isinstance(position, int) and not isinstance(position, bool) else ""
-        chips.append(_chip(icon, tone, mark(_QUEUE_GLYPH), f"{head} ({label}{suffix})", href))
-    if pull.get("merge_state") == "conflicts":
-        # Conflicts are ungated (not a suppressible category): a merge-blocked
-        # PR always shows the danger chip. Exact match avoids false conflicts.
-        chips.append(_chip("triangle-alert", "danger", mark(_CONFLICT_GLYPH), f"{head} (conflicts)", href))
-
-    review_state = pull.get("review_state")
-    if isinstance(review_state, str) and "review" in chips_on:
-        review = _REVIEW_VISUAL.get(review_state)
-        if review:
-            icon, tone, label = review
-            chips.append(_chip(icon, tone, mark(_REVIEW_GLYPH.get(review_state, "?")), f"{head} ({label})", href))
-
-    checks = pull.get("checks")
-    cstate = checks.get("state") if isinstance(checks, dict) else None
-    if isinstance(cstate, str) and "ci" in chips_on:
-        icon, tone, label = _CHECK_VISUAL.get(cstate, _CHECK_VISUAL["unknown"])
-        chips.append(_chip(icon, tone, mark(_CHECK_GLYPH.get(cstate, "?")), f"{head} (CI {label})", href))
-
-    comments = pull.get("comments")
-    unresolved = comments.get("unresolved") if isinstance(comments, dict) else 0
-    if unresolved and "comments" in chips_on:
-        chips.append(_chip("message-square", "warn", mark(_COMMENT_GLYPH), f"{head} ({unresolved} unresolved)", href))
-
+    position = queue.get("position") if isinstance(queue, dict) else None
+    if kind == "queue" and isinstance(position, int) and not isinstance(position, bool):
+        label = f"{label} · position {position}"
+    chips.append(_chip(icon, tone, mark(_attention_mark(pull, kind)), f"{head} ({label})", href))
     return chips
 
 
 def _badge_items(repos: list[dict[str, Any]], chips_on: frozenset[str], *, dense: bool = False) -> list[dict[str, Any]]:
-    """Per session: a chip sequence per open PR (PR + review + CI + comments), an
-    error marker per failed repo, concatenated across repos. Merged-only repos and
-    non-github checkouts contribute nothing, keeping the badge actionable.
+    """Per session: the PR affordance plus the one winning state chip per open PR,
+    an error marker per failed repo, concatenated across repos. Merged-only repos
+    and non-github checkouts contribute nothing, keeping the badge actionable.
     ``dense`` adds the one-character terminal marks to every chip."""
     items: list[dict[str, Any]] = []
     for repo in repos:
@@ -471,7 +564,8 @@ def _status_candidate(
             if top is None:
                 continue
             pull, kind = top
-            rank, _icon, tone, label = _ATTENTION_VISUAL[kind]
+            rank = _ATTENTION_VISUAL[kind][0]
+            _icon, tone, label = _attention_glyph(pull, kind)
             cell = {"text": label, "tone": tone, "tooltip": tooltip, "sort_value": rank}
             href = pull.get("url") if isinstance(pull.get("url"), str) else None
         if best is None or rank < best[0]:
@@ -555,6 +649,8 @@ def _pull_visual(pull: dict[str, Any]) -> tuple[str, str | None, str | None]:
         return "circle-x", "neutral", None
     if pull.get("draft"):
         return _ICON_DRAFT, "warn", None
+    if _viewer_role(pull) == "reviewer":
+        return _ICON_REVIEW, "info", None
     return _ICON_OPEN, "success", None
 
 
@@ -624,38 +720,38 @@ def _unresolved_count(pull: dict[str, Any]) -> int:
 
 
 def _pr_signals(pull: dict[str, Any]) -> list[dict[str, Any]]:
-    """The compact glyph strip on a PR selector row: CI, review, conflicts and an
-    unresolved-comment count. Each entry is tone-colored with the words in its
-    tooltip, so a run of rows is scannable without reading any of them. Empty for
-    the no-token shape, where none of these fields exist."""
-    signals: list[dict[str, Any]] = []
-    checks = pull.get("checks")
-    cstate = checks.get("state") if isinstance(checks, dict) else None
-    if isinstance(cstate, str):
-        icon, tone, label = _CHECK_VISUAL.get(cstate, _CHECK_VISUAL["unknown"])
-        signals.append({"icon": icon, "tone": tone, "tooltip": f"CI {label}"})
-    review = pull.get("review_state")
-    visual = _REVIEW_VISUAL.get(review) if isinstance(review, str) else None
-    if visual is not None:
-        icon, tone, label = visual
-        signals.append({"icon": icon, "tone": tone, "tooltip": label})
-    queue_label = _queue_label(pull)
-    if queue_label is not None:
-        icon, tone, label = queue_label
-        queue = pull.get("merge_queue")
-        position = queue.get("position") if isinstance(queue, dict) else None
-        tooltip = (
-            f"{label} · position {position}" if isinstance(position, int) and not isinstance(position, bool) else label
-        )
-        signals.append({"icon": icon, "tone": tone, "tooltip": tooltip})
-    if pull.get("merge_state") == "conflicts":
-        signals.append({"icon": "triangle-alert", "tone": "danger", "tooltip": "conflicts with base branch"})
-    unresolved = _unresolved_count(pull)
-    if unresolved:
-        signals.append(
-            {"icon": "message-square", "tone": "warn", "text": str(unresolved), "tooltip": f"{unresolved} unresolved"}
-        )
-    return signals
+    """The glyph strip on a PR selector row: the one most-urgent state signal (or
+    the unresolved-comment count, which says more than a bare glyph), tone-colored
+    with the words in its tooltip, so a run of rows is scannable without reading
+    any of them. The row icon already carries open/draft/merged, so nothing is
+    emitted for a PR with no notable state, nor for the no-token shape."""
+    kind = _pull_attention(pull, _ALL_CHIPS)
+    if kind == "draft":
+        # A draft is WIP: the row icon says so, and only a queued or conflicted
+        # branch outranks it.
+        if pull.get("merge_queue") is not None:
+            kind = "queue"
+        else:
+            kind = "conflicts" if pull.get("merge_state") == "conflicts" else "open"
+    if kind == "unresolved":
+        unresolved = _unresolved_count(pull)
+        if unresolved:
+            return [
+                {
+                    "icon": "message-square",
+                    "tone": "warn",
+                    "text": str(unresolved),
+                    "tooltip": f"{unresolved} unresolved",
+                }
+            ]
+    if kind in ("open", "draft"):
+        return []
+    icon, tone, label = _attention_glyph(pull, kind)
+    queue = pull.get("merge_queue")
+    position = queue.get("position") if isinstance(queue, dict) else None
+    if kind == "queue" and isinstance(position, int) and not isinstance(position, bool):
+        label = f"{label} · position {position}"
+    return [{"icon": icon, "tone": tone, "tooltip": label}]
 
 
 def _pr_row(repo: dict[str, Any], pull: dict[str, Any], *, selected: bool, show_repo: bool = False) -> dict[str, Any]:

@@ -67,6 +67,13 @@ fragment PRNode on PullRequest {
     mergeQueue { url }
     baseRefName additions deletions changedFiles
     author { login }
+    # Viewer-scoped, so the pane can tell "my PR" from "a PR I'm reviewing"
+    # without a second query for the viewer's login. ``viewerDidAuthor`` is a
+    # plain boolean; the two review fields are nullable connections of one node,
+    # so their presence alone answers "am I on the hook for this review".
+    viewerDidAuthor
+    viewerLatestReview { state }
+    viewerLatestReviewRequest { id }
     baseRef { branchProtectionRule {
       requiresStatusChecks
       requiredStatusCheckContexts
@@ -906,6 +913,34 @@ def review_summary(people: list[dict[str, str]]) -> str:
     return f"{len(people)} pending"
 
 
+# The viewer's relationship to a PR -> our role vocabulary. ``None`` when the
+# snapshot carries no viewer information (the no-token REST shape, or a PR the
+# viewer neither wrote nor was asked to review), so callers keep their
+# role-neutral rendering instead of guessing from the author login.
+
+
+def viewer_role(pr: dict[str, Any]) -> str | None:
+    """``"author"`` when the viewer opened the PR, ``"reviewer"`` when they have
+    reviewed it or been asked to (a direct or team review request both surface
+    here), else ``None``."""
+    if pr.get("viewerDidAuthor") is True:
+        return "author"
+    if any(isinstance(pr.get(key), dict) for key in ("viewerLatestReview", "viewerLatestReviewRequest")):
+        return "reviewer"
+    return None
+
+
+def viewer_review(pr: dict[str, Any]) -> str | None:
+    """Where the viewer's own review stands: ``approved`` / ``changes-requested``
+    / ``commented`` / ``pending``, or ``None`` when they have not reviewed it.
+    ``pending`` is GitHub's unsubmitted draft review, which is not a position on
+    the PR."""
+    review = pr.get("viewerLatestReview")
+    if not isinstance(review, dict):
+        return None
+    return _REVIEW_NODE_STATE.get(review.get("state") or "", "pending")
+
+
 def diff_summary(pr: dict[str, Any]) -> dict[str, int] | None:
     """``{"added", "removed", "files"}`` for the PR, or ``None`` when GitHub did
     not report them (the no-token REST shape, or a drifted response)."""
@@ -1030,6 +1065,8 @@ def _normalize_pull(
         "checks": check_summary(pr, required_checks_only=required_checks_only),
         "comments": comment_summary(pr),
         "author": (pr.get("author") or {}).get("login") or "",
+        "viewer_role": viewer_role(pr),
+        "viewer_review": viewer_review(pr),
         "base": pr.get("baseRefName"),
         "reviewers": people,
         "head_approved": head_approved(pr),
