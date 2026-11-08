@@ -1349,8 +1349,8 @@ _TOKEN_NOTE = {
     "kind": "note",
     "tone": "warn",
     "text": (
-        "No GitHub token: showing open PRs only. Set GITHUB_TOKEN or run `gh auth login` "
-        "to see review state, CI checks, unresolved comments, and merged PRs."
+        "No GitHub token: branch discovery shows open PRs only. Set GITHUB_TOKEN or run `gh auth login` "
+        "to see review state, CI checks, unresolved comments, and merged branch PRs."
     ),
 }
 

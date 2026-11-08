@@ -201,3 +201,40 @@ def test_status_discovers_fork_pull_targeting_configured_upstream(tmp_path):
     result = handlers.github_status(str(tmp_path), env=_NoTokenEnv(), transport=_transport(handler))
     assert result["repo"] == "alice/r"
     assert result["pulls"][0]["url"] == "https://github.com/upstream/r/pull/7"
+
+
+def test_linked_status_and_open_query_exact_pr(monkeypatch):
+    monkeypatch.setattr(handlers, "worktree_pr_link", lambda _path: ("upstream", "project", 42))
+    monkeypatch.setattr(handlers, "current_branch", lambda _path: "local-review")
+
+    def handler(request):
+        assert request.url.path == "/repos/upstream/project/pulls/42"
+        return httpx.Response(200, json={**_pr(42), "html_url": "https://github.com/upstream/project/pull/42"})
+
+    transport = _transport(handler)
+    result = handlers.github_status(env=_NoTokenEnv(), transport=transport)
+    assert (result["repo"], result["branch"], result["pulls"][0]["number"]) == ("upstream/project", "local-review", 42)
+    assert handlers.github_open(env=_NoTokenEnv(), transport=transport) == {
+        "url": "https://github.com/upstream/project/pull/42",
+        "kind": "pull",
+    }
+
+
+def test_linked_merged_pr_status_reports_merged(monkeypatch):
+    monkeypatch.setattr(handlers, "worktree_pr_link", lambda _path: ("upstream", "project", 42))
+    monkeypatch.setattr(handlers, "current_branch", lambda _path: "review")
+    transport = _transport(
+        lambda _request: httpx.Response(200, json={**_pr(42), "state": "closed", "merged_at": "2026-01-01T00:00:00Z"})
+    )
+    result = handlers.github_status(env=_NoTokenEnv(), transport=transport)
+    assert result["pulls"][0]["merged"] is True
+    assert result["summary"] == "upstream/project: PR #42 merged"
+
+
+def test_missing_linked_pr_never_opens_unrelated_branch(monkeypatch):
+    monkeypatch.setattr(handlers, "worktree_pr_link", lambda _path: ("upstream", "project", 42))
+    monkeypatch.setattr(handlers, "current_branch", lambda _path: "local-review")
+    transport = _transport(lambda _request: httpx.Response(404))
+    assert handlers.github_status(env=_NoTokenEnv(), transport=transport)["error"]["kind"] == "not_found"
+    with pytest.raises(errors.NotFoundError):
+        handlers.github_open(env=_NoTokenEnv(), transport=transport)

@@ -40,6 +40,7 @@ from typing import Any
 from datetime import datetime
 from datetime import timedelta
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
@@ -435,7 +436,31 @@ class Runtime:
             if snapshot is None:
                 return
             live_ids = {s["id"] for s in sessions if isinstance(s, dict) and isinstance(s.get("id"), str)}
-            cached = [s for s in snapshot["sessions"] if isinstance(s, dict) and s.get("session_id") in live_ids]
+
+            candidates = [s for s in snapshot["sessions"] if isinstance(s, dict) and s.get("session_id") in live_ids]
+            repos = [repo for session in candidates for repo in session.get("repos", [])]
+            paths = {repo["path"] for repo in repos if isinstance(repo, dict) and isinstance(repo.get("path"), str)}
+
+            def read_link(path: str) -> list[Any] | None | refresh.GitHubError:
+                try:
+                    link = refresh.worktree_pr_link(path)
+                    return list(link) if link else None
+                except refresh.GitHubError as exc:
+                    return exc
+
+            with ThreadPoolExecutor(max_workers=refresh.GIT_WORKERS) as pool:
+                links = dict(zip(paths, pool.map(read_link, paths), strict=True))
+            cached = [
+                session
+                for session in candidates
+                if all(
+                    isinstance(repo, dict)
+                    and isinstance(repo.get("path"), str)
+                    and not isinstance(links[repo["path"]], refresh.GitHubError)
+                    and links[repo["path"]] == repo.get("_pr_link")
+                    for repo in session.get("repos", [])
+                )
+            ]
             for session in cached:
                 freshness = session.get("freshness")
                 if isinstance(freshness, dict):

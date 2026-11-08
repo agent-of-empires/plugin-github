@@ -6,6 +6,10 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## Unreleased
 
+### Features
+
+- Recognize explicit GitHub PR links stored in per-worktree Git metadata.
+
 ### Bug Fixes
 
 - **discovery:** Find upstream-targeting PRs from fork checkouts in web snapshots and direct-worker status/open handlers, using the GitHub remotes each checkout configures (no metadata or fork-lineage calls). The permitted head is always the checkout's own repo (upstream is only a destination), so unrelated same-name branches are rejected; caches, PR selection, and stack navigation stay destination-aware, and destination GraphQL pages are bounded to a single page with owner-scoped REST fallback (#129).

@@ -55,11 +55,13 @@ from aoe_github_plugin import lookup
 from aoe_github_plugin import graphql
 from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.client import GitHubClient
+from aoe_github_plugin.errors import ApiError
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import NotFoundError
 from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.handlers import _resolve_optional_token
 from aoe_github_plugin.utils.gitctx import parse_owner_repo
+from aoe_github_plugin.utils.gitctx import worktree_pr_link
 
 _LOG = logging.getLogger(__name__)
 
@@ -855,7 +857,7 @@ def _probe_extra_pages(
     return False, False
 
 
-def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str, Any]], bool]:
+def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str, Any]], bool]:  # noqa: C901, PLR0911
     """Cheap REST conditional check for one ``(owner, repo, branch)``: returns
     ``(changed, pulls, fresh)`` where ``changed`` is ``False`` on a ``304`` (the
     open-PR list is unchanged, the request was free against the primary limit).
@@ -875,16 +877,32 @@ def _rest_probe(client: GitHubClient, key: RepoKey) -> tuple[bool, list[dict[str
         raise RateLimitedError
     etag = cached["etag"] if cached else None
     page_size = 100
-    params = {"state": "open", "head": f"{head_owner}:{branch}", "per_page": str(page_size)}
+    linked = branch.startswith(":pr/")
+    branch_params = {"state": "open", "head": f"{head_owner}:{branch}", "per_page": str(page_size)}
+    params = None if linked else branch_params
+    endpoint = f"/repos/{owner}/{repo}/pulls/{branch[4:]}" if linked else f"/repos/{owner}/{repo}/pulls"
     try:
-        status, new_etag, raw = client.get_json_conditional(f"/repos/{owner}/{repo}/pulls", params, etag)
+        status, new_etag, raw = client.get_json_conditional(endpoint, params, etag)
     except RateLimitedError:
         _set_backoff("rest")
         if cached is not None:
             return False, cached["pulls"], False
         raise
+    except NotFoundError:
+        with _cache_lock:
+            _etag_cache.pop(key, None)
+        raise
     if status == 304 and cached is not None:
         return False, cached["pulls"], True
+    if linked:
+        if not isinstance(raw, dict) or raw.get("number") != int(branch[4:]):
+            raise ApiError(200, "unexpected linked pull request")
+        pulls = _trim([raw])
+        pulls[0]["merged"] = bool(raw.get("merged_at"))
+        with _cache_lock:
+            _etag_cache[key] = {"etag": new_etag, "pulls": pulls}
+        return True, pulls, True
+    params = branch_params
     items = [pr for pr in raw or [] if isinstance(pr, dict)]
     # ``head=owner:branch`` matches that branch in EVERY repository the owner
     # has, so another checkout's PRs can fill the first page and hide this one
@@ -972,7 +990,7 @@ def _is_active(pulls: list[dict[str, Any]]) -> bool:
     queue. Those transitions can happen without the REST pull-list ETag changing,
     so they earn the shorter staleness ceiling."""
     for pull in pulls:
-        if pull.get("merged"):
+        if pull.get("merged") or str(pull.get("state") or "").upper() in {"CLOSED", "MERGED"}:
             continue
         if pull.get("merge_queue") is not None:
             return True
@@ -1415,7 +1433,7 @@ def _discovered_connection(
     }
 
 
-def _apply_aliases(
+def _apply_aliases(  # noqa: C901, PLR0912
     client: GitHubClient,
     chunk: list[RepoKey],
     pending: dict[RepoKey, dict[str, Any]],
@@ -1435,6 +1453,8 @@ def _apply_aliases(
     for i, key in enumerate(chunk):
         cache_key = _rich_cache_key(key, flags=flags)
         conn = repository.get(f"b{i}")
+        if key[2].startswith(":pr/") and (isinstance(conn, dict) or conn is None):
+            conn = {"nodes": [conn] if conn else []} if conn is None or conn.get("number") == int(key[2][4:]) else None
         if f"b{i}" in failed or not isinstance(conn, dict):
             _arm_retry_cooldown([key], pending, now)
             # Serve this key's last-good answer. The digest tier may already have
@@ -1449,7 +1469,9 @@ def _apply_aliases(
         # of paying a second serial lookup (#129). A truncated run proved
         # nothing and is never handed over. Per-tick scratch, never persisted.
         proved = pending[key].pop("digest_owned", None)
-        if proved is not None:
+        if key[2].startswith(":pr/"):
+            truncated = None
+        elif proved is not None:
             owned_numbers = {node.get("number") for node in proved.get("nodes") or [] if isinstance(node, dict)}
             kept = [
                 node
@@ -1563,9 +1585,11 @@ def _fetch_chunk(
 
     variables: dict[str, Any] = {"owner": owner, "repo": repo}
     for i, key in enumerate(chunk):
-        variables[f"b{i}"] = key[2]
+        variables[f"b{i}"] = int(key[2][4:]) if key[2].startswith(":pr/") else key[2]
+    linked = chunk[0][2].startswith(":pr/")
     try:
-        data = client.post_graphql(graphql.build_query(len(chunk)), variables)
+        query = graphql.build_link_query(len(chunk)) if linked else graphql.build_query(len(chunk))
+        data = client.post_graphql(query, variables)
     except RateLimitedError:
         _set_backoff("graphql")
         _chunk_fallback(chunk, pending, out)
@@ -1614,7 +1638,11 @@ def _apply_digest_aliases(
     for i, key in enumerate(chunk):
         conn = repository.get(f"b{i}")
         signature = None
-        if f"b{i}" not in failed and isinstance(conn, dict):
+        if f"b{i}" not in failed and key[2].startswith(":pr/"):
+            if conn is None or (isinstance(conn, dict) and conn.get("number") == int(key[2][4:])):
+                owned = {"nodes": [conn] if conn else []}
+                signature = graphql.digest_signature(owned)
+        elif f"b{i}" not in failed and isinstance(conn, dict):
             reason, owned = _owned_connection(
                 client,
                 key,
@@ -1677,9 +1705,11 @@ def _fetch_digest_chunk(
 
     variables: dict[str, Any] = {"owner": owner, "repo": repo}
     for i, key in enumerate(chunk):
-        variables[f"b{i}"] = key[2]
+        variables[f"b{i}"] = int(key[2][4:]) if key[2].startswith(":pr/") else key[2]
+    linked = chunk[0][2].startswith(":pr/")
     try:
-        data = client.post_graphql(graphql.build_digest_query(len(chunk)), variables)
+        query = graphql.build_link_query(len(chunk), digest=True) if linked else graphql.build_digest_query(len(chunk))
+        data = client.post_graphql(query, variables)
     except RateLimitedError:
         _set_backoff("graphql")
         _chunk_fallback(chunk, pending, out)
@@ -1717,9 +1747,9 @@ def _run_chunked(
     """Group ``pending`` by ``(owner, repo)``, chunk to ``MAX_GRAPHQL_ALIASES``
     (#25), and run each chunk fail-soft: an unexpected error degrades its own
     chunk's keys, never the whole refresh."""
-    groups: dict[tuple[str, str], list[RepoKey]] = defaultdict(list)
+    groups: dict[tuple[str, str, bool], list[RepoKey]] = defaultdict(list)
     for key in pending:
-        groups[(key[0], key[1])].append(key)
+        groups[(key[0], key[1], key[2].startswith(":pr/"))].append(key)
     for gkeys in groups.values():
         gkeys.sort()
         for start in range(0, len(gkeys), MAX_GRAPHQL_ALIASES):
@@ -1766,6 +1796,11 @@ def _fetch_rich(
             rich = _graphql_cache.get(cache_key)
         probe = probes[key]
         if isinstance(probe, GitHubError):
+            if isinstance(probe, NotFoundError) and key[2].startswith(":pr/"):
+                with _cache_lock:
+                    _graphql_cache.pop(cache_key, None)
+                out[key] = _error_entry(probe)
+                continue
             stale = _pulls_result(rich["pulls"], fresh=False, stale=True) if rich is not None else None
             out[key] = stale if stale is not None else _error_entry(probe)
             continue
@@ -1920,13 +1955,15 @@ class _Resolved:
     repo: str | None
     key: CheckoutKey | None
     remotes: list[tuple[str, str]]
+    branch: str | None = None
+    error: dict[str, str] | None = None
 
 
-def _resolve_checkouts(
+def _resolve_checkouts(  # noqa: C901
     sessions: list[dict[str, Any]], settings: SnapshotSettings
 ) -> tuple[
     list[tuple[dict[str, Any], list[tuple[str, str | None]]]],
-    dict[tuple[str, str | None], tuple[str | None, CheckoutKey | None]],
+    dict[tuple[str, str | None], tuple[str | None, CheckoutKey | None, str | None, dict[str, str] | None]],
     dict[CheckoutKey, list[tuple[str, str]]],
 ]:
     """Discover each session's checkouts, then each checkout's identity and remotes.
@@ -1944,7 +1981,19 @@ def _resolve_checkouts(
         """Identity and remotes for one checkout, read once in the shared pool."""
         (path, branch), checkout = item
         repo, key = _identify(checkout, branch)
-        return _Resolved((path, branch), repo, key, _remote_repos(checkout))
+        local_branch = key[2] if key else branch
+        if branch is None:
+            try:
+                link = worktree_pr_link(checkout)
+            except GitHubError as exc:
+                return _Resolved((path, branch), repo, None, [], local_branch, {"kind": exc.kind, "hint": str(exc)})
+            if link is not None:
+                owner, name, number = link
+                if local_branch is None:
+                    current = _git(checkout, "rev-parse", "--abbrev-ref", "HEAD")
+                    local_branch = current if current != "HEAD" else None
+                return _Resolved((path, branch), f"{owner}/{name}", (owner, name, f":pr/{number}"), [], local_branch)
+        return _Resolved((path, branch), repo, key, _remote_repos(checkout), local_branch)
 
     with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
         per_session = list(zip(sessions, pool.map(_discover, sessions), strict=True))
@@ -1953,7 +2002,7 @@ def _resolve_checkouts(
             for checkout, branch in checkouts:
                 reps.setdefault((os.path.realpath(checkout), branch), checkout)
         resolved: list[_Resolved] = list(pool.map(_checkout, reps.items()))
-    ident = {found.path_key: (found.repo, found.key) for found in resolved}
+    ident = {found.path_key: (found.repo, found.key, found.branch, found.error) for found in resolved}
     # Union, not overwrite: two worktrees of one origin share a query key but
     # can declare different remotes. Both are real destinations for that key.
     destinations: dict[CheckoutKey, list[tuple[str, str]]] = {}
@@ -1964,7 +2013,7 @@ def _resolve_checkouts(
     return per_session, ident, destinations
 
 
-def build_snapshot(
+def build_snapshot(  # noqa: C901
     sessions: list[dict[str, Any]],
     env: TokenEnvironment | None = None,
     transport: httpx.BaseTransport | None = None,
@@ -2003,21 +2052,41 @@ def build_snapshot(
             ignore_bot_approval_recommendations=settings.ignore_bot_approval_recommendations,
         ),
     )
+
+    def recheck_link(path: str) -> tuple[str, str, int] | None | GitHubError:
+        try:
+            return worktree_pr_link(path)
+        except GitHubError as exc:
+            return exc
+
+    paths = {checkout for _, checkouts in per_session for checkout, branch in checkouts if branch is None}
+    with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
+        links = dict(zip(paths, pool.map(recheck_link, paths), strict=True))
     refreshed_at = _utc_now_iso()
     out_sessions: list[dict[str, Any]] = []
     for session, checkouts in per_session:
         repos: list[dict[str, Any]] = []
         session_keys: list[CheckoutKey] = []
         for checkout, branch in checkouts:
-            repo_str, key = ident[(os.path.realpath(checkout), branch)]
+            repo_str, key, local_branch, link_error = ident[(os.path.realpath(checkout), branch)]
             entry: dict[str, Any] = {
                 "path": checkout,
                 "name": Path(checkout).name or checkout,
                 "repo": repo_str,
-                "branch": key[2] if key else branch,
+                "branch": local_branch,
                 "pulls": [],
-                "error": None,
+                "error": link_error,
             }
+            expected_link = (key[0], key[1], int(key[2][4:])) if key and key[2].startswith(":pr/") else None
+            current_link = links.get(checkout)
+            if isinstance(current_link, GitHubError):
+                entry["error"] = {"kind": current_link.kind, "hint": str(current_link)}
+                key = None
+            if key is not None and current_link != expected_link:
+                entry["error"] = {"kind": "github_error", "hint": "Worktree PR link changed during refresh"}
+                key = None
+            if expected_link is not None:
+                entry["_pr_link"] = list(expected_link)
             if key is not None:
                 session_keys.append(key)
                 result = fetched.get(key, {})

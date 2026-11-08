@@ -23,6 +23,7 @@ from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import GitHubAuthError
 from aoe_github_plugin.utils.gitctx import current_branch
+from aoe_github_plugin.utils.gitctx import worktree_pr_link
 from aoe_github_plugin.utils.gitctx import remote_owner_repo
 from aoe_github_plugin.utils.gitctx import remote_owner_repos
 
@@ -37,6 +38,20 @@ def _resolve_optional_token(env: TokenEnvironment | None) -> str | None:
         token, _ = resolve_token(env or SystemEnvironment())
         return token
     return None
+
+
+def _linked_pull(client: GitHubClient, owner: str, repo: str, number: int) -> dict[str, Any]:
+    raw = client.get_json(f"/repos/{owner}/{repo}/pulls/{number}")
+    if not isinstance(raw, dict) or raw.get("number") != number:
+        raise GitHubError("GitHub returned an invalid linked pull request")
+    return {
+        "number": number,
+        "url": raw.get("html_url"),
+        "title": raw.get("title") or "",
+        "state": raw.get("state"),
+        "draft": bool(raw.get("draft", False)),
+        "merged": bool(raw.get("merged_at")),
+    }
 
 
 def github_status(
@@ -60,6 +75,17 @@ def github_status(
         "error": None,
     }
     try:
+        link = worktree_pr_link(path)
+        if link is not None:
+            owner, repo, number = link
+            result["repo"] = f"{owner}/{repo}"
+            result["branch"] = current_branch(path)
+            with GitHubClient(token=_resolve_optional_token(env), transport=transport) as client:
+                pull = _linked_pull(client, owner, repo, number)
+            result["pulls"] = [pull]
+            state = "merged" if pull["merged"] else pull["state"]
+            result["summary"] = f"{owner}/{repo}: PR #{number} {state}"
+            return result
         owner_repo = remote_owner_repo(path)
         if owner_repo is None:
             result["summary"] = "GitHub: not a github.com remote"
@@ -97,6 +123,12 @@ def github_open(
     an existing PR is best-effort: any API failure falls back to the compare
     URL so opening still works offline / unauthenticated.
     """
+    link = worktree_pr_link(path)
+    if link is not None:
+        owner, repo, number = link
+        with GitHubClient(token=_resolve_optional_token(env), transport=transport) as client:
+            pull = _linked_pull(client, owner, repo, number)
+        return {"url": pull["url"], "kind": "pull"}
     owner_repo = remote_owner_repo(path)
     if owner_repo is None:
         raise GitHubError("not a github.com remote; cannot open in GitHub")
