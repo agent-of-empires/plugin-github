@@ -1460,8 +1460,8 @@ def _apply_aliases(  # noqa: C901, PLR0912
     for i, key in enumerate(chunk):
         cache_key = _rich_cache_key(key, flags=flags)
         conn = repository.get(f"b{i}")
-        if key[2].startswith(":pr/") and (isinstance(conn, dict) or conn is None):
-            conn = {"nodes": [conn] if conn else []} if conn is None or conn.get("number") == int(key[2][4:]) else None
+        if key[2].startswith(":pr/"):
+            conn = {"nodes": [conn]} if isinstance(conn, dict) and conn.get("number") == int(key[2][4:]) else None
         if f"b{i}" in failed or not isinstance(conn, dict):
             _arm_retry_cooldown([key], pending, now)
             # Serve this key's last-good answer. The digest tier may already have
@@ -1646,8 +1646,8 @@ def _apply_digest_aliases(
         conn = repository.get(f"b{i}")
         signature = None
         if f"b{i}" not in failed and key[2].startswith(":pr/"):
-            if conn is None or (isinstance(conn, dict) and conn.get("number") == int(key[2][4:])):
-                owned = {"nodes": [conn] if conn else []}
+            if isinstance(conn, dict) and conn.get("number") == int(key[2][4:]):
+                owned = {"nodes": [conn]}
                 signature = graphql.digest_signature(owned)
         elif f"b{i}" not in failed and isinstance(conn, dict):
             reason, owned = _owned_connection(

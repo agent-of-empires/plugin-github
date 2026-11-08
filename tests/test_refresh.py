@@ -3549,6 +3549,50 @@ def test_linked_rich_lookup_uses_exact_number_and_cache(tmp_path):
     assert sum(request.method == "POST" for request in requests) == 1
 
 
+def test_linked_null_graphql_response_preserves_pr(tmp_path):
+    repo = tmp_path / "repo"
+    _make_repo(repo)
+    _link_file(repo).write_text("https://github.com/o/r/pull/17\n")
+
+    def handler(request):
+        if request.url.path.endswith("/stacks"):
+            return httpx.Response(404)
+        if request.method == "GET":
+            return httpx.Response(200, json=_pull(17))
+        return httpx.Response(200, json={"data": {"repository": {"b0": None}, "rateLimit": {}}})
+
+    snapshot = refresh.build_snapshot(
+        [{"id": "s", "project_path": str(repo)}], env=_Env(), transport=httpx.MockTransport(handler)
+    )
+    assert snapshot["sessions"][0]["repos"][0]["pulls"][0]["number"] == 17
+
+
+def test_linked_null_graphql_response_preserves_rich_cache(tmp_path):
+    repo = tmp_path / "repo"
+    _make_repo(repo)
+    _link_file(repo).write_text("https://github.com/o/r/pull/17\n")
+    queries = []
+
+    def handler(request):
+        if request.url.path.endswith("/stacks"):
+            return httpx.Response(404)
+        if request.method == "GET":
+            if request.headers.get("If-None-Match"):
+                return httpx.Response(304)
+            return httpx.Response(200, headers={"ETag": '"v1"'}, json=_pull(17))
+        queries.append(request)
+        node = _gql_node(17) if len(queries) == 1 else None
+        return httpx.Response(200, json={"data": {"repository": {"b0": node}, "rateLimit": {}}})
+
+    sessions = [{"id": "s", "project_path": str(repo)}]
+    transport = httpx.MockTransport(handler)
+    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
+    result = refresh.build_snapshot(sessions, env=_Env(), transport=transport, force=True)
+    pull = result["sessions"][0]["repos"][0]["pulls"][0]
+    assert pull["number"] == 17
+    assert pull["review_state"] == "approved"
+
+
 def test_merged_link_keeps_rich_cache_on_graphql_failure(tmp_path):
     repo = tmp_path / "repo"
     _make_repo(repo)
@@ -3657,6 +3701,10 @@ def test_legacy_branch_sharing_linked_checkout_refreshes_and_replays(tmp_path, m
     runtime = main.Runtime(send=lambda _message: None)
     runtime._replay_cached(sessions)
     assert [session["session_id"] for session in runtime._last_snapshot["sessions"]] == ["direct"]
+    sessions[0]["workspace_repos"] = [{"source_path": str(repo), "branch": "feature"}]
+    runtime = main.Runtime(send=lambda _message: None)
+    runtime._replay_cached(sessions[:1])
+    assert runtime._last_snapshot is None
 
 
 def test_linked_pr_with_missing_url_reports_api_error(tmp_path):

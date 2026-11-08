@@ -423,7 +423,7 @@ class Runtime:
             )
         return current_ids
 
-    def _replay_cached(self, sessions: list[dict[str, Any]]) -> None:
+    def _replay_cached(self, sessions: list[dict[str, Any]]) -> None:  # noqa: C901
         """Paint last-known data from the persisted snapshot before the cold
         network refresh runs, so a restart is not blank for the whole fan-out.
         Filtered to sessions that still exist (session ids are stable across a
@@ -468,12 +468,26 @@ class Runtime:
                     for item in current
                 )
 
+            def matches_linked_checkout(session: dict[str, Any], repo: dict[str, Any]) -> bool:
+                current = live[session["session_id"]]
+                metadata = current.get("workspace_repos")
+                if isinstance(metadata, list) and metadata:
+                    return any(
+                        isinstance(item, dict)
+                        and isinstance(item.get("worktree_path"), str)
+                        and item["worktree_path"]
+                        and os.path.realpath(item["worktree_path"]) == os.path.realpath(repo["path"])
+                        for item in metadata
+                    )
+                return current.get("project_path") == session.get("project_path")
+
             cached = [
                 session
                 for session in candidates
                 if all(
                     isinstance(repo, dict)
                     and isinstance(repo.get("path"), str)
+                    and (not repo.get("_pr_link") or matches_linked_checkout(session, repo))
                     and (
                         matches_legacy_source(session, repo)
                         if repo.get("_pr_link_ignored")
