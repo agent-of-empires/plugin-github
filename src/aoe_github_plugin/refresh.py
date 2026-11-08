@@ -59,6 +59,7 @@ from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import NotFoundError
 from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.handlers import _resolve_optional_token
+from aoe_github_plugin.utils.gitctx import GhDiscoveryError
 from aoe_github_plugin.utils.gitctx import gh_pr_repository
 from aoe_github_plugin.utils.gitctx import parse_owner_repo
 
@@ -170,6 +171,9 @@ DEFAULT_SNAPSHOT_SETTINGS = SnapshotSettings()
 # fan-out threads read/write both, so guard with a lock.
 _cache_lock = threading.Lock()
 _etag_cache: dict[RepoKey, dict[str, Any]] = {}  # key -> {"etag", "pulls"}
+GH_DESTINATION_TTL = 300.0
+_gh_destination_cache: dict[tuple[str, str], tuple[float, tuple[str, str] | None]] = {}
+_gh_failure_until: dict[tuple[str, str], float] = {}
 # Last-good rich (GraphQL) result per key: {"pulls", "fetched_at"}. Serves the
 # TTL window and is the stale fallback while rate-limited.
 _graphql_cache: dict[RichCacheKey, dict[str, Any]] = {}
@@ -1923,8 +1927,30 @@ class _Resolved:
     remotes: list[tuple[str, str]]
 
 
+def _gh_destination(path: str, branch: str, *, force: bool) -> tuple[str, str] | None:
+    """Reuse a checkout's gh result during its TTL and GitHub backoff."""
+    key = (os.path.realpath(path), branch)
+    now = time.monotonic()
+    with _cache_lock:
+        cached = _gh_destination_cache.get(key)
+        cooling = now < _gh_failure_until.get(key, 0.0)
+        blocked = any(now < _backoff[kind]["until"] for kind in _BACKOFF_KINDS)
+    if blocked or (not force and (cooling or (cached is not None and now - cached[0] < GH_DESTINATION_TTL))):
+        return cached[1] if cached is not None else None
+    try:
+        destination = gh_pr_repository(path)
+    except GhDiscoveryError:
+        with _cache_lock:
+            _gh_failure_until[key] = time.monotonic() + BACKOFF_SECS
+        return cached[1] if cached is not None else None
+    with _cache_lock:
+        _gh_destination_cache[key] = (time.monotonic(), destination)
+        _gh_failure_until.pop(key, None)
+    return destination
+
+
 def _resolve_checkouts(
-    sessions: list[dict[str, Any]], settings: SnapshotSettings
+    sessions: list[dict[str, Any]], settings: SnapshotSettings, *, force: bool = False
 ) -> tuple[
     list[tuple[dict[str, Any], list[tuple[str, str | None]]]],
     dict[tuple[str, str | None], tuple[str | None, CheckoutKey | None]],
@@ -1947,7 +1973,7 @@ def _resolve_checkouts(
         repo, key = _identify(checkout, branch)
         remotes = _remote_repos(checkout)
         if branch is None and key is not None:
-            destination = gh_pr_repository(checkout)
+            destination = _gh_destination(checkout, key[2], force=force)
             if destination is not None and destination not in remotes:
                 remotes.append(destination)
         return _Resolved((path, branch), repo, key, remotes)
@@ -1998,7 +2024,7 @@ def build_snapshot(
     ``transport`` are test seams.
     """
 
-    per_session, ident, destinations = _resolve_checkouts(sessions, settings)
+    per_session, ident, destinations = _resolve_checkouts(sessions, settings, force=force)
     fetched, auth_present = _fetch_all(
         destinations,
         env,

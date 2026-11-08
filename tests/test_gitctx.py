@@ -4,6 +4,7 @@ import subprocess
 
 import pytest
 
+from aoe_github_plugin.utils.gitctx import GhDiscoveryError
 from aoe_github_plugin.utils.gitctx import gh_pr_repository
 from aoe_github_plugin.utils.gitctx import parse_owner_repo
 
@@ -40,8 +41,6 @@ def test_malformed_is_none():
     [
         ('{"state":"OPEN","url":"https://github.com/upstream/project/pull/42"}', ("upstream", "project")),
         ('{"state":"CLOSED","url":"https://github.com/upstream/project/pull/42"}', None),
-        ('{"state":"OPEN","url":"https://github.com.evil/upstream/project/pull/42"}', None),
-        ("not json", None),
     ],
 )
 def test_gh_pr_repository_validates_output(monkeypatch, tmp_path, output, expected):
@@ -53,9 +52,19 @@ def test_gh_pr_repository_validates_output(monkeypatch, tmp_path, output, expect
     assert gh_pr_repository(tmp_path) == expected
 
 
+@pytest.mark.parametrize(
+    "output", ['{"state":"OPEN","url":"https://github.com.evil/o/r/pull/1"}', "not json", '{"state":[]}']
+)
+def test_gh_pr_repository_rejects_bad_response(monkeypatch, tmp_path, output):
+    monkeypatch.setattr(subprocess, "run", lambda args, **_kwargs: subprocess.CompletedProcess(args, 0, stdout=output))
+    with pytest.raises(GhDiscoveryError):
+        gh_pr_repository(tmp_path)
+
+
 def test_gh_pr_repository_falls_back_when_gh_missing(monkeypatch, tmp_path):
     def run(*_args, **_kwargs):
         raise FileNotFoundError
 
     monkeypatch.setattr(subprocess, "run", run)
-    assert gh_pr_repository(tmp_path) is None
+    with pytest.raises(GhDiscoveryError):
+        gh_pr_repository(tmp_path)

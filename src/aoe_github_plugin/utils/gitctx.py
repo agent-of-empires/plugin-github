@@ -40,8 +40,12 @@ def parse_owner_repo(remote_url: str) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
+class GhDiscoveryError(Exception):
+    """The optional gh lookup could not produce a trustworthy result."""
+
+
 def gh_pr_repository(path: str) -> tuple[str, str] | None:
-    """Best-effort destination of the checkout's open PR, if gh is available."""
+    """Return the open PR destination, or None for a confirmed closed PR."""
     try:
         proc = subprocess.run(
             ["gh", "pr", "view", "--json", "url,state"],
@@ -52,18 +56,20 @@ def gh_pr_repository(path: str) -> tuple[str, str] | None:
             check=False,
         )
         if proc.returncode:
-            return None
+            raise GhDiscoveryError
         result = json.loads(proc.stdout)
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        return None
-    if not isinstance(result, dict) or result.get("state") != "OPEN":
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        raise GhDiscoveryError from exc
+    if not isinstance(result, dict) or result.get("state") not in ("OPEN", "CLOSED", "MERGED"):
+        raise GhDiscoveryError
+    if result["state"] != "OPEN":
         return None
     url = result.get("url")
     if not isinstance(url, str):
-        return None
+        raise GhDiscoveryError
     match = re.fullmatch(r"https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)/pull/[1-9][0-9]*", url)
     if not match or match[2] in {".", ".."}:
-        return None
+        raise GhDiscoveryError
     return match[1], match[2]
 
 

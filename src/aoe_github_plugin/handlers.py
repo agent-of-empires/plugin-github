@@ -22,6 +22,7 @@ from aoe_github_plugin.auth import resolve_token
 from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import GitHubAuthError
+from aoe_github_plugin.utils.gitctx import GhDiscoveryError
 from aoe_github_plugin.utils.gitctx import current_branch
 from aoe_github_plugin.utils.gitctx import gh_pr_repository
 from aoe_github_plugin.utils.gitctx import remote_owner_repo
@@ -72,9 +73,10 @@ def github_status(
         token = _resolve_optional_token(env)
         with GitHubClient(token=token, transport=transport) as client:
             remotes = remote_owner_repos(path)
-            destination = gh_pr_repository(path)
-            if destination is not None:
-                remotes.append(destination)
+            with contextlib.suppress(GhDiscoveryError):
+                destination = gh_pr_repository(path)
+                if destination is not None:
+                    remotes.append(destination)
             repos = lookup.repositories(owner_repo, remotes)
             pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         result["pulls"] = pulls
@@ -111,9 +113,10 @@ def github_open(
         token = _resolve_optional_token(env)
         with GitHubClient(token=token, transport=transport) as client:
             remotes = remote_owner_repos(path)
-            destination = gh_pr_repository(path)
-            if destination is not None:
-                remotes.append(destination)
+            with contextlib.suppress(GhDiscoveryError):
+                destination = gh_pr_repository(path)
+                if destination is not None:
+                    remotes.append(destination)
             repos = lookup.repositories(owner_repo, remotes)
             pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         if pulls:

@@ -8,7 +8,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Features
 
-- **discovery:** Use `gh pr view` as an optional source of additional PR destinations while retaining configured-remote branch matching.
+- **discovery:** Use `gh pr view` as an optional source of additional PR destinations while retaining configured-remote branch matching; cache results between refreshes and respect GitHub backoff.
 
 ### Bug Fixes
 

@@ -226,3 +226,23 @@ def test_gh_destination_supplements_branch_matching(monkeypatch):
     result = handlers.github_status(env=_NoTokenEnv(), transport=_transport(handler))
     assert result["repo"] == "alice/r"
     assert result["pulls"][0]["url"] == "https://github.com/upstream/r/pull/7"
+
+
+def test_gh_failure_preserves_configured_remote_discovery(monkeypatch):
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _path: ("alice", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repos", lambda _path: [("alice", "r")])
+    monkeypatch.setattr(handlers, "current_branch", lambda _path: "feature")
+
+    def failure(_path):
+        raise handlers.GhDiscoveryError
+
+    monkeypatch.setattr(handlers, "gh_pr_repository", failure)
+    pull = {
+        **_pr(),
+        "html_url": "https://github.com/alice/r/pull/7",
+        "head": {"ref": "feature", "repo": {"name": "r", "owner": {"login": "alice"}}},
+    }
+    result = handlers.github_status(
+        env=_NoTokenEnv(), transport=_transport(lambda _request: httpx.Response(200, json=[pull]))
+    )
+    assert result["pulls"][0]["url"] == "https://github.com/alice/r/pull/7"
