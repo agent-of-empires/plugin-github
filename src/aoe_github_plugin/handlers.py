@@ -23,7 +23,7 @@ from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import GitHubAuthError
 from aoe_github_plugin.utils.gitctx import current_branch
-from aoe_github_plugin.utils.gitctx import worktree_pr_link
+from aoe_github_plugin.utils.gitctx import gh_pr_repository
 from aoe_github_plugin.utils.gitctx import remote_owner_repo
 from aoe_github_plugin.utils.gitctx import remote_owner_repos
 
@@ -38,25 +38,6 @@ def _resolve_optional_token(env: TokenEnvironment | None) -> str | None:
         token, _ = resolve_token(env or SystemEnvironment())
         return token
     return None
-
-
-def _linked_pull(client: GitHubClient, owner: str, repo: str, number: int) -> dict[str, Any]:
-    raw = client.get_json(f"/repos/{owner}/{repo}/pulls/{number}")
-    if (
-        not isinstance(raw, dict)
-        or raw.get("number") != number
-        or not isinstance(raw.get("html_url"), str)
-        or not raw["html_url"]
-    ):
-        raise GitHubError("GitHub returned an invalid linked pull request")
-    return {
-        "number": number,
-        "url": raw.get("html_url"),
-        "title": raw.get("title") or "",
-        "state": raw.get("state"),
-        "draft": bool(raw.get("draft", False)),
-        "merged": bool(raw.get("merged_at")),
-    }
 
 
 def github_status(
@@ -80,17 +61,6 @@ def github_status(
         "error": None,
     }
     try:
-        link = worktree_pr_link(path)
-        if link is not None:
-            owner, repo, number = link
-            result["repo"] = f"{owner}/{repo}"
-            result["branch"] = current_branch(path)
-            with GitHubClient(token=_resolve_optional_token(env), transport=transport) as client:
-                pull = _linked_pull(client, owner, repo, number)
-            result["pulls"] = [pull]
-            state = "merged" if pull["merged"] else pull["state"]
-            result["summary"] = f"{owner}/{repo}: PR #{number} {state}"
-            return result
         owner_repo = remote_owner_repo(path)
         if owner_repo is None:
             result["summary"] = "GitHub: not a github.com remote"
@@ -101,7 +71,11 @@ def github_status(
         result["branch"] = branch
         token = _resolve_optional_token(env)
         with GitHubClient(token=token, transport=transport) as client:
-            repos = lookup.repositories(owner_repo, remote_owner_repos(path))
+            remotes = remote_owner_repos(path)
+            destination = gh_pr_repository(path)
+            if destination is not None:
+                remotes.append(destination)
+            repos = lookup.repositories(owner_repo, remotes)
             pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         result["pulls"] = pulls
         if pulls:
@@ -122,17 +96,12 @@ def github_open(
 ) -> dict[str, Any]:
     """Resolve the GitHub URL to open for the checkout at ``path``.
 
-    Returns ``{"url", "kind"}``, selecting an explicit linked PR when present.
-    Otherwise, a branch PR lookup is best-effort and API failures fall back to
-    the compare page. An invalid or inaccessible explicit link raises a typed
-    ``GitHubError`` rather than opening an unrelated compare page.
+    Returns ``{"url", "kind"}`` where ``kind`` is ``"pull"`` (an open PR exists
+    for the branch) or ``"compare"`` (the create-PR page for the branch).
+    Raises ``GitHubError`` only when there is no github.com remote. Looking up
+    an existing PR is best-effort: any API failure falls back to the compare
+    URL so opening still works offline / unauthenticated.
     """
-    link = worktree_pr_link(path)
-    if link is not None:
-        owner, repo, number = link
-        with GitHubClient(token=_resolve_optional_token(env), transport=transport) as client:
-            pull = _linked_pull(client, owner, repo, number)
-        return {"url": pull["url"], "kind": "pull"}
     owner_repo = remote_owner_repo(path)
     if owner_repo is None:
         raise GitHubError("not a github.com remote; cannot open in GitHub")
@@ -141,7 +110,11 @@ def github_open(
     with contextlib.suppress(GitHubError):
         token = _resolve_optional_token(env)
         with GitHubClient(token=token, transport=transport) as client:
-            repos = lookup.repositories(owner_repo, remote_owner_repos(path))
+            remotes = remote_owner_repos(path)
+            destination = gh_pr_repository(path)
+            if destination is not None:
+                remotes.append(destination)
+            repos = lookup.repositories(owner_repo, remotes)
             pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         if pulls:
             return {"url": pulls[0]["url"], "kind": "pull"}

@@ -203,49 +203,26 @@ def test_status_discovers_fork_pull_targeting_configured_upstream(tmp_path):
     assert result["pulls"][0]["url"] == "https://github.com/upstream/r/pull/7"
 
 
-def test_linked_status_and_open_query_exact_pr(monkeypatch):
-    monkeypatch.setattr(handlers, "worktree_pr_link", lambda _path: ("upstream", "project", 42))
-    monkeypatch.setattr(handlers, "current_branch", lambda _path: "local-review")
+def test_gh_destination_supplements_branch_matching(monkeypatch):
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _path: ("alice", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repos", lambda _path: [("alice", "r")])
+    monkeypatch.setattr(handlers, "current_branch", lambda _path: "feature")
+    monkeypatch.setattr(handlers, "gh_pr_repository", lambda _path: ("upstream", "r"))
 
     def handler(request):
-        assert request.url.path == "/repos/upstream/project/pulls/42"
-        return httpx.Response(200, json={**_pr(42), "html_url": "https://github.com/upstream/project/pull/42"})
+        if request.url.path == "/repos/upstream/r/pulls":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        **_pr(),
+                        "html_url": "https://github.com/upstream/r/pull/7",
+                        "head": {"ref": "feature", "repo": {"name": "r", "owner": {"login": "alice"}}},
+                    }
+                ],
+            )
+        return httpx.Response(200, json=[])
 
-    transport = _transport(handler)
-    result = handlers.github_status(env=_NoTokenEnv(), transport=transport)
-    assert (result["repo"], result["branch"], result["pulls"][0]["number"]) == ("upstream/project", "local-review", 42)
-    assert handlers.github_open(env=_NoTokenEnv(), transport=transport) == {
-        "url": "https://github.com/upstream/project/pull/42",
-        "kind": "pull",
-    }
-
-
-def test_linked_merged_pr_status_reports_merged(monkeypatch):
-    monkeypatch.setattr(handlers, "worktree_pr_link", lambda _path: ("upstream", "project", 42))
-    monkeypatch.setattr(handlers, "current_branch", lambda _path: "review")
-    transport = _transport(
-        lambda _request: httpx.Response(200, json={**_pr(42), "state": "closed", "merged_at": "2026-01-01T00:00:00Z"})
-    )
-    result = handlers.github_status(env=_NoTokenEnv(), transport=transport)
-    assert result["pulls"][0]["merged"] is True
-    assert result["summary"] == "upstream/project: PR #42 merged"
-
-
-def test_missing_linked_pr_never_opens_unrelated_branch(monkeypatch):
-    monkeypatch.setattr(handlers, "worktree_pr_link", lambda _path: ("upstream", "project", 42))
-    monkeypatch.setattr(handlers, "current_branch", lambda _path: "local-review")
-    transport = _transport(lambda _request: httpx.Response(404))
-    assert handlers.github_status(env=_NoTokenEnv(), transport=transport)["error"]["kind"] == "not_found"
-    with pytest.raises(errors.NotFoundError):
-        handlers.github_open(env=_NoTokenEnv(), transport=transport)
-
-
-def test_linked_pr_with_missing_url_reports_error(monkeypatch):
-    monkeypatch.setattr(handlers, "worktree_pr_link", lambda _path: ("upstream", "project", 42))
-    monkeypatch.setattr(handlers, "current_branch", lambda _path: "review")
-    pull = _pr(42)
-    del pull["html_url"]
-    transport = _transport(lambda _request: httpx.Response(200, json=pull))
-    assert handlers.github_status(env=_NoTokenEnv(), transport=transport)["error"]["kind"] == "github_error"
-    with pytest.raises(errors.GitHubError):
-        handlers.github_open(env=_NoTokenEnv(), transport=transport)
+    result = handlers.github_status(env=_NoTokenEnv(), transport=_transport(handler))
+    assert result["repo"] == "alice/r"
+    assert result["pulls"][0]["url"] == "https://github.com/upstream/r/pull/7"

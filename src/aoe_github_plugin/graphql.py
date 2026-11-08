@@ -178,29 +178,6 @@ query($owner: String!, $repo: String!, $number: Int!) {
 )
 
 
-def build_link_query(alias_count: int, *, digest: bool = False) -> str:
-    n = max(alias_count, 1)
-    params = ", ".join(["$owner: String!", "$repo: String!", *[f"$b{i}: Int!" for i in range(n)]])
-    if digest:
-        selection = """number state isDraft merged mergeable mergeStateStatus reviewDecision updatedAt headRefOid
-        mergeQueueEntry { position state }
-        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
-        reviewThreads(first: 1) { totalCount }"""
-        fragment = ""
-    else:
-        selection = "...PRNode"
-        fragment = _PR_NODE_FRAGMENT
-    fields = "\n".join(f"    b{i}: pullRequest(number: $b{i}) {{ {selection} }}" for i in range(n))
-    return f"""
-query({params}) {{
-  rateLimit {{ cost remaining resetAt }}
-  repository(owner: $owner, name: $repo) {{
-{fields}
-  }}
-}}
-{fragment}"""
-
-
 # The cheap change-detection tier (#69). Scalars plus the top-level check rollup
 # and the review-thread count only: no contexts, no thread nodes, no comments, so
 # a batched digest costs ~1 point where the rich query costs ~25-30. The fields

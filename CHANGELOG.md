@@ -8,7 +8,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Features
 
-- Recognize explicit GitHub PR links stored in per-worktree Git metadata.
+- **discovery:** Use `gh pr view` as an optional source of additional PR destinations while retaining configured-remote branch matching.
 
 ### Bug Fixes
 

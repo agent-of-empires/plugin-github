@@ -40,7 +40,6 @@ from typing import Any
 from datetime import datetime
 from datetime import timedelta
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 
 from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
@@ -423,7 +422,7 @@ class Runtime:
             )
         return current_ids
 
-    def _replay_cached(self, sessions: list[dict[str, Any]]) -> None:  # noqa: C901
+    def _replay_cached(self, sessions: list[dict[str, Any]]) -> None:
         """Paint last-known data from the persisted snapshot before the cold
         network refresh runs, so a restart is not blank for the whole fan-out.
         Filtered to sessions that still exist (session ids are stable across a
@@ -435,68 +434,8 @@ class Runtime:
             snapshot = refresh.load_snapshot()
             if snapshot is None:
                 return
-            live = {s["id"]: s for s in sessions if isinstance(s, dict) and isinstance(s.get("id"), str)}
-
-            candidates = [s for s in snapshot["sessions"] if isinstance(s, dict) and s.get("session_id") in live]
-            repos = [repo for session in candidates for repo in session.get("repos", [])]
-            paths = {
-                repo["path"]
-                for repo in repos
-                if isinstance(repo, dict) and isinstance(repo.get("path"), str) and not repo.get("_pr_link_ignored")
-            }
-
-            def read_link(path: str) -> list[Any] | None | refresh.GitHubError:
-                try:
-                    link = refresh.worktree_pr_link(path)
-                    return list(link) if link else None
-                except refresh.GitHubError as exc:
-                    return exc
-
-            with ThreadPoolExecutor(max_workers=refresh.GIT_WORKERS) as pool:
-                links = dict(zip(paths, pool.map(read_link, paths), strict=True))
-
-            def matches_legacy_source(session: dict[str, Any], repo: dict[str, Any]) -> bool:
-                current = live[session["session_id"]].get("workspace_repos")
-                if not isinstance(current, list):
-                    return False
-                return any(
-                    isinstance(item, dict)
-                    and not item.get("worktree_path")
-                    and isinstance(item.get("source_path"), str)
-                    and os.path.realpath(item["source_path"]) == os.path.realpath(repo["path"])
-                    and item.get("branch") == repo.get("branch")
-                    for item in current
-                )
-
-            def matches_linked_checkout(session: dict[str, Any], repo: dict[str, Any]) -> bool:
-                current = live[session["session_id"]]
-                metadata = current.get("workspace_repos")
-                if isinstance(metadata, list) and metadata:
-                    return any(
-                        isinstance(item, dict)
-                        and isinstance(item.get("worktree_path"), str)
-                        and item["worktree_path"]
-                        and os.path.realpath(item["worktree_path"]) == os.path.realpath(repo["path"])
-                        for item in metadata
-                    )
-                return current.get("project_path") == session.get("project_path")
-
-            cached = [
-                session
-                for session in candidates
-                if all(
-                    isinstance(repo, dict)
-                    and isinstance(repo.get("path"), str)
-                    and (not repo.get("_pr_link") or matches_linked_checkout(session, repo))
-                    and (
-                        matches_legacy_source(session, repo)
-                        if repo.get("_pr_link_ignored")
-                        else not isinstance(links[repo["path"]], refresh.GitHubError)
-                        and links[repo["path"]] == repo.get("_pr_link")
-                    )
-                    for repo in session.get("repos", [])
-                )
-            ]
+            live_ids = {s["id"] for s in sessions if isinstance(s, dict) and isinstance(s.get("id"), str)}
+            cached = [s for s in snapshot["sessions"] if isinstance(s, dict) and s.get("session_id") in live_ids]
             for session in cached:
                 freshness = session.get("freshness")
                 if isinstance(freshness, dict):

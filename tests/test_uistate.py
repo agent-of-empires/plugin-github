@@ -1256,15 +1256,6 @@ def test_fully_merged_stack_range_is_not_described_as_mergeable():
     assert stack["children"][0]["value"] == "Already merged"
 
 
-def test_closed_pr_is_not_presented_as_mergeable_or_open():
-    pull = _rich_pull(state="CLOSED", merged=False, review="approved", merge_state="conflicts")
-    repos = [_repo(pulls=[pull])]
-    callout = _callout(repos)
-    assert callout["title"] == "Closed"
-    assert callout["actions"][0]["disabled"] is True
-    assert _column_payload(repos) == {}
-
-
 def test_column_is_empty_when_no_prs_to_clear_stale_state():
     assert _column_payload([_repo()]) == {}
 

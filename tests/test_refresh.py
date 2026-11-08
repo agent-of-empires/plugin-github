@@ -8,7 +8,6 @@ import time
 import logging
 import threading
 import subprocess
-from pathlib import Path
 from datetime import datetime
 from datetime import timezone
 from datetime import timedelta
@@ -16,7 +15,6 @@ from datetime import timedelta
 import httpx
 import pytest
 
-from aoe_github_plugin import main
 from aoe_github_plugin import lookup
 from aoe_github_plugin import graphql
 from aoe_github_plugin import refresh
@@ -186,6 +184,24 @@ def test_build_snapshot_aggregates_a_session(tmp_path):
     assert repos[0]["error"] is None
 
 
+def test_gh_destination_supplements_snapshot_matching(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _make_repo(repo)
+    monkeypatch.setattr(refresh, "gh_pr_repository", lambda _path: ("upstream", "r"))
+
+    def handler(request):
+        if request.url.path == "/repos/upstream/r/pulls":
+            return httpx.Response(200, json=[{**_pull(), "html_url": "https://github.com/upstream/r/pull/12"}])
+        return httpx.Response(200, json=[])
+
+    snapshot = refresh.build_snapshot(
+        [{"id": "s", "project_path": str(repo)}], env=_NoToken(), transport=httpx.MockTransport(handler)
+    )
+    result = snapshot["sessions"][0]["repos"][0]
+    assert result["repo"] == "o/r"
+    assert result["pulls"][0]["url"] == "https://github.com/upstream/r/pull/12"
+
+
 def test_tokenless_refresh_skips_native_stack_requests(tmp_path):
     # Shared repo identity fetches open PRs once and makes no anonymous stack calls.
     ws1 = tmp_path / "w1"
@@ -215,29 +231,6 @@ def test_etag_304_reuses_cached_pulls(tmp_path):
     # Second refresh: server answers 304 (cache hit); pulls come from cache.
     second = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
     assert second["sessions"][0]["repos"][0]["pulls"][0]["number"] == 99
-
-
-def test_branch_404_preserves_conditional_cache(tmp_path):
-    repo = tmp_path / "repo"
-    _make_repo(repo)
-    sessions = [{"id": "s", "project_path": str(repo)}]
-    requests = []
-
-    def handler(request):
-        requests.append(request)
-        if len(requests) == 1:
-            return httpx.Response(200, headers={"ETag": '"v1"'}, json=[_pull(7)])
-        if len(requests) == 2:
-            return httpx.Response(404)
-        assert request.headers.get("If-None-Match") == '"v1"'
-        return httpx.Response(304)
-
-    transport = httpx.MockTransport(handler)
-    refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
-    failed = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
-    assert failed["sessions"][0]["repos"][0]["error"]["kind"] == "not_found"
-    recovered = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
-    assert recovered["sessions"][0]["repos"][0]["pulls"][0]["number"] == 7
 
 
 def test_backoff_serves_cached_and_skips_http(tmp_path):
@@ -1541,30 +1534,6 @@ def test_terminal_state_holds_cache_until_the_300s_ceiling(tmp_path):
     _age_cache(refresh.GRAPHQL_ACTIVE_DIGEST_STALE + 1)
     refresh.build_snapshot(sessions, env=_Env(), transport=transport)
     assert len(gql) == 1
-
-
-def test_closed_link_with_running_ci_does_not_use_active_polling(tmp_path):
-    repo = tmp_path / "repo"
-    _make_repo(repo)
-    _link_file(repo).write_text("https://github.com/o/r/pull/7\n")
-    node = _running_node(7)
-    node["state"] = "CLOSED"
-    queries = []
-
-    def handler(request):
-        if request.method == "GET":
-            if request.headers.get("If-None-Match"):
-                return httpx.Response(304)
-            return httpx.Response(200, headers={"ETag": '"v1"'}, json={**_pull(7), "state": "closed"})
-        queries.append(request)
-        return httpx.Response(200, json={"data": {"repository": {"b0": node}, "rateLimit": {}}})
-
-    sessions = [{"id": "s", "project_path": str(repo)}]
-    transport = httpx.MockTransport(handler)
-    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
-    _age_cache(refresh.GRAPHQL_ACTIVE_DIGEST_STALE + 1)
-    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
-    assert len(queries) == 1
 
 
 def test_waiting_review_is_not_treated_as_active(tmp_path):
@@ -3460,284 +3429,3 @@ def test_digest_ownership_truncation_arms_retry_cooldown(tmp_path):
     kinds.clear()
     refresh.build_snapshot(sessions, env=_Env(), transport=transport)
     assert kinds == []
-
-
-def _link_file(path):
-    value = subprocess.check_output(
-        ["git", "-C", str(path), "rev-parse", "--git-path", "aoe-pr-link"], text=True
-    ).strip()
-    return Path(path) / value
-
-
-def test_branch_named_like_pr_marker_uses_branch_discovery(tmp_path):
-    repo = tmp_path / "repo"
-    _make_repo(repo, branch="#pr/17")
-    requests = []
-    snapshot = refresh.build_snapshot(
-        [{"id": "session", "project_path": str(repo)}],
-        env=_NoToken(),
-        transport=_transport([_pull(4, branch="#pr/17")], capture=requests),
-    )
-    assert requests[0].url.path == "/repos/o/r/pulls"
-    assert requests[0].url.params["head"] == "o:#pr/17"
-    assert snapshot["sessions"][0]["repos"][0]["pulls"][0]["number"] == 4
-
-
-def test_worktree_links_are_independent_and_follow_changes(tmp_path):
-    repo = tmp_path / "repo"
-    other = tmp_path / "other"
-    _make_repo(repo)
-    _git(repo, "worktree", "add", "--force", str(other), "feature")
-    _link_file(repo).write_text("https://github.com/upstream/project/pull/17\n")
-    sessions = [{"id": "one", "project_path": str(repo)}, {"id": "two", "project_path": str(other)}]
-    requests = []
-
-    def handler(request):
-        requests.append(request)
-        if request.url.path == "/repos/upstream/project/pulls/17":
-            return httpx.Response(200, headers={"ETag": '"one"'}, json=_pull(17))
-        if request.url.path == "/repos/upstream/project/pulls/18":
-            return httpx.Response(404, json={"message": "Not Found"})
-        assert request.url.path == "/repos/o/r/pulls"
-        assert request.url.params["head"] == "o:feature"
-        return httpx.Response(200, json=[_pull(4)])
-
-    transport = httpx.MockTransport(handler)
-    snapshot = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
-    linked, ordinary = [session["repos"][0] for session in snapshot["sessions"]]
-    assert (linked["repo"], linked["branch"], linked["pulls"][0]["number"]) == ("upstream/project", "feature", 17)
-    assert (ordinary["repo"], ordinary["branch"], ordinary["pulls"][0]["number"]) == ("o/r", "feature", 4)
-    _link_file(repo).write_text("https://github.com/upstream/project/pull/18\n")
-    stale = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)["sessions"][0]["repos"][0]
-    assert stale["pulls"] == []
-    assert stale["error"]["kind"] == "not_found"
-    _link_file(repo).write_text("invalid\n")
-    invalid = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)["sessions"][0]["repos"][0]
-    assert invalid["pulls"] == []
-    assert invalid["error"]["kind"] == "github_error"
-    _link_file(repo).unlink()
-    restored = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)["sessions"][0]["repos"][0]
-    assert (restored["repo"], restored["pulls"][0]["number"]) == ("o/r", 4)
-
-
-def test_linked_rich_lookup_uses_exact_number_and_cache(tmp_path):
-    repo = tmp_path / "repo"
-    _make_repo(repo)
-    _link_file(repo).write_text("https://github.com/upstream/project/pull/17\n")
-    requests = []
-
-    def handler(request):
-        requests.append(request)
-        if request.url.path == "/repos/upstream/project/stacks":
-            return httpx.Response(404, json={"message": "Not Found"})
-        if request.method == "GET":
-            assert request.url.path == "/repos/upstream/project/pulls/17"
-            if request.headers.get("If-None-Match"):
-                return httpx.Response(304)
-            return httpx.Response(200, headers={"ETag": '"v1"'}, json=_pull(17))
-        payload = json.loads(request.content)
-        assert payload["variables"] == {"owner": "upstream", "repo": "project", "b0": 17}
-        assert "pullRequest(number: $b0)" in payload["query"]
-        return httpx.Response(200, json={"data": {"repository": {"b0": _gql_node(17)}, "rateLimit": {}}})
-
-    sessions = [{"id": "s", "project_path": str(repo)}]
-    transport = httpx.MockTransport(handler)
-    first = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
-    second = refresh.build_snapshot(sessions, env=_Env(), transport=transport)
-    assert first["sessions"][0]["repos"][0]["pulls"][0]["review_state"] == "approved"
-    assert second["sessions"][0]["repos"][0]["pulls"][0]["number"] == 17
-    assert sum(request.method == "POST" for request in requests) == 1
-
-
-def test_linked_null_graphql_response_preserves_pr(tmp_path):
-    repo = tmp_path / "repo"
-    _make_repo(repo)
-    _link_file(repo).write_text("https://github.com/o/r/pull/17\n")
-
-    def handler(request):
-        if request.url.path.endswith("/stacks"):
-            return httpx.Response(404)
-        if request.method == "GET":
-            return httpx.Response(200, json=_pull(17))
-        return httpx.Response(200, json={"data": {"repository": {"b0": None}, "rateLimit": {}}})
-
-    snapshot = refresh.build_snapshot(
-        [{"id": "s", "project_path": str(repo)}], env=_Env(), transport=httpx.MockTransport(handler)
-    )
-    assert snapshot["sessions"][0]["repos"][0]["pulls"][0]["number"] == 17
-
-
-def test_linked_null_graphql_response_preserves_rich_cache(tmp_path):
-    repo = tmp_path / "repo"
-    _make_repo(repo)
-    _link_file(repo).write_text("https://github.com/o/r/pull/17\n")
-    queries = []
-
-    def handler(request):
-        if request.url.path.endswith("/stacks"):
-            return httpx.Response(404)
-        if request.method == "GET":
-            if request.headers.get("If-None-Match"):
-                return httpx.Response(304)
-            return httpx.Response(200, headers={"ETag": '"v1"'}, json=_pull(17))
-        queries.append(request)
-        node = _gql_node(17) if len(queries) == 1 else None
-        return httpx.Response(200, json={"data": {"repository": {"b0": node}, "rateLimit": {}}})
-
-    sessions = [{"id": "s", "project_path": str(repo)}]
-    transport = httpx.MockTransport(handler)
-    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
-    result = refresh.build_snapshot(sessions, env=_Env(), transport=transport, force=True)
-    pull = result["sessions"][0]["repos"][0]["pulls"][0]
-    assert pull["number"] == 17
-    assert pull["review_state"] == "approved"
-
-
-def test_merged_link_keeps_rich_cache_on_graphql_failure(tmp_path):
-    repo = tmp_path / "repo"
-    _make_repo(repo)
-    _link_file(repo).write_text("https://github.com/o/r/pull/17\n")
-    queries = []
-    node = _gql_node(17, state="MERGED", merged=True)
-
-    def handler(request):
-        if request.url.path.endswith("/stacks"):
-            return httpx.Response(404)
-        if request.method == "GET":
-            if request.headers.get("If-None-Match"):
-                return httpx.Response(304)
-            return httpx.Response(
-                200, headers={"ETag": '"v1"'}, json={**_pull(17), "state": "closed", "merged_at": "2026-01-01"}
-            )
-        queries.append(request)
-        if len(queries) > 1:
-            return httpx.Response(500)
-        return httpx.Response(200, json={"data": {"repository": {"b0": node}, "rateLimit": {}}})
-
-    sessions = [{"id": "s", "project_path": str(repo)}]
-    transport = httpx.MockTransport(handler)
-    refresh.build_snapshot(sessions, env=_Env(), transport=transport)
-    result = refresh.build_snapshot(sessions, env=_Env(), transport=transport, force=True)
-    pull = result["sessions"][0]["repos"][0]["pulls"][0]
-    assert pull["merged"] is True
-    assert pull["review_state"] == "approved"
-
-
-def test_linked_worktree_snapshot_reaches_runtime_ui(tmp_path):
-    source = tmp_path / "source"
-    repo = tmp_path / "outside" / "review"
-    _make_repo(source)
-    repo.parent.mkdir()
-    _git(source, "worktree", "add", "--force", str(repo), "feature")
-    _link_file(repo).write_text("https://github.com/upstream/project/pull/17\n")
-
-    def handler(request):
-        assert request.url.path == "/repos/upstream/project/pulls/17"
-        return httpx.Response(200, json={**_pull(17), "html_url": "https://github.com/upstream/project/pull/17"})
-
-    snapshot = refresh.build_snapshot(
-        [
-            {
-                "id": "session",
-                "project_path": str(source),
-                "workspace_repos": [{"source_path": str(source), "worktree_path": str(repo), "branch": "old"}],
-            }
-        ],
-        env=_NoToken(),
-        transport=httpx.MockTransport(handler),
-    )
-    assert snapshot["sessions"][0]["repos"][0]["path"] == str(repo)
-    messages = []
-    runtime = main.Runtime(send=messages.append)
-    runtime._push_snapshot(snapshot)
-    rendered = json.dumps(messages)
-    assert "https://github.com/upstream/project/pull/17" in rendered
-    assert "#17" in rendered
-
-
-def test_replay_does_not_show_a_previous_worktree_link(tmp_path, monkeypatch):
-    repo = tmp_path / "review"
-    _make_repo(repo)
-    _link_file(repo).write_text("https://github.com/upstream/project/pull/17\n")
-    sessions = [{"id": "session", "project_path": str(repo)}]
-    snapshot = refresh.build_snapshot(sessions, env=_NoToken(), transport=_transport(_pull(17)))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    refresh.save_snapshot(snapshot)
-    _link_file(repo).write_text("https://github.com/upstream/project/pull/18\n")
-    messages = []
-    main.Runtime(send=messages.append)._replay_cached(sessions)
-    assert messages == []
-
-
-def test_legacy_branch_sharing_linked_checkout_refreshes_and_replays(tmp_path, monkeypatch):
-    repo = tmp_path / "review"
-    _make_repo(repo)
-    _link_file(repo).write_text("https://github.com/upstream/project/pull/17\n")
-    sessions = [
-        {"id": "direct", "project_path": str(repo)},
-        {
-            "id": "legacy",
-            "project_path": str(tmp_path / "workspace"),
-            "workspace_repos": [{"source_path": str(repo), "branch": "feature"}],
-        },
-    ]
-
-    def handler(request):
-        if request.url.path == "/repos/upstream/project/pulls/17":
-            return httpx.Response(200, json={**_pull(17), "html_url": "https://github.com/upstream/project/pull/17"})
-        assert request.url.path == "/repos/o/r/pulls"
-        return httpx.Response(200, json=[_pull(4)])
-
-    snapshot = refresh.build_snapshot(sessions, env=_NoToken(), transport=httpx.MockTransport(handler))
-    direct, legacy = [session["repos"][0] for session in snapshot["sessions"]]
-    assert (direct["pulls"][0]["number"], direct["error"]) == (17, None)
-    assert (legacy["pulls"][0]["number"], legacy["error"]) == (4, None)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    refresh.save_snapshot(snapshot)
-    runtime = main.Runtime(send=lambda _message: None)
-    runtime._replay_cached(sessions)
-    assert {session["session_id"] for session in runtime._last_snapshot["sessions"]} == {"direct", "legacy"}
-    sessions[1]["workspace_repos"][0]["worktree_path"] = str(repo)
-    runtime = main.Runtime(send=lambda _message: None)
-    runtime._replay_cached(sessions)
-    assert [session["session_id"] for session in runtime._last_snapshot["sessions"]] == ["direct"]
-    sessions[0]["workspace_repos"] = [{"source_path": str(repo), "branch": "feature"}]
-    runtime = main.Runtime(send=lambda _message: None)
-    runtime._replay_cached(sessions[:1])
-    assert runtime._last_snapshot is None
-
-
-def test_linked_pr_with_missing_url_reports_api_error(tmp_path):
-    repo = tmp_path / "review"
-    _make_repo(repo)
-    _link_file(repo).write_text("https://github.com/upstream/project/pull/17\n")
-    pull = _pull(17)
-    del pull["html_url"]
-    snapshot = refresh.build_snapshot(
-        [{"id": "s", "project_path": str(repo)}],
-        env=_NoToken(),
-        transport=_transport(pull),
-    )
-    result = snapshot["sessions"][0]["repos"][0]
-    assert result["pulls"] == []
-    assert result["error"]["kind"] == "api_error"
-
-
-@pytest.mark.parametrize(
-    "content",
-    [
-        b"https://github.com/o/r/pull/0\n",
-        b"https://github.com/o/r/pull/1\nextra\n",
-        b"https://github.com/o/r/pull/1",
-        b"https://github.com.evil/o/r/pull/1\n",
-        b"\xff\n",
-    ],
-)
-def test_invalid_link_does_not_discover_branch(tmp_path, content):
-    repo = tmp_path / "repo"
-    _make_repo(repo)
-    _link_file(repo).write_bytes(content)
-    snapshot = refresh.build_snapshot([{"id": "s", "project_path": str(repo)}], env=_NoToken())
-    result = snapshot["sessions"][0]["repos"][0]
-    assert result["pulls"] == []
-    assert result["error"]["kind"] == "github_error"

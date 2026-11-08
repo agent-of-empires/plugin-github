@@ -63,23 +63,6 @@ def test_status_is_failsoft_outside_a_repo():
     assert result["pulls"] == []
 
 
-def test_status_entrypoint_reports_invalid_worktree_link(tmp_path):
-    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
-    (tmp_path / ".git" / "aoe-pr-link").write_text("https://evil.example/o/r/pull/1\n")
-    responses, _ = _run(
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 9,
-                "method": "github.status",
-                "params": {"args": {"path": str(tmp_path)}},
-            }
-        )
-    )
-    assert responses[0]["result"]["pulls"] == []
-    assert responses[0]["result"]["error"]["kind"] == "github_error"
-
-
 def test_open_outside_a_repo_returns_error():
     # "/" has no github.com remote; github.open surfaces a typed error.
     responses, _ = _run(

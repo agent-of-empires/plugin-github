@@ -9,10 +9,9 @@ common git/GitHub operations from #658 without dropping into a terminal.
 > structured `github.status` (open PRs for the branch, each with its URL) and
 > `github.open` (open-in-GitHub). The per-session pane shows rich PR state
 > (state incl. merged, review state, merge conflicts, merge queue position and
-> state, CI checks, and unresolved comments) when a token is present. Without a
-> token, branch discovery shows open PRs; explicit links also resolve closed and
-> merged PRs. The write operations (create/merge PR, push, pull, fix-CI) land in
-> follow-ups.
+> state, CI checks, and unresolved comments) when a token is present, degrading
+> to open PRs only without one. The write operations (create/merge PR, push, pull,
+> fix-CI) land in follow-ups.
 
 ## Layout
 
@@ -99,21 +98,9 @@ session.
 
 `github.open` resolves the URL to open in a browser and returns
 `{ "url", "kind" }`: `kind: "pull"` (an open PR exists for the branch) or
-`kind: "compare"` (the create-PR page). For ordinary checkouts, finding an
-existing PR is best-effort: API failure falls back to compare; a missing
-github.com remote raises a typed error.
-
-An explicit worktree association overrides branch discovery for `github.status`,
-`github.open`, and the session pane. Write one newline-terminated UTF-8 URL of
-the form `https://github.com/OWNER/REPO/pull/NUMBER` to the path returned by
-`git rev-parse --git-path aoe-pr-link`, run in the actual worktree. The plugin
-queries that exact PR, including closed or merged PRs, independently of the
-checkout's origin and branch name. The local branch remains visible in status.
-Remove the file to restore normal branch discovery. Invalid or unreadable links,
-or a PR GitHub cannot find, produce an error rather than selecting a different
-PR. Each worktree has its own metadata file, even when branches are shared.
-`github.open` reports lookup errors for explicit links rather than opening a
-compare page for an unrelated branch.
+`kind: "compare"` (the create-PR page). Finding an existing PR is best-effort:
+any API failure falls back to the compare URL so it still works offline. It
+raises a typed error only when the checkout has no github.com remote.
 
 ### Multi-session refresh
 
@@ -140,9 +127,9 @@ session-less `github.refresh` cover every session and prune vanished ones:
    include them.
 3. Resolve each checkout's origin and branch, then look for PRs targeting origin
    or any other GitHub remote that checkout configures (an `upstream` remote, a
-   differently named one, or several). Destinations come only from configured
-   remotes: there is no metadata call and no fork-network or arbitrary remote
-   search, so a fork-of-fork needs its middle remote configured to be visible.
+   differently named one, or several). When available, `gh pr view` also
+   supplies the destination of the checkout's open PR. If `gh` is unavailable
+   or cannot resolve a PR, discovery uses the configured remotes as before.
    The head is always the checkout's own origin
    repository; a configured upstream is only an additional destination, so a
    contributor's PR against upstream matches while an otherwise unrelated
@@ -189,8 +176,8 @@ session-less `github.refresh` cover every session and prune vanished ones:
    distinguishing a broken PR from a healthy one at a glance; with
    `dense_row_badge_glyphs` on, each chip also carries a single-character mark so
    the terminal has something to paint where it has no icons (off by default); a
-   draft shows the PR chip alone, and repos with only closed or merged PRs are
-   omitted, since the badge is an actionable
+   draft shows the PR
+   chip alone and merged-only repos are omitted, since the badge is an actionable
    indicator), a `row-column`
    (`{text, tone, tooltip, sort_value?, filter_values?}`, or `{}` to clear -- one deterministic
    words summary of the session's most-urgent PR signal so the list is scannable
@@ -472,9 +459,9 @@ echo '{"jsonrpc":"2.0","id":2,"method":"github.open","params":{"args":{"path":".
 
 Token resolution order: `GITHUB_TOKEN`, then `GH_TOKEN`, then `gh auth token`
 (only when `gh` is installed and authenticated). `gh` is an optional source,
-never required; without a token the worker still shows open branch PRs and
-explicitly linked PRs (the basic REST view), but review state, CI checks, and
-unresolved comments need a token, since they come from the authenticated GraphQL query.
+never required; without a token the worker still shows open PRs (the basic REST
+view), but review state, CI checks, unresolved comments, and merged PRs need a
+token, since they come from the authenticated GraphQL query.
 
 ## Releases
 

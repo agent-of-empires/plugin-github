@@ -5,8 +5,8 @@ working copy, so a handler can talk about the right repository.
 from __future__ import annotations
 
 import re
+import json
 import subprocess
-from pathlib import Path
 
 from aoe_github_plugin.errors import GitHubError
 
@@ -40,34 +40,31 @@ def parse_owner_repo(remote_url: str) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
-def worktree_pr_link(path: str) -> tuple[str, str, int] | None:
-    """Read the worktree's explicit PR, or None only when the file is absent."""
+def gh_pr_repository(path: str) -> tuple[str, str] | None:
+    """Best-effort destination of the checkout's open PR, if gh is available."""
     try:
         proc = subprocess.run(
-            ["git", "-C", path, "rev-parse", "--git-path", "aoe-pr-link"],
+            ["gh", "pr", "view", "--json", "url,state"],
+            cwd=path,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=5,
             check=False,
         )
-        if proc.returncode != 0:
+        if proc.returncode:
             return None
-        link_path = Path(proc.stdout.strip())
-        if not link_path.is_absolute():
-            link_path = Path(path) / link_path
-        content = link_path.read_bytes()
-    except FileNotFoundError:
+        result = json.loads(proc.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise GitHubError(f"Cannot read worktree PR link: {exc}") from exc
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise GitHubError("Invalid worktree PR link: expected a UTF-8 GitHub pull URL") from exc
-    match = re.fullmatch(r"https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)\n", text)
-    if not match or match[2] in {".", ".."} or len(match[3]) > 10 or int(match[3]) > 2147483647:
-        raise GitHubError("Invalid worktree PR link: expected a canonical GitHub pull URL")
-    return match[1], match[2], int(match[3])
+    if not isinstance(result, dict) or result.get("state") != "OPEN":
+        return None
+    url = result.get("url")
+    if not isinstance(url, str):
+        return None
+    match = re.fullmatch(r"https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)/pull/[1-9][0-9]*", url)
+    if not match or match[2] in {".", ".."}:
+        return None
+    return match[1], match[2]
 
 
 def remote_owner_repo(path: str) -> tuple[str, str] | None:
