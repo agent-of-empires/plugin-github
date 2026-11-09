@@ -913,16 +913,15 @@ def review_summary(people: list[dict[str, str]]) -> str:
     return f"{len(people)} pending"
 
 
-# The viewer's relationship to a PR -> our role vocabulary. ``None`` when the
-# snapshot carries no viewer information (the no-token REST shape, or a PR the
-# viewer neither wrote nor was asked to review), so callers keep their
-# role-neutral rendering instead of guessing from the author login.
-
-
 def viewer_role(pr: dict[str, Any]) -> str | None:
     """``"author"`` when the viewer opened the PR, ``"reviewer"`` when they have
     reviewed it or been asked to (a direct or team review request both surface
-    here), else ``None``."""
+    here), else ``None``.
+
+    ``None`` when the snapshot carries no viewer information (the no-token REST
+    shape, or a PR the viewer neither wrote nor was asked to review), so callers
+    keep their role-neutral rendering instead of guessing from the author login.
+    """
     if pr.get("viewerDidAuthor") is True:
         return "author"
     if any(isinstance(pr.get(key), dict) for key in ("viewerLatestReview", "viewerLatestReviewRequest")):

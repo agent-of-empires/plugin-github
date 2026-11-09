@@ -106,13 +106,6 @@ _ICON_ERROR = "circle-alert"
 # else, and no clock will move it.
 _ICON_REVIEW = "git-pull-request"
 _ICON_YOUR_REVIEW = "eye"
-# A PR the viewer is *reviewing* takes the plain PR glyph (and an info tone),
-# against the arrow that marks their own branch, so the two read apart in a mono
-# chip strip. When the outstanding review is the viewer's own next action, an
-# eye replaces the "awaiting review" clock: the waiting is on them, not someone
-# else, and no clock will move it.
-_ICON_REVIEW = "git-pull-request"
-_ICON_YOUR_REVIEW = "eye"
 
 # review_state -> (lucide icon, host Tone, human label).
 _REVIEW_VISUAL: dict[str, tuple[str, str, str]] = {
