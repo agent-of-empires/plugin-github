@@ -232,7 +232,11 @@ _REVIEW_GLYPH: dict[str, str] = {
 }
 # The viewer's own outstanding request is a kind of its own (the ladder's rung),
 # so its mark is too: the review states' marks name a position, this names a task.
-_YOUR_REVIEW_GLYPH = "☉"
+# `◉` is the one mark every surface agrees on -- the attention dashboard maps
+# "Review requested" to it and expects it to mean the request *on you* -- and it is
+# East-Asian Neutral, unlike the Ambiguous `☉` this first used, which takes two
+# cells in a CJK locale.
+_YOUR_REVIEW_GLYPH = "◉"
 # The heavy check/cross pair, so CI never reads as the review chip next to it.
 _CHECK_GLYPH: dict[str, str] = {
     "succeeded": "✔",

@@ -430,7 +430,8 @@ status column live for the moment you unsnooze it.
 The `dense_row_badge_glyphs` setting (off by default) turns the row into marks:
 every badge chip gains its own one-character mark (`⇄` open PR, `◌` draft, `⊘`
 conflict, `✓` approved, `◷` partially approved, `✗` changes requested, `↻` pushed
-since review, `❝` commented, `⧗` awaiting review, `✔`/`✘` CI passing/failing, `~`
+since review, `❝` commented, `⧗` awaiting review, `◉` a review requested of you,
+`✔`/`✘` CI passing/failing, `~`
 CI running, `⇨` CI queued, `?` CI unknown, `⇉` merge queue, `✉` unresolved
 comments, `!` error) and the status words are dropped, so a session row reads as
 marks instead of titles. No two chips share a mark, so a lone mark still names its

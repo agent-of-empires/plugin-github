@@ -943,6 +943,9 @@ def test_glyph_tables_cover_every_visual_state():
         uistate._CONFLICT_GLYPH,
         uistate._COMMENT_GLYPH,
         uistate._ERROR_GLYPH,
+        # The viewer's own request lives outside the tables, so it has to be named
+        # here explicitly: left out, an Ambiguous-width mark slipped through.
+        uistate._YOUR_REVIEW_GLYPH,
         *uistate._REVIEW_GLYPH.values(),
         *uistate._CHECK_GLYPH.values(),
     )
