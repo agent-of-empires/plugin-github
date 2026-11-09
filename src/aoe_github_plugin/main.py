@@ -691,9 +691,9 @@ class Runtime:
                 repos.add(repo.lower())
         return repos
 
-    def _suggestion_settings(self) -> dict[str, Any]:
+    def _suggestion_settings(self, keys: tuple[str, ...] = SUGGESTION_SETTING_KEYS) -> dict[str, Any]:
         settings: dict[str, Any] = {}
-        for key in SUGGESTION_SETTING_KEYS:
+        for key in keys:
             result = self.call_host(CONFIG_GET, {"key": key})
             if not isinstance(result, dict):
                 raise TypeError(f"Failed to read suggestion setting {key!r}")
@@ -750,7 +750,8 @@ class Runtime:
             return
         try:
             enabled = self._enabled_criteria()
-            settings = self._suggestion_settings()
+            # Only the scope keys: a failed read of an unrelated setting must not hide the checks.
+            settings = self._suggestion_settings(("suggestion_repositories", "suggestion_organizations"))
             report = checks.run_checks(
                 mentioned_enabled=None if enabled is None else "mentioned" in enabled,
                 repos_raw=settings["suggestion_repositories"],
