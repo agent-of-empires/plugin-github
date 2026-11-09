@@ -9,7 +9,7 @@
 # The host parses this strictly (deny_unknown_fields), so every key below must
 # match a field in that schema.
 
-id = "aagent-of-empires.github"
+id = "agent-of-empires.github"
 name = "GitHub"
 version = "2.4.0"
 # Manifest schema / host API version. api_version 5 added the [[screenshots]]

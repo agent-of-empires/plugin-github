@@ -101,3 +101,8 @@ def test_icon_requires_api_version_7():
 
 def test_suggestion_projects_setting_is_gone():
     assert "suggestion_projects" not in {setting["key"] for setting in _manifest()["settings"]}
+
+
+def test_the_plugin_id_stays_stable():
+    # Installed settings and the featured index key on this id.
+    assert _manifest()["id"] == "agent-of-empires.github"
