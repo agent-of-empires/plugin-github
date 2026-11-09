@@ -1194,6 +1194,22 @@ def test_publish_checks_passes_sources_and_scope_and_replaces_the_host_list(monk
     assert calls[-1] == (main.SUGGESTIONS_CHECKS_SET, {"checks": [{"id": "x", "label": "X", "status": "ok"}]})
 
 
+def test_publish_checks_reads_only_the_scope_settings(monkeypatch):
+    calls = []
+    runtime = main.Runtime(send=lambda _m: None)
+    host = _host(sources={"sources": []}, settings={}, calls=calls)
+
+    def call_host(method, params, timeout=None):
+        if method == main.CONFIG_GET and params["key"] == "suggestion_limit":
+            return None  # a timed-out read of a setting the checks do not use
+        return host(method, params, timeout)
+
+    runtime.call_host = call_host
+    monkeypatch.setattr(main.checks, "run_checks", lambda **_kw: [{"id": "x", "label": "X", "status": "ok"}])
+    runtime._publish_checks()
+    assert calls[-1][1]["checks"] == [{"id": "x", "label": "X", "status": "ok"}]
+
+
 def test_publish_checks_passes_none_when_the_host_does_not_report_sources(monkeypatch):
     captured = {}
     runtime = main.Runtime(send=lambda _m: None)
