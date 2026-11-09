@@ -1,4 +1,4 @@
-mode: shadow
+mode: enforce
 
 # The AWS account tier has no Claude 5.x access on Bedrock yet; switch back
 # to us.anthropic.claude-sonnet-5-5 and us.anthropic.claude-haiku-5-5 once it does.
