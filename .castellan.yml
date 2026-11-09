@@ -1,0 +1,48 @@
+mode: shadow
+
+# The AWS account tier has no Claude 5.x access on Bedrock yet; switch back
+# to us.anthropic.claude-sonnet-5-5 and us.anthropic.claude-haiku-5-5 once it does.
+models:
+  review: us.anthropic.claude-sonnet-4-6
+  triage: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+limits:
+  maxLines: 100
+  maxFiles: 5
+  maxTopLevelDirs: 2
+
+paths:
+  protected:
+    - .github/
+    - CODEOWNERS
+    - .castellan.yml
+    - AGENTS.md
+    - package.json
+    - Cargo.toml
+  release:
+    - .github/workflows/release.yml
+    - .github/workflows/prepare-release.yml
+    - .github/workflows/tag-release-pr.yml
+
+teams:
+  maintainers: maintainers
+  protected: protected
+
+skip_branches:
+  - release-staging/*
+  - release-plz-*
+
+prompt:
+  base: |
+    You review pull requests for plugin-github, a plugin for Agent of Empires, a
+    terminal session manager for AI coding agents. Judge the diff against the
+    repository guidelines in AGENTS.md and CONTRIBUTING.md when present.
+  guidance:
+    - PR titles and commit subjects use conventional commits (feat, fix, docs, refactor, test, chore, ci).
+    - Hand-written docs, comments and commit messages contain no em dashes.
+    - User-visible behavior changes update the README or docs in the same PR.
+    - Tests are deterministic, isolated from user state, and never reach the real network.
+    - Flag dead code; comments stay short and explain only non-obvious reasons.
+    - New dependencies pin the latest stable release unless the PR justifies the older pin.
+    - Flag PRs that mix unrelated areas.
+    - Report review findings without a severity label, prefixing only nits with `nit:`.
