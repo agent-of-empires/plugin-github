@@ -184,6 +184,117 @@ def test_build_snapshot_aggregates_a_session(tmp_path):
     assert repos[0]["error"] is None
 
 
+def test_gh_destination_supplements_snapshot_matching(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _make_repo(repo)
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda _path: ("upstream", "r"))
+
+    def handler(request):
+        if request.url.path == "/repos/upstream/r/pulls":
+            return httpx.Response(200, json=[{**_pull(), "html_url": "https://github.com/upstream/r/pull/12"}])
+        return httpx.Response(200, json=[])
+
+    snapshot = refresh.build_snapshot(
+        [{"id": "s", "project_path": str(repo)}], env=_NoToken(), transport=httpx.MockTransport(handler)
+    )
+    result = snapshot["sessions"][0]["repos"][0]
+    assert result["repo"] == "o/r"
+    assert result["pulls"][0]["url"] == "https://github.com/upstream/r/pull/12"
+
+
+def test_gh_failure_removes_unconfigured_destination_from_snapshot(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _make_repo(repo)
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda _path: ("upstream", "r"))
+
+    def handler(request):
+        if request.url.path == "/repos/upstream/r/pulls":
+            return httpx.Response(200, json=[{**_pull(), "html_url": "https://github.com/upstream/r/pull/12"}])
+        return httpx.Response(200, json=[])
+
+    sessions = [{"id": "s", "project_path": str(repo)}]
+    transport = httpx.MockTransport(handler)
+    first = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport)
+    assert first["sessions"][0]["repos"][0]["pulls"][0]["number"] == 12
+
+    def failure(_path):
+        raise refresh.gh_cache.GhDiscoveryError
+
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", failure)
+    second = refresh.build_snapshot(sessions, env=_NoToken(), transport=transport, force=True)
+    assert second["sessions"][0]["repos"][0]["pulls"] == []
+
+
+def test_gh_destination_cache_respects_expiry_force_and_backoff(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda path: calls.append(path) or ("upstream", "r"))
+    now = [1000.0]
+    monkeypatch.setattr(refresh.time, "monotonic", lambda: now[0])
+
+    assert refresh._gh_destination(str(tmp_path), "feature", force=False) == ("upstream", "r")
+    assert refresh._gh_destination(str(tmp_path), "feature", force=False) == ("upstream", "r")
+    assert len(calls) == 1
+    refresh._gh_destination(str(tmp_path), "feature", force=True)
+    assert len(calls) == 2
+    refresh._backoff["rest"]["until"] = 2000.0
+    now[0] = 1400.0
+    assert refresh._gh_destination(str(tmp_path), "feature", force=True) == ("upstream", "r")
+    assert len(calls) == 2
+    refresh._backoff["rest"]["until"] = 0.0
+    refresh._gh_destination(str(tmp_path), "feature", force=False)
+    assert len(calls) == 3
+    refresh._gh_destination(str(tmp_path), "other", force=False)
+    assert len(calls) == 4
+
+
+def test_gh_destination_discards_cached_result_on_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda _path: ("upstream", "r"))
+    path = str(tmp_path)
+    assert refresh._gh_destination(path, "feature", force=True) == ("upstream", "r")
+
+    def failure(_path):
+        raise refresh.gh_cache.GhDiscoveryError
+
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", failure)
+    assert refresh._gh_destination(path, "feature", force=True) is None
+    assert refresh._gh_destination(path, "feature", force=False) is None
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda _path: None)
+    assert refresh._gh_destination(path, "feature", force=True) is None
+    assert refresh._gh_destination(path, "feature", force=False) is None
+
+
+def test_gh_failure_cooldown_avoids_repeated_calls(tmp_path, monkeypatch):
+    calls = []
+
+    def failure(path):
+        calls.append(path)
+        raise refresh.gh_cache.GhDiscoveryError
+
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", failure)
+    path = str(tmp_path)
+    assert refresh._gh_destination(path, "feature", force=False) is None
+    assert refresh._gh_destination(path, "feature", force=False) is None
+    assert len(calls) == 1
+    refresh._gh_destination(path, "feature", force=True)
+    assert len(calls) == 2
+
+
+def test_gh_cache_bounds_success_and_failure_entries(tmp_path, monkeypatch):
+    monkeypatch.setattr(refresh.gh_cache, "MAX_ENTRIES", 2)
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", lambda _path: None)
+    for branch in ("one", "two", "three"):
+        refresh._gh_destination(str(tmp_path), branch, force=False)
+    assert len(refresh.gh_cache._cache) == 2
+
+    def failure(_path):
+        raise refresh.gh_cache.GhDiscoveryError
+
+    monkeypatch.setattr(refresh.gh_cache, "gh_pr_repository", failure)
+    for branch in ("four", "five", "six"):
+        refresh._gh_destination(str(tmp_path), branch, force=False)
+    assert len(refresh.gh_cache._failures) == 2
+
+
 def test_tokenless_refresh_skips_native_stack_requests(tmp_path):
     # Shared repo identity fetches open PRs once and makes no anonymous stack calls.
     ws1 = tmp_path / "w1"

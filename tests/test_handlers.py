@@ -201,3 +201,60 @@ def test_status_discovers_fork_pull_targeting_configured_upstream(tmp_path):
     result = handlers.github_status(str(tmp_path), env=_NoTokenEnv(), transport=_transport(handler))
     assert result["repo"] == "alice/r"
     assert result["pulls"][0]["url"] == "https://github.com/upstream/r/pull/7"
+
+
+def test_gh_destination_supplements_branch_matching(monkeypatch):
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _path: ("alice", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repos", lambda _path: [("alice", "r")])
+    monkeypatch.setattr(handlers, "current_branch", lambda _path: "feature")
+    monkeypatch.setattr(handlers.gh_cache, "gh_pr_repository", lambda _path: ("upstream", "r"))
+
+    def handler(request):
+        if request.url.path == "/repos/upstream/r/pulls":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        **_pr(),
+                        "html_url": "https://github.com/upstream/r/pull/7",
+                        "head": {"ref": "feature", "repo": {"name": "r", "owner": {"login": "alice"}}},
+                    }
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    result = handlers.github_status(env=_NoTokenEnv(), transport=_transport(handler))
+    assert result["repo"] == "alice/r"
+    assert result["pulls"][0]["url"] == "https://github.com/upstream/r/pull/7"
+
+
+def test_gh_failure_preserves_configured_remote_discovery(monkeypatch):
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _path: ("alice", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repos", lambda _path: [("alice", "r")])
+    monkeypatch.setattr(handlers, "current_branch", lambda _path: "feature")
+
+    def failure(_path):
+        raise handlers.gh_cache.GhDiscoveryError
+
+    monkeypatch.setattr(handlers.gh_cache, "gh_pr_repository", failure)
+    pull = {
+        **_pr(),
+        "html_url": "https://github.com/alice/r/pull/7",
+        "head": {"ref": "feature", "repo": {"name": "r", "owner": {"login": "alice"}}},
+    }
+    result = handlers.github_status(
+        env=_NoTokenEnv(), transport=_transport(lambda _request: httpx.Response(200, json=[pull]))
+    )
+    assert result["pulls"][0]["url"] == "https://github.com/alice/r/pull/7"
+
+
+def test_status_and_open_share_gh_discovery(monkeypatch):
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _path: ("alice", "r"))
+    monkeypatch.setattr(handlers, "remote_owner_repos", lambda _path: [("alice", "r")])
+    monkeypatch.setattr(handlers, "current_branch", lambda _path: "feature")
+    calls = []
+    monkeypatch.setattr(handlers.gh_cache, "gh_pr_repository", lambda path: calls.append(path) or None)
+    transport = _transport(lambda _request: httpx.Response(200, json=[]))
+    handlers.github_status(env=_NoTokenEnv(), transport=transport)
+    handlers.github_open(env=_NoTokenEnv(), transport=transport)
+    assert calls == ["."]

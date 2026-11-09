@@ -6,6 +6,10 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## Unreleased
 
+### Features
+
+- **discovery:** Use `gh pr view` as an optional source of additional PR destinations while retaining configured-remote branch matching; cache results between refreshes and respect GitHub backoff.
+
 ### Bug Fixes
 
 - **discovery:** Find upstream-targeting PRs from fork checkouts in web snapshots and direct-worker status/open handlers, using the GitHub remotes each checkout configures (no metadata or fork-lineage calls). The permitted head is always the checkout's own repo (upstream is only a destination), so unrelated same-name branches are rejected; caches, PR selection, and stack navigation stay destination-aware, and destination GraphQL pages are bounded to a single page with owner-scoped REST fallback (#129).

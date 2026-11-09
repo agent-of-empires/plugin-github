@@ -54,12 +54,14 @@ import httpx
 from aoe_github_plugin import lookup
 from aoe_github_plugin import graphql
 from aoe_github_plugin.auth import TokenEnvironment
+from aoe_github_plugin.utils import gh_cache
 from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import NotFoundError
 from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.handlers import _resolve_optional_token
 from aoe_github_plugin.utils.gitctx import parse_owner_repo
+from aoe_github_plugin.utils.gitctx import checkout_environment
 
 _LOG = logging.getLogger(__name__)
 
@@ -291,6 +293,7 @@ def _git(path: str, *args: str) -> str | None:
     try:
         proc = subprocess.run(
             ["git", "-C", path, *args],
+            env=checkout_environment(),
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT,
@@ -1922,8 +1925,16 @@ class _Resolved:
     remotes: list[tuple[str, str]]
 
 
+def _gh_destination(path: str, branch: str, *, force: bool) -> tuple[str, str] | None:
+    """Share destination discovery while respecting plugin rate-limit gates."""
+    now = time.monotonic()
+    with _cache_lock:
+        blocked = any(now < _backoff[kind]["until"] for kind in _BACKOFF_KINDS)
+    return gh_cache.destination(path, branch, force=force, blocked=blocked)
+
+
 def _resolve_checkouts(
-    sessions: list[dict[str, Any]], settings: SnapshotSettings
+    sessions: list[dict[str, Any]], settings: SnapshotSettings, *, force: bool = False
 ) -> tuple[
     list[tuple[dict[str, Any], list[tuple[str, str | None]]]],
     dict[tuple[str, str | None], tuple[str | None, CheckoutKey | None]],
@@ -1944,7 +1955,12 @@ def _resolve_checkouts(
         """Identity and remotes for one checkout, read once in the shared pool."""
         (path, branch), checkout = item
         repo, key = _identify(checkout, branch)
-        return _Resolved((path, branch), repo, key, _remote_repos(checkout))
+        remotes = _remote_repos(checkout)
+        if branch is None and key is not None:
+            destination = _gh_destination(checkout, key[2], force=force)
+            if destination is not None and destination not in remotes:
+                remotes.append(destination)
+        return _Resolved((path, branch), repo, key, remotes)
 
     with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
         per_session = list(zip(sessions, pool.map(_discover, sessions), strict=True))
@@ -1992,7 +2008,7 @@ def build_snapshot(
     ``transport`` are test seams.
     """
 
-    per_session, ident, destinations = _resolve_checkouts(sessions, settings)
+    per_session, ident, destinations = _resolve_checkouts(sessions, settings, force=force)
     fetched, auth_present = _fetch_all(
         destinations,
         env,
