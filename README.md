@@ -51,7 +51,7 @@ anything is written.
 
 ### GitHub suggestions
 
-On Agent of Empires 1.21.0+ (SDK API 20), this plugin publishes host-managed
+On Agent of Empires 1.23.0+ (SDK API 21), this plugin publishes host-managed
 suggested sessions, independent of AoE sessions. Each source below is one
 criterion declared in the manifest's `[suggestions]` block. The host owns the
 per-profile on/off switch for every criterion. Before each discovery the worker
