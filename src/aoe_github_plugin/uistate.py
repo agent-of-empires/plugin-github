@@ -312,10 +312,12 @@ def _review_visual(pull: dict[str, Any]) -> tuple[str, str, str] | None:
     The same review state means different things on either side of a PR. On the
     viewer's own PR it describes other people ("awaiting review" = still waiting
     on them). On a PR they are reviewing, an outstanding request is their own next
-    action, so it reads as an eye with a warning tone instead of a clock, and a
-    position they already submitted is credited to them. Anything else falls
-    through to the shared ``_REVIEW_VISUAL`` row, so a blocker another reviewer
-    raised is never hidden behind the viewer's own approval.
+    action, so it reads as an eye with a warning tone instead of a clock -- it
+    outranks a position they already submitted, since a re-request asks for a new
+    one -- while a position they submitted with nothing outstanding is credited to
+    them. Anything else falls through to the shared ``_REVIEW_VISUAL`` row, so a
+    blocker another reviewer raised is never hidden behind the viewer's own
+    approval.
     """
     state = pull.get("review_state")
     base = _REVIEW_VISUAL.get(state) if isinstance(state, str) else None
@@ -323,10 +325,11 @@ def _review_visual(pull: dict[str, Any]) -> tuple[str, str, str] | None:
         return base
     own = pull.get("viewer_review")
     submitted = own if isinstance(own, str) and own in _VIEWER_REVIEW_LABEL else None
-    if submitted is None and pull.get("viewer_review_requested") is True and state != "changes-requested":
+    if pull.get("viewer_review_requested") is True and state != "changes-requested":
         # A request is outstanding and it is on the viewer: this is the glyph they
-        # act on. Without one (a dismissed review leaves no request), the shared
-        # state's glyph stands rather than claiming work that is not theirs.
+        # act on, even when they already reviewed (GitHub asking again is new work).
+        # Without one (a dismissed review leaves no request), the shared state's
+        # glyph stands rather than claiming work that is not theirs.
         return (_ICON_YOUR_REVIEW, "warn", "awaiting your review")
     if base is not None and submitted is not None and submitted == state:
         icon, tone, _label = base

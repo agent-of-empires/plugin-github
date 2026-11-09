@@ -811,11 +811,23 @@ def test_authored_pr_keeps_the_arrow_and_the_waiting_clock():
 
 
 def test_reviewer_review_already_submitted_is_credited_to_them():
+    # Nothing is asked of them any more, so their submitted position is the signal.
     pull = _reviewer_pull(review="approved")
     pull["viewer_review"] = "approved"
+    pull["viewer_review_requested"] = False
     items = _badge_items_for([_repo(pulls=[pull])])
     assert items[1]["icon"] == "badge-check"
     assert items[1]["tooltip"].endswith("(approved by you)")
+
+
+def test_reviewer_asked_again_after_reviewing_gets_the_eye():
+    # They submitted a position, but GitHub is asking again: the new request is
+    # their work, so the eye outranks crediting the earlier review.
+    pull = _reviewer_pull(review="approved")
+    pull["viewer_review"] = "approved"
+    items = _badge_items_for([_repo(pulls=[pull])])
+    assert items[1]["icon"] == "eye"
+    assert items[1]["tooltip"].endswith("(awaiting your review)")
 
 
 def test_reviewer_open_request_never_hides_another_reviewers_blocker():

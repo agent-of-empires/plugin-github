@@ -184,7 +184,10 @@ session-less `github.refresh` cover every session and prune vanished ones:
    move (a clock), while a PR you are reviewing takes the plain PR glyph in an
    info tone and turns a review GitHub still has pending on them (a request on
    `viewerLatestReviewRequest`, so a dismissed review is not one) into a warn eye,
-   "awaiting your review"; a review you already submitted is labelled as yours ("approved by
+   "awaiting your review" -- the request wins even when a review was already
+   submitted, since a re-request asks for a new position, but a changes-requested
+   state outranks it so another reviewer's blocker is never hidden; with nothing
+   outstanding, a review you already submitted is labelled as yours ("approved by
    you")), a `row-column`
    (`{text, tone, tooltip, sort_value?, filter_values?}`, or `{}` to clear -- one deterministic
    words summary of the session's most-urgent PR signal so the list is scannable
@@ -309,8 +312,9 @@ The pane is one-PR-focused, and reads top to bottom:
    carries `#number`, the title, `branch · author`, and a single glyph for the
    PR's most-urgent state (or the unresolved-comment count), kept to one so a run
    of rows reads at a glance. The row icon and that glyph follow the viewer's role
-   the same way the session badge does (plain/info + eye when the PR is yours to
-   review). Clicking a row fires `github.select_pr { pr }`; the trailing arrow is a
+   the same way the session badge does (plain/info + an eye while a review is still
+   requested of you, unless changes were requested). Clicking a row fires
+   `github.select_pr { pr }`; the trailing arrow is a
    separate link to GitHub, so picking a PR never navigates away or changes a
    checkout. The selection is remembered in memory per session, and falls back
    to the top of the list whenever the PR it named is no longer in the snapshot
