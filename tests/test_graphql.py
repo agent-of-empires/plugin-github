@@ -742,6 +742,13 @@ def test_viewer_role_tells_my_pr_from_one_im_reviewing():
     # A submitted review or an outstanding request (direct or team) makes a reviewer.
     assert graphql.viewer_role({"viewerLatestReview": {"state": "CHANGES_REQUESTED"}}) == "reviewer"
     assert graphql.viewer_role({"viewerLatestReviewRequest": {"id": "r1"}}) == "reviewer"
+    # A dismissed review is not a position: without a fresh request it makes nobody
+    # a reviewer, so the PR keeps its role-neutral glyph instead of "reviewing".
+    assert graphql.viewer_role({"viewerLatestReview": {"state": "DISMISSED"}}) is None
+    assert (
+        graphql.viewer_role({"viewerLatestReview": {"state": "DISMISSED"}, "viewerLatestReviewRequest": {"id": "r1"}})
+        == "reviewer"
+    )
     # The no-token REST shape (and a PR the viewer has no stake in) stays roleless.
     assert graphql.viewer_role({}) is None
     assert graphql.viewer_role({"viewerDidAuthor": False, "viewerLatestReview": None}) is None

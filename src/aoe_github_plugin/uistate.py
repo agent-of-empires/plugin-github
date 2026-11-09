@@ -17,7 +17,9 @@ sort option, six global filter facets, plus three pushes per session:
   workspace's repos, plus an error marker per failed repo. Each chip is colored by
   tone (failing CI / changes requested danger, unresolved comments warn, healthy
   success), so the row distinguishes a broken PR from a healthy one at a glance
-  (#36). A draft shows the PR chip alone; merged-only repos are omitted, since the
+  (#36). A draft shows the PR chip alone unless it is queued or conflicted, which
+  outrank it (the ladder ranks those above a draft, so chip, words and sort agree);
+  merged-only repos are omitted, since the
   badge is an actionable indicator. Every chip's href opens that PR; the pane
   carries the full detail, and the tooltip keeps the full line. By default a chip
   is the GitHub glyph, tone and tooltip the web row already paints, and the
@@ -66,7 +68,9 @@ The PR affordance and review glyphs are viewer-scoped (``viewer_role`` /
 viewer authored the arrow marks their own branch and an outstanding review reads
 as a wait on someone else, while a PR they are reviewing takes the plain PR glyph
 and turns a review GitHub is still requesting of them into an eye -- the one glyph
-that is theirs to act on.
+that is theirs to act on, and a rung of the attention ladder
+(``awaiting-your-review``): its rank, dense mark and label all name the request
+rather than the PR's aggregate review state.
 
 Icons are lucide names (the web frontend already depends on ``lucide-react``);
 ``tone`` is one of the host's ``Tone`` set and colors the icon, while ``color``
@@ -226,6 +230,9 @@ _REVIEW_GLYPH: dict[str, str] = {
     "commented": "❝",
     "waiting": "⧗",
 }
+# The viewer's own outstanding request is a kind of its own (the ladder's rung),
+# so its mark is too: the review states' marks name a position, this names a task.
+_YOUR_REVIEW_GLYPH = "☉"
 # The heavy check/cross pair, so CI never reads as the review chip next to it.
 _CHECK_GLYPH: dict[str, str] = {
     "succeeded": "✔",
@@ -255,17 +262,21 @@ _ATTENTION_VISUAL: dict[str, tuple[int, str, str, str]] = {
     "queue": (1, "git-merge", "info", "in merge queue"),
     "conflicts": (2, "triangle-alert", "danger", "conflicts"),
     "changes-requested": (3, *_REVIEW_VISUAL["changes-requested"][:2], "changes requested"),
-    "checks-failing": (4, *_CHECK_VISUAL["failing"][:2], "CI failing"),
-    "unresolved": (5, "message-square", "warn", "unresolved comments"),
-    "checks-running": (6, *_CHECK_VISUAL["running"][:2], "CI running"),
-    "checks-queued": (7, *_CHECK_VISUAL["queued"][:2], "CI queued"),
-    "changes-pushed": (8, *_REVIEW_VISUAL["changes-pushed"][:2], "pushed since review"),
-    "awaiting-review": (9, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
-    "commented": (10, *_REVIEW_VISUAL["commented"][:2], "commented"),
-    "partially-approved": (11, *_REVIEW_VISUAL["partially-approved"][:2], "partially approved"),
-    "approved": (12, *_REVIEW_VISUAL["approved"][:2], "approved"),
-    "open": (13, _ICON_OPEN, "success", "open PR"),
-    "draft": (14, _ICON_DRAFT, "warn", "draft"),
+    # GitHub is asking the *viewer* for a review: the one signal they can clear
+    # themselves, so it ranks above the states they can only wait on (CI, comments,
+    # someone else's review) and below a blocker another reviewer raised.
+    "awaiting-your-review": (4, _ICON_YOUR_REVIEW, "warn", "awaiting your review"),
+    "checks-failing": (5, *_CHECK_VISUAL["failing"][:2], "CI failing"),
+    "unresolved": (6, "message-square", "warn", "unresolved comments"),
+    "checks-running": (7, *_CHECK_VISUAL["running"][:2], "CI running"),
+    "checks-queued": (8, *_CHECK_VISUAL["queued"][:2], "CI queued"),
+    "changes-pushed": (9, *_REVIEW_VISUAL["changes-pushed"][:2], "pushed since review"),
+    "awaiting-review": (10, *_REVIEW_VISUAL["waiting"][:2], "awaiting review"),
+    "commented": (11, *_REVIEW_VISUAL["commented"][:2], "commented"),
+    "partially-approved": (12, *_REVIEW_VISUAL["partially-approved"][:2], "partially approved"),
+    "approved": (13, *_REVIEW_VISUAL["approved"][:2], "approved"),
+    "open": (14, _ICON_OPEN, "success", "open PR"),
+    "draft": (15, _ICON_DRAFT, "warn", "draft"),
 }
 
 
@@ -275,6 +286,7 @@ _ATTENTION_VISUAL: dict[str, tuple[int, str, str, str]] = {
 _KIND_CATEGORY: dict[str, str] = {
     "changes-requested": "review",
     "changes-pushed": "review",
+    "awaiting-your-review": "review",
     "awaiting-review": "review",
     "commented": "review",
     "partially-approved": "review",
@@ -348,6 +360,12 @@ def _attention_glyph(pull: dict[str, Any], kind: str) -> tuple[str, str, str]:
         review = _review_visual(pull)
         if review is not None:
             return review
+    if kind == "unresolved":
+        unresolved = _unresolved_count(pull)
+        if unresolved:
+            # The count says more than the bare state, and the selector row
+            # already shows it: keep the two surfaces saying the same thing.
+            return "message-square", "warn", f"{unresolved} unresolved"
     _rank, icon, tone, label = _ATTENTION_VISUAL[kind]
     return icon, tone, label
 
@@ -362,6 +380,10 @@ def _attention_mark(pull: dict[str, Any], kind: str) -> str:
         return _CONFLICT_GLYPH
     if kind == "unresolved":
         return _COMMENT_GLYPH
+    if kind == "awaiting-your-review":
+        # Own the mark here rather than reading `review_state`, which names the
+        # PR's aggregate review state and not the request on the viewer.
+        return _YOUR_REVIEW_GLYPH
     if _KIND_CATEGORY.get(kind) == "review":
         state = pull.get("review_state")
         return _REVIEW_GLYPH.get(state, "?") if isinstance(state, str) else "?"
@@ -386,14 +408,16 @@ def _pull_attention(pull: dict[str, Any], chips: frozenset[str]) -> str:
     (review_state/checks/comments) keys are absent in the no-token shape, so a
     token-less PR falls through to ``open``/``draft`` and the row degrades to the
     basic view rather than mislabeling state it cannot see."""
-    if pull.get("draft"):
-        return "draft"
     # Queue membership is not user-suppressible and takes precedence over stale
-    # per-commit signals while GitHub processes the queued merge.
+    # per-commit signals while GitHub processes the queued merge. A queued or
+    # conflicted draft outranks "draft" too: the chip, the words and the sort all
+    # read this one ladder, so the pane cannot paint a conflict the row sorts last.
     if pull.get("merge_queue") is not None:
         return "queue"
     if pull.get("merge_state") == "conflicts":
         return "conflicts"
+    if pull.get("draft"):
+        return "draft"
     review = pull.get("review_state")
     checks = pull.get("checks")
     cstate = checks.get("state") if isinstance(checks, dict) else None
@@ -401,8 +425,14 @@ def _pull_attention(pull: dict[str, Any], chips: frozenset[str]) -> str:
     unresolved = comments.get("unresolved") if isinstance(comments, dict) else 0
     # Priority ladder (issue #36); first enabled match wins. A no-token PR matches
     # none of these (rich keys absent) and falls through to the healthy "open".
+    # The viewer's own outstanding request is a rung, not a relabel applied after
+    # this returns: rank, dense mark and label all have to name the same state.
     rules: tuple[tuple[bool, str], ...] = (
         (review == "changes-requested", "changes-requested"),
+        (
+            _viewer_role(pull) == "reviewer" and pull.get("viewer_review_requested") is True,
+            "awaiting-your-review",
+        ),
         (cstate == "failing", "checks-failing"),
         (bool(unresolved), "unresolved"),
         (cstate == "running", "checks-running"),
@@ -499,8 +529,11 @@ def _pr_badge_chips(
     def mark(glyph: str) -> str | None:
         return glyph if dense else None
 
-    if pull.get("draft"):
-        # a draft is WIP: skip review/CI/comment noise until it opens.
+    kind = _pull_attention(pull, chips_on)
+    if kind == "draft":
+        # A draft is WIP: skip review/CI/comment noise until it opens. A queued or
+        # conflicted draft is not this kind (the ladder ranks those above it), so
+        # its chip agrees with the row-column and the pane instead of going quiet.
         return [_chip(_ICON_DRAFT, "warn", mark(_DRAFT_GLYPH), f"{head} (draft)", href)]
     reviewing = _viewer_role(pull) == "reviewer"
     icon, tone = (_ICON_REVIEW, "info") if reviewing else (_ICON_OPEN, "success")
@@ -511,8 +544,7 @@ def _pr_badge_chips(
     # One chip for the winning signal, from the same ladder the row-column and the
     # pane use. Queue membership and conflicts sit before the gated ladder, so they
     # survive every chip toggle; the queue's position rides in the tooltip.
-    kind = _pull_attention(pull, chips_on)
-    if kind in ("open", "draft"):
+    if kind == "open":
         return chips
     icon, tone, label = _attention_glyph(pull, kind)
     queue = pull.get("merge_queue")
@@ -718,13 +750,6 @@ def _pr_signals(pull: dict[str, Any]) -> list[dict[str, Any]]:
     any of them. The row icon already carries open/draft/merged, so nothing is
     emitted for a PR with no notable state, nor for the no-token shape."""
     kind = _pull_attention(pull, _ALL_CHIPS)
-    if kind == "draft":
-        # A draft is WIP: the row icon says so, and only a queued or conflicted
-        # branch outranks it.
-        if pull.get("merge_queue") is not None:
-            kind = "queue"
-        else:
-            kind = "conflicts" if pull.get("merge_state") == "conflicts" else "open"
     if kind == "unresolved":
         unresolved = _unresolved_count(pull)
         if unresolved:

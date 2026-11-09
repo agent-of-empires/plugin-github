@@ -69,8 +69,9 @@ fragment PRNode on PullRequest {
     author { login }
     # Viewer-scoped, so the pane can tell "my PR" from "a PR I'm reviewing"
     # without a second query for the viewer's login. ``viewerDidAuthor`` is a
-    # plain boolean; the two review fields are nullable connections of one node,
-    # so their presence alone answers "am I on the hook for this review".
+    # plain boolean; the two review fields are nullable object fields
+    # (``PullRequestReview`` / ``ReviewRequest``), so their presence alone answers
+    # "am I on the hook for this review".
     viewerDidAuthor
     viewerLatestReview { state }
     viewerLatestReviewRequest { id }
@@ -916,7 +917,9 @@ def review_summary(people: list[dict[str, str]]) -> str:
 def viewer_role(pr: dict[str, Any]) -> str | None:
     """``"author"`` when the viewer opened the PR, ``"reviewer"`` when they have
     reviewed it or been asked to (a direct or team review request both surface
-    here), else ``None``.
+    here), else ``None``. A dismissed review is not a position -- GitHub removed
+    it and the viewer has no standing on the PR unless asked again -- so it does
+    not make them a reviewer on its own.
 
     ``None`` when the snapshot carries no viewer information (the no-token REST
     shape, or a PR the viewer neither wrote nor was asked to review), so callers
@@ -924,7 +927,10 @@ def viewer_role(pr: dict[str, Any]) -> str | None:
     """
     if pr.get("viewerDidAuthor") is True:
         return "author"
-    if any(isinstance(pr.get(key), dict) for key in ("viewerLatestReview", "viewerLatestReviewRequest")):
+    if isinstance(pr.get("viewerLatestReviewRequest"), dict):
+        return "reviewer"
+    review = pr.get("viewerLatestReview")
+    if isinstance(review, dict) and str(review.get("state") or "").upper() != "DISMISSED":
         return "reviewer"
     return None
 

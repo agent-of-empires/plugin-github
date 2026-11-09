@@ -830,6 +830,33 @@ def test_reviewer_asked_again_after_reviewing_gets_the_eye():
     assert items[1]["tooltip"].endswith("(awaiting your review)")
 
 
+def test_reviewer_request_owns_its_rank_and_dense_mark():
+    # The eye is a rung of the ladder, so the rank the sidebar sorts on and the mark
+    # the terminal paints name the request, not the PR's aggregate "approved".
+    pull = _reviewer_pull(review="approved")
+    pull["viewer_review"] = "approved"
+    items = _badge_items_for([_repo(pulls=[pull])], dense_glyphs=True)
+    assert [i["icon"] for i in items] == ["git-pull-request", "eye"]
+    assert items[1]["text"] == uistate._YOUR_REVIEW_GLYPH
+    params = uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=[_repo(pulls=[pull])])))
+    cell = _column(params, "s1")["payload"]
+    assert cell["text"] == "awaiting your review"
+    assert cell["sort_value"] == uistate._ATTENTION_VISUAL["awaiting-your-review"][0]
+    assert cell["sort_value"] < uistate._ATTENTION_VISUAL["approved"][0]
+
+
+def test_reviewer_request_outranks_ci_and_unresolved_comments():
+    # Only a blocker outranks the viewer's own request: red or unfinished CI and
+    # unresolved comments do not hide the one glyph they can act on.
+    checks = {"state": "failing", "runs": []}
+    comments = {"unresolved": 2, "items": []}
+    pull = _reviewer_pull(review="waiting", checks=checks, comments=comments)
+    items = _badge_items_for([_repo(pulls=[pull])])
+    assert [i["icon"] for i in items] == ["git-pull-request", "eye"]
+    row = _selector_row(pull)
+    assert [(b["icon"], b["tooltip"]) for b in row["badges"]] == [("eye", "awaiting your review")]
+
+
 def test_reviewer_open_request_never_hides_another_reviewers_blocker():
     # A pending request of the reviewer's own does not mask a changes-requested
     # decision someone else made: the danger chip still wins.
@@ -936,6 +963,14 @@ def test_badge_chip_tooltips_name_repo_and_state():
     assert len(tips) == 2  # affordance + the one winning signal
     assert tips[0].startswith("a: PR #5")
     assert "changes requested" in tips[1]
+
+
+def test_badge_chip_tooltip_keeps_the_unresolved_count():
+    # The count is the useful part (base rendered "(3 unresolved)"), and the pane
+    # selector already shows it: the badge must not fall back to a static label.
+    pull = _rich_pull(review="approved", comments={"unresolved": 3, "items": []})
+    items = _badge_items_for([_repo(name="a", pulls=[pull])])
+    assert items[1]["tooltip"].endswith("(3 unresolved)")
 
 
 def test_selector_strip_keeps_only_the_most_urgent_glyph():
@@ -1250,14 +1285,19 @@ def test_clean_pr_has_no_conflict_chip_and_reads_ready():
     assert "disabled" not in action
 
 
-def test_draft_conflict_asymmetry_quiet_badge_visible_pane_verdict():
-    # A draft keeps the established asymmetry: the session badge stays draft-only
-    # (WIP, no conflict chip), but the pane still says the branch is blocked.
+def test_conflicted_draft_surfaces_on_every_surface():
+    # One ladder for the chip, the words and the sort: a conflicted draft is not
+    # quiet in one surface and urgent in another.
     pull = _rich_pull(draft=True, merge_state="conflicts")
     repos = [_repo(pulls=[pull])]
-    assert _badge_icons_with(repos, frozenset({"review", "ci", "comments"})) == ["git-pull-request-draft"]
-    # Draft is the more actionable thing to say: open it before worrying about the
-    # conflict, and the conflict signal still rides the selector row's glyph strip.
+    assert _badge_icons_with(repos, frozenset({"review", "ci", "comments"})) == [
+        "git-pull-request-arrow",
+        "triangle-alert",
+    ]
+    cell = _column_payload(repos)
+    assert cell["text"] == "conflicts"
+    assert cell["sort_value"] == uistate._ATTENTION_VISUAL["conflicts"][0]
+    # The verdict still opens with the draft, which is what to fix first.
     callout = _callout(repos)
     assert callout["title"] == "Draft"
     row = _rows(_pane(uistate.snapshot_ui_state_params(_auth_snapshot(_session(repos=repos))))["payload"]["blocks"])[0]

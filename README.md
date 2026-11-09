@@ -177,7 +177,8 @@ session-less `github.refresh` cover every session and prune vanished ones:
    success, distinguishing a broken PR from a healthy one at a glance; with
    `dense_row_badge_glyphs` on, each chip also carries a single-character mark so
    the terminal has something to paint where it has no icons (off by default); a
-   draft shows the PR chip alone and merged-only repos are omitted, since the badge
+   draft shows the PR chip alone (unless it is queued or conflicted, which outrank
+   it) and merged-only repos are omitted, since the badge
    is an actionable indicator. The PR affordance and state chip are viewer-scoped
    (`viewerDidAuthor` / `viewerLatestReview` / `viewerLatestReviewRequest`): a PR
    you authored keeps the arrow and reads an outstanding review as someone else's
@@ -185,9 +186,11 @@ session-less `github.refresh` cover every session and prune vanished ones:
    info tone and turns a review GitHub still has pending on them (a request on
    `viewerLatestReviewRequest`, so a dismissed review is not one) into a warn eye,
    "awaiting your review" -- the request wins even when a review was already
-   submitted, since a re-request asks for a new position, but a changes-requested
-   state outranks it so another reviewer's blocker is never hidden; with nothing
-   outstanding, a review you already submitted is labelled as yours ("approved by
+   submitted, since a re-request asks for a new position, and it ranks above CI and
+   unresolved-comment signals; only a merge conflict, merge-queue membership and a
+   changes-requested state outrank it, so another reviewer's blocker is never
+   hidden. With nothing outstanding, a review you already submitted is labelled as
+   yours ("approved by
    you")), a `row-column`
    (`{text, tone, tooltip, sort_value?, filter_values?}`, or `{}` to clear -- one deterministic
    words summary of the session's most-urgent PR signal so the list is scannable
