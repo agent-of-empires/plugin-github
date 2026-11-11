@@ -1266,6 +1266,24 @@ def test_suggestions_refresh_republishes_checks_once(monkeypatch):
     assert order == ["checks", "suggestions"]
 
 
+def test_a_refresh_arriving_during_the_checks_stays_pending(monkeypatch):
+    runtime = main.Runtime(send=lambda _m: None)
+    order = []
+
+    def publish():
+        order.append("checks")
+        if order.count("checks") == 1:
+            runtime.handle_inbound({"jsonrpc": "2.0", "method": "suggestions.refresh"})
+
+    monkeypatch.setattr(runtime, "_publish_checks", publish)
+    monkeypatch.setattr(runtime, "_refresh_suggestions", lambda: order.append("suggestions"))
+    runtime.handle_inbound({"jsonrpc": "2.0", "method": "suggestions.refresh"})
+    runtime._service_ticks()
+    assert runtime._suggestions_refresh_due
+    runtime._service_ticks()
+    assert order == ["checks", "suggestions", "checks", "suggestions"]
+
+
 def test_network_tick_does_not_republish_checks(monkeypatch):
     runtime = main.Runtime(send=lambda _m: None)
     runtime._next_network = 0.0
