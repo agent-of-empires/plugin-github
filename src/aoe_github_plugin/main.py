@@ -266,6 +266,8 @@ class Runtime:
         self._ignore_bot_approval_recommendations = False
         self._ignored_commenters = graphql.parse_ignored_commenters(DEFAULT_IGNORED_COMMENTERS)
         self._next_network: float | None = None
+        # Own deadline: session refreshes re-arm the network tick and must not postpone discovery.
+        self._next_suggestions: float | None = None
         self._next_poll: float | None = None
         self._suggestions_refresh_due = False
         self._checks_due = False
@@ -665,6 +667,12 @@ class Runtime:
         if self._next_network is not None:
             self._next_network = time.monotonic() + self._interval + _network_jitter(self._interval)
 
+    def _run_suggestions(self) -> None:
+        self._refresh_suggestions()
+        # Re-arm only after discovery: a slow one must not leave the deadline in the past.
+        if self._next_suggestions is not None:
+            self._next_suggestions = time.monotonic() + self._interval + _network_jitter(self._interval)
+
     def _enabled_criteria(self) -> set[str] | None:
         """Criteria the host left on, or ``None`` when it did not answer. Silence
         must never read as "all on": a disabled criterion may not cost a request."""
@@ -768,7 +776,6 @@ class Runtime:
     def _service_ticks(self) -> None:
         """Run whichever refresh is due: an inbound github.refresh, a fast local
         tick that noticed a session change, or the slower network tick."""
-        suggestions_ran = False
         if self._suggestions_refresh_due:
             # A refresh or a sources change: the checks depend on both the enabled
             # sources and the scope settings, so they must not outlive them.
@@ -778,8 +785,7 @@ class Runtime:
             self._publish_checks()
         if self._suggestions_refresh_due:
             self._suggestions_refresh_due = False
-            suggestions_ran = True
-            self._refresh_suggestions()
+            self._run_suggestions()
         now = time.monotonic()
         if self.refresh_due:
             self.refresh_due = False
@@ -795,10 +801,9 @@ class Runtime:
             self._next_poll = now + SESSION_POLL_SECS
         if self._next_network is not None and now >= self._next_network:
             self.run_refresh()
-            if not suggestions_ran:
-                self._refresh_suggestions()
-            # Re-arm only after both: a slow discovery must not leave the deadline in the past.
             self._rearm_network()
+        if self._next_suggestions is not None and now >= self._next_suggestions:
+            self._run_suggestions()
 
     def run(self) -> None:
         threading.Thread(target=self._read_stdin, daemon=True).start()
@@ -828,9 +833,10 @@ class Runtime:
         # slower network tick catches external PR/state changes.
         now = time.monotonic()
         self._next_network = now + self._interval + _network_jitter(self._interval) if self._interval > 0 else None
+        self._next_suggestions = now + self._interval + _network_jitter(self._interval) if self._interval > 0 else None
         self._next_poll = now + SESSION_POLL_SECS if self._interval > 0 else None
         while not self.stopped:
-            wakes = [t for t in (self._next_network, self._next_poll) if t is not None]
+            wakes = [t for t in (self._next_network, self._next_suggestions, self._next_poll) if t is not None]
             timeout = max(0.0, min(wakes) - time.monotonic()) if wakes else None
             try:
                 item = self.inbox.get(timeout=timeout)
