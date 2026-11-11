@@ -1147,17 +1147,27 @@ def test_rate_limited_gate_skips_settings_and_project_reads(monkeypatch):
     assert sent[-1]["method"] == "suggestions.error"
 
 
-def test_network_tick_rearms_only_after_discovery_finishes(monkeypatch):
+def test_suggestions_tick_rearms_only_after_discovery_finishes(monkeypatch):
     runtime = main.Runtime(send=lambda _m: None)
     runtime._interval = 120
-    runtime._next_network = time.monotonic() - 1
+    runtime._next_suggestions = time.monotonic() - 1
     seen = []
-    monkeypatch.setattr(runtime, "run_refresh", lambda *_a, **_k: None)
-    monkeypatch.setattr(runtime, "_refresh_suggestions", lambda: seen.append(runtime._next_network))
+    monkeypatch.setattr(runtime, "_refresh_suggestions", lambda: seen.append(runtime._next_suggestions))
     runtime._service_ticks()
     assert len(seen) == 1
     assert seen[0] < time.monotonic()  # still the old, due deadline while discovery runs
+    assert runtime._next_suggestions > time.monotonic() + 60
+
+
+def test_session_refresh_does_not_postpone_the_suggestions_deadline(monkeypatch):
+    runtime = main.Runtime(send=lambda _m: None)
+    runtime._interval = 120
+    runtime._next_network = time.monotonic() + 1
+    runtime._next_suggestions = deadline = time.monotonic() + 1
+    monkeypatch.setattr(runtime, "run_refresh", lambda *_a, **_k: None)
+    runtime._refresh_and_reset(force=True)
     assert runtime._next_network > time.monotonic() + 60
+    assert runtime._next_suggestions == deadline
 
 
 def test_a_host_refresh_and_a_network_tick_together_run_discovery_once(monkeypatch):
