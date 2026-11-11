@@ -776,15 +776,17 @@ class Runtime:
     def _service_ticks(self) -> None:
         """Run whichever refresh is due: an inbound github.refresh, a fast local
         tick that noticed a session change, or the slower network tick."""
-        if self._suggestions_refresh_due:
+        # Take the flag before the checks run: a notification that arrives while they do stays pending.
+        suggestions_due = self._suggestions_refresh_due
+        self._suggestions_refresh_due = False
+        if suggestions_due:
             # A refresh or a sources change: the checks depend on both the enabled
             # sources and the scope settings, so they must not outlive them.
             self._checks_due = True
         if self._checks_due:
             self._checks_due = False
             self._publish_checks()
-        if self._suggestions_refresh_due:
-            self._suggestions_refresh_due = False
+        if suggestions_due:
             self._run_suggestions()
         now = time.monotonic()
         if self.refresh_due:
