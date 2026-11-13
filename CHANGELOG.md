@@ -8,6 +8,11 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Features
 
+- **suggestions:** Publish host-managed suggested sessions for nine GitHub criteria (changes requested, review requested, re-review, review thread replies, merge conflicts, failing checks, mentions, assigned issues, new issues). The worker asks the host which criteria are on and makes no GitHub request for a disabled one. Requires AoE 1.23.0+ (SDK API 21).
+- **suggestions:** Add the `suggestion_repositories`, `suggestion_organizations` and `suggestion_limit` settings; `new_issues` falls back to the repositories of your registered projects from `projects.list`. Items carry a `mapping_key` (the lowercased `owner/repo`) and AoE's suggestion mappings (agent-of-empires#4912) choose the project, so there is no plugin-side project setting.
+- **suggestions:** Add the `suggestion_ignore` setting: a comma-separated list of organizations (`acme`) and repositories (`acme/widgets`) that never produce suggestions, for every criterion. Case-insensitive, wins over both allowlists, and also excluded in the GitHub searches with `-org:`/`-repo:` qualifiers where they fit.
+- **suggestions:** Send a short `source_ref` such as `acme/widgets#123` for AoE to show on suggestion rows, with `suggestion_ref_org`, `suggestion_ref_repo` and `suggestion_ref_number` to choose its parts.
+- **suggestions:** Report setup checks to the host (`gh` installed, signed in, repositories readable, notifications scope) at startup, on the host's recheck and on every suggestions refresh, with a one-line fix for each failing check.
 - **discovery:** Use `gh pr view` as an optional source of additional PR destinations while retaining configured-remote branch matching; cache results between refreshes and respect GitHub backoff.
 
 ### Bug Fixes
@@ -18,6 +23,8 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **pull request:** Read PRs fetched by number through the same shared node fragment as branch pages, so review, issue, and workflow fields no longer arrive partial: a requested-changes review older than the head commit now reads "pushed since review" instead of "changes requested".
 - **refresh:** Read a checkout's remotes through the bounded git helper, so a stalled mount or held git lock cannot block a refresh worker and stall the whole tick.
 - **discovery:** Resolve a crowded destination page from the owner-scoped REST probe: when a fresh probe names the owned open PRs and the bounded page omits some, fetch those by number instead of paying serial identity discovery that a heavily used branch name can exhaust for good, and never treat a cache-served probe during REST backoff as a census. Unresolved detail fetches and rate limits cool the key on the short retry window while the long window stays for a page that is certain to truncate again, which needs this tick's live probe: a page bound reached while the probe served a cache entry cools short as well. The digest tier arms that cooldown when ownership stays unproven, and a promotion reuses the digest pass's detail nodes instead of fetching the same PR twice in one tick (#130).
+- **suggestions:** Follow `hasNextPage` for review threads and status check contexts on authored PRs (up to 10 pages of 100 each) so `review_thread_reply` and `ci_failed` no longer miss matches past the first page; a larger PR reports `suggestions.error` instead of a partial result.
+- **suggestions:** Build each draft prompt from fixed text and lead it with the untrusted-content notice; reviewer logins, check names and commit SHAs stay in `reason` and `variables`, never in the prompt prose.
 
 ## [2.4.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.4.0) - 2026-11-03
 
