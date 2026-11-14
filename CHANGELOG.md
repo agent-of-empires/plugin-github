@@ -4,22 +4,25 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
-## Unreleased
+## [2.5.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.5.0) - 2026-11-13
 
-### Features
 
-- **discovery:** Use `gh pr view` as an optional source of additional PR destinations while retaining configured-remote branch matching; cache results between refreshes and respect GitHub backoff.
 
 ### Bug Fixes
 
-- **discovery:** Find upstream-targeting PRs from fork checkouts in web snapshots and direct-worker status/open handlers, using the GitHub remotes each checkout configures (no metadata or fork-lineage calls). The permitted head is always the checkout's own repo (upstream is only a destination), so unrelated same-name branches are rejected; caches, PR selection, and stack navigation stay destination-aware, and destination GraphQL pages are bounded to a single page with owner-scoped REST fallback (#129).
-- **discovery:** Treat an error-envelope discovery response as unknown rather than an empty census: a 200 carrying `RATE_LIMITED` or any other `errors`, or a missing repository connection, now serves the fallback instead of caching "no owned PRs". Discovery's `rateLimit` spend is recorded and a rate-limited envelope arms the shared GraphQL gate.
-- **discovery:** Reuse a *completed* digest ownership result when a key promotes to the full query: ownership depends only on destination and branch, so a crowded page no longer pays a second serial lookup, and owned PRs missing from that page are still fetched by number. Truncated lookups prove nothing and are never handed over, so those still resolve separately.
-- **pull request:** Read PRs fetched by number through the same shared node fragment as branch pages, so review, issue, and workflow fields no longer arrive partial: a requested-changes review older than the head commit now reads "pushed since review" instead of "changes requested".
-- **refresh:** Read a checkout's remotes through the bounded git helper, so a stalled mount or held git lock cannot block a refresh worker and stall the whole tick.
-- **discovery:** Resolve a crowded destination page from the owner-scoped REST probe: when a fresh probe names the owned open PRs and the bounded page omits some, fetch those by number instead of paying serial identity discovery that a heavily used branch name can exhaust for good, and never treat a cache-served probe during REST backoff as a census. Unresolved detail fetches and rate limits cool the key on the short retry window while the long window stays for a page that is certain to truncate again, which needs this tick's live probe: a page bound reached while the probe served a cache entry cools short as well. The digest tier arms that cooldown when ownership stays unproven, and a promotion reuses the digest pass's detail nodes instead of fetching the same PR twice in one tick (#130).
+- **sessions:** Keep snoozed rows' PR state, opt-in in [#143](https://github.com/agent-of-empires/plugin-github/pull/143) by [@athal7](https://github.com/athal7) ([`608435d`](https://github.com/agent-of-empires/plugin-github/commit/608435da12d0dc7c5695605594a5dbad003c9e33))
+- **discovery:** Find upstream pull requests from fork checkouts in [#130](https://github.com/agent-of-empires/plugin-github/pull/130) by [@athal7](https://github.com/athal7) ([`d17ea36`](https://github.com/agent-of-empires/plugin-github/commit/d17ea361e60c1044b08e72e0f1eb7ba954d7e470))
 
+
+### Features
+
+- **github:** Supplement PR discovery with gh in [#147](https://github.com/agent-of-empires/plugin-github/pull/147) by [@athal7](https://github.com/athal7) ([`b020512`](https://github.com/agent-of-empires/plugin-github/commit/b02051236e8674f7b3b3b2711d1b5b759716aae9))
+- **uistate:** Show one role-aware state glyph per PR in [#146](https://github.com/agent-of-empires/plugin-github/pull/146) by [@athal7](https://github.com/athal7) ([`9960371`](https://github.com/agent-of-empires/plugin-github/commit/9960371d35f0d2149c03b211a7dac79978c68413))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.4.0...v2.5.0
 ## [2.4.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.4.0) - 2026-11-03
+
 
 
 ### Bug Fixes
@@ -281,3 +284,6 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - Multi-session multi-repo GitHub UI refresh (+ manifest/worker fixes) in [#6](https://github.com/agent-of-empires/plugin-github/pull/6) by [@Seluj78](https://github.com/Seluj78) ([`352a981`](https://github.com/agent-of-empires/plugin-github/commit/352a981eca8473059dbc4f171f2570d70b28b07d))
 - Dockable pane slot, fresh-on-session-change, and a Refresh button in [#7](https://github.com/agent-of-empires/plugin-github/pull/7) by [@Seluj78](https://github.com/Seluj78) ([`795c6d3`](https://github.com/agent-of-empires/plugin-github/commit/795c6d367f5e81be0bf32aa3aff63c639cff8e27))
 - **pane:** Rich per-PR state (merged/review/CI/comments) via token-gated GraphQL in [#13](https://github.com/agent-of-empires/plugin-github/pull/13) by [@Seluj78](https://github.com/Seluj78) ([`4b66d82`](https://github.com/agent-of-empires/plugin-github/commit/4b66d8212709a4dca18185f35e78db490ea5fc04))
+
+
+
