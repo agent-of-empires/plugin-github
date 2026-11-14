@@ -21,9 +21,9 @@ version = "2.5.0"
 # bodies on `section`, `disabled` / `variant` / `href` actions, and the
 # pane-level `footer`. A host older than 12 rejects this manifest outright,
 # which is the intent: it would render the pane as a bare list of rows with no
-# verdict, no diff, and no way to switch PRs. 21 adds host-managed suggested
+# verdict, no diff, and no way to switch PRs. 22 adds host-managed suggested
 # sessions (the `[suggestions]` block below).
-api_version = 21
+api_version = 22
 # Host-app compatibility range (different axis from api_version, which is the
 # manifest-schema version). The host refuses install/update outside this range
 # and skips loading if a later aoe upgrade moves out of it. Requires api_version
@@ -379,7 +379,7 @@ platforms = ["linux", "macos"]
 command = [".aoe-build/venv/bin/pip", "install", "."]
 platforms = ["linux", "macos"]
 
-# Suggested sessions (api_version 20). Each source is one criterion the host
+# Suggested sessions (api_version 22). Each source is one criterion the host
 # can switch off per profile; the worker asks `suggestions.sources` before every
 # discovery and never queries GitHub for a criterion that is off. Variables are
 # the `{name}` placeholders a user can put in a prompt template for that
