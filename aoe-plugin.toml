@@ -58,8 +58,8 @@ icon_asset = "assets/icon.png"
 #   notifications - the worker raises in-app notices via the `ui.notify` host
 #                   RPC: on a user-initiated refresh that is rate-limited it
 #                   warns the user, with the reset countdown (#20).
-# All are in aoe_plugin_api::KNOWN_CAPABILITIES. Add later as the surface grows:
-#   session.read  to correlate PRs/issues with active sessions
+# All are in aoe_plugin_api::KNOWN_CAPABILITIES. Also requested:
+#   session.read  - correlates PRs/issues with active sessions
 #   browser_open  - the `open_pr` command opens the active session's PR href
 #                   (already published into the row-badge slot) in the user's
 #                   browser; the host gates a command's browser-opening action
