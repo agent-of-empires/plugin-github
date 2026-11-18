@@ -55,7 +55,7 @@ def parse_owner_repo(remote_url: str) -> tuple[str, str] | None:
     path = next((url[len(p) :] for p in prefixes if url.startswith(p)), None)
     if path is None:
         return None
-    path = path.removesuffix(".git")
+    path = path.rstrip("/").removesuffix(".git")
     parts = path.split("/")
     if len(parts) != 2 or not parts[0] or not parts[1]:
         return None

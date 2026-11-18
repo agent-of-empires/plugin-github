@@ -26,6 +26,11 @@ def test_https_with_git_suffix():
     assert parse_owner_repo("https://github.com/owner/repo.git") == ("owner", "repo")
 
 
+def test_https_trailing_slash():
+    assert parse_owner_repo("https://github.com/owner/repo/") == ("owner", "repo")
+    assert parse_owner_repo("https://github.com/owner/repo.git/") == ("owner", "repo")
+
+
 def test_ssh_protocol_form():
     assert parse_owner_repo("ssh://git@github.com/owner/repo.git") == ("owner", "repo")
 
