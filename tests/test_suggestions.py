@@ -172,6 +172,30 @@ def test_review_requested_builds_item_with_variables_and_untrusted_prompt():
     assert "project" not in item
 
 
+def test_review_requested_reason_does_not_repeat_the_provider_name():
+    items = _discover(FakeClient({" review-requested:@me": [_pr()]}), {"review_requested"})
+    assert items[0]["reason"] == "Review requested"
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("feat(x): Add widget", "Review: Add widget"),
+        ("fix: Crash on start", "Review: Crash on start"),
+        ("chore(deps)!: Bump foo", "Review: Bump foo"),
+        ("Fix: widget", "Review: widget"),
+        ("Fix widget: handle nil", "Review: Fix widget: handle nil"),
+        ("Update: docs", "Review: Update: docs"),
+        ("feat: ", "Review: feat: "),
+    ],
+)
+def test_draft_title_drops_a_conventional_commit_prefix(title, expected):
+    client = FakeClient({" review-requested:@me": [_pr(title=title)]})
+    items = _discover(client, {"review_requested"})
+    assert items[0]["draft"]["title"] == expected
+    assert items[0]["title"] == title
+
+
 @pytest.mark.parametrize(
     ("off", "needle"),
     [
