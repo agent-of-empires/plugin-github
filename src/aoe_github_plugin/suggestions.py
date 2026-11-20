@@ -546,8 +546,8 @@ def _viewer_login(client: GitHubClient) -> str:
     return login
 
 
-def _draft_title(verb: str, title: str) -> str:
-    return f"{verb}: {_COMMIT_PREFIX_RE.sub('', title)}"
+def _draft_title(title: str) -> str:
+    return _COMMIT_PREFIX_RE.sub("", title)
 
 
 def _review_side(
@@ -572,7 +572,7 @@ def _review_side(
                 timestamp=pr.get("updatedAt"),
                 reason="Review requested",
                 variables=_pr_variables(pr),
-                draft_title=_draft_title("Review", title),
+                draft_title=_draft_title(title),
                 prompt=f"Review https://github.com/{repo}/pull/{number} and address the review request.",
             )
     if "re_review" in enabled:
@@ -599,7 +599,7 @@ def _review_side(
                 timestamp=pr.get("updatedAt"),
                 reason="New commits since your last review",
                 variables={**_pr_variables(complete), "reviewed_commit_sha": reviewed},
-                draft_title=_draft_title("Re-review", title),
+                draft_title=_draft_title(title),
                 prompt=(
                     f"Re-review https://github.com/{repo}/pull/{number}: "
                     "new commits were pushed since your last review."
@@ -672,7 +672,7 @@ def _authored(
                 timestamp=pr.get("updatedAt"),
                 reason=reason,
                 variables={**_pr_variables(complete), **extra},
-                draft_title=_draft_title("Address", title),
+                draft_title=_draft_title(title),
                 prompt=(
                     f"On https://github.com/{repo}/pull/{number}: "
                     + "; ".join(_AUTHORED_PROMPT[criterion] for criterion, _ in matched)
@@ -750,7 +750,7 @@ def _mentions(
                 timestamp=notification.get("updated_at"),
                 reason="You were mentioned" if notification.get("reason") == "mention" else "Your team was mentioned",
                 variables={"number": str(number), "kind": kind, "comment_url": comment_url},
-                draft_title=_draft_title("Reply", title),
+                draft_title=_draft_title(title),
                 prompt=(
                     f"Read the latest comments on https://github.com/{repo}/{'pull' if kind == 'pr' else 'issues'}"
                     f"/{number} where you were mentioned and prepare a response or a fix."
@@ -781,7 +781,7 @@ def _issue_items(criterion: str, issues: list[dict[str, Any]], *, reason: str, v
                 timestamp=issue.get("createdAt") if criterion == "new_issues" else issue.get("updatedAt"),
                 reason=reason,
                 variables=_issue_variables(issue),
-                draft_title=_draft_title(verb, title),
+                draft_title=_draft_title(title),
                 prompt=f"{verb} https://github.com/{repo}/issues/{number} and propose a fix plan.",
             )
         )

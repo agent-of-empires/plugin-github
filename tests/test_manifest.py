@@ -22,6 +22,14 @@ PER_SESSION_SLOTS = {"row-badge", "row-column", "pane", "detail-badge"}
 ALLOWED_MODIFIERS = {"ctrl", "control", "shift"}
 
 
+SCOPE_COPY = {
+    "suggestion_organizations": ("Only these organizations", "Leave empty for your Projects' repos."),
+    "suggestion_repositories": ("Only these repos", "Like acme/widgets. Leave empty for all."),
+    "suggestion_ignore": ("Never suggest from", "Organizations or repos. Wins over the two lists above."),
+    "suggestion_limit": ("Keep up to", "Suggestions from GitHub at a time."),
+}
+
+
 def _manifest() -> dict:
     return tomlkit.parse(MANIFEST.read_text()).unwrap()
 
@@ -101,6 +109,11 @@ def test_icon_requires_api_version_7():
 
 def test_suggestion_projects_setting_is_gone():
     assert "suggestion_projects" not in {setting["key"] for setting in _manifest()["settings"]}
+
+
+def test_scope_settings_use_the_plain_labels_and_help():
+    settings = {setting["key"]: setting for setting in _manifest()["settings"]}
+    assert {key: (s["label"], s["description"]) for key, s in settings.items() if key in SCOPE_COPY} == SCOPE_COPY
 
 
 def test_the_plugin_id_stays_stable():
