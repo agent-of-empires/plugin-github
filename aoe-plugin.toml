@@ -140,24 +140,24 @@ advanced = true
 
 [[settings]]
 key = "suggestion_repositories"
-label = "GitHub suggestion repositories"
-description = "Optional comma-separated owner/repo allowlist. When both this and the organization allowlist are empty, searches cover every repository you can see and new issues come from your registered projects' repositories. When only organizations are set, searches cover those organizations, new issues included."
+label = "Only these repos"
+description = "Like acme/widgets. Leave empty for all."
 type = "string"
 default = ""
 advanced = true
 
 [[settings]]
 key = "suggestion_organizations"
-label = "GitHub suggestion organizations"
-description = "Optional comma-separated organization allowlist, combined with the repository allowlist. When set, new issues come from these organizations instead of your registered projects' repositories."
+label = "Only these organizations"
+description = "Leave empty for your Projects' repos."
 type = "string"
 default = ""
 advanced = true
 
 [[settings]]
 key = "suggestion_ignore"
-label = "Ignored GitHub suggestion sources"
-description = "Optional comma-separated list of organizations (acme) and repositories (acme/widgets) that never produce suggestions, for every criterion. Case-insensitive. Wins over both allowlists: an ignored repository stays hidden even when its organization or the repository itself is allowlisted."
+label = "Never suggest from"
+description = "Organizations or repos. Wins over the two lists above."
 type = "string"
 default = ""
 advanced = true
@@ -188,8 +188,8 @@ advanced = true
 
 [[settings]]
 key = "suggestion_limit"
-label = "Maximum GitHub suggestions"
-description = "Maximum suggestions retained in the provider snapshot."
+label = "Keep up to"
+description = "Suggestions from GitHub at a time."
 type = "integer"
 default = 100
 min = 1

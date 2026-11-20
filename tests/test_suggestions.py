@@ -180,16 +180,16 @@ def test_review_requested_reason_does_not_repeat_the_provider_name():
 @pytest.mark.parametrize(
     ("title", "expected"),
     [
-        ("feat(x): Add widget", "Review: Add widget"),
-        ("fix: Crash on start", "Review: Crash on start"),
-        ("chore(deps)!: Bump foo", "Review: Bump foo"),
-        ("Fix: widget", "Review: widget"),
-        ("Fix widget: handle nil", "Review: Fix widget: handle nil"),
-        ("Update: docs", "Review: Update: docs"),
-        ("feat: ", "Review: feat: "),
+        ("feat(x): Add widget", "Add widget"),
+        ("fix: Crash on start", "Crash on start"),
+        ("chore(deps)!: Bump foo", "Bump foo"),
+        ("Fix: widget", "widget"),
+        ("Fix widget: handle nil", "Fix widget: handle nil"),
+        ("Update: docs", "Update: docs"),
+        ("feat: ", "feat: "),
     ],
 )
-def test_draft_title_drops_a_conventional_commit_prefix(title, expected):
+def test_draft_title_is_the_plain_title_without_a_commit_prefix(title, expected):
     client = FakeClient({" review-requested:@me": [_pr(title=title)]})
     items = _discover(client, {"review_requested"})
     assert items[0]["draft"]["title"] == expected
