@@ -128,10 +128,17 @@ session-less `github.refresh` cover every session and prune vanished ones:
    child submodules are skipped by default; turn off `ignore_submodules` to
    include them.
 3. Resolve each checkout's origin and branch, then look for PRs targeting origin
-   or any other trusted remote on the same GitHub host that checkout configures (an `upstream` remote, a
-   differently named one, or several). Destinations come only from configured
-   remotes: there is no metadata call and no fork-network or arbitrary remote
-   search, so a fork-of-fork needs its middle remote configured to be visible.
+   or any other configured trusted remote on the same GitHub host (an `upstream` remote, a
+   differently named one, or several). When all remotes use public
+   GitHub, `gh pr view` also supplies the destination of the checkout's open PR.
+   This optional lookup pins `GH_HOST` to `github.com` and excludes enterprise
+   token variables. Enterprise and mixed-host checkouts use configured remotes.
+   If `gh` is unavailable
+   or cannot resolve a PR, discovery uses configured remotes. Refresh and direct
+   handlers share a bounded cache of successful results per checkout and branch
+   for five minutes and cool down failed lookups.
+   Refresh reuses the last-good result during GitHub backoff; a forced refresh
+   retries outside backoff.
    The head is always the checkout's own origin
    repository; a configured upstream is only an additional destination, so a
    contributor's PR against upstream matches while an otherwise unrelated
@@ -169,18 +176,31 @@ session-less `github.refresh` cover every session and prune vanished ones:
    query, the proof is carried across, so a key costs one full query rather than
    a full query plus a separate ownership-discovery query.
 4. Push one global `sort-key`, six global `filter-facet`s (below), and three `ui.state.set` per session: a `row-badge` (`{items: [...]}` -- a
-   chip sequence per open PR: a clickable PR icon, a merge-conflict chip when the
-   PR conflicts with its base, a merge-queue status/position chip when queued, then
-   review-state, CI-rollup, and unresolved-comment chips, each shown only when a
+   chip sequence per open PR: a clickable PR icon, then at most one state chip for
+   the PR's most-urgent signal (a merge-queue status/position, a merge conflict,
+   changes requested, failing CI, unresolved comments, ...), shown only when a
    token supplies that field, concatenated across the workspace's repos, plus an error marker per failed
-   repo. Each chip is colored by tone, so failing CI / changes requested read as
-   danger, unresolved comments as warn, and a healthy PR as success,
-   distinguishing a broken PR from a healthy one at a glance; with
+   repo. One state chip rather than one per signal keeps a row scannable; the pane
+   keeps the full breakdown. Each chip is colored by tone, so failing CI / changes
+   requested read as danger, unresolved comments as warn, and a healthy PR as
+   success, distinguishing a broken PR from a healthy one at a glance; with
    `dense_row_badge_glyphs` on, each chip also carries a single-character mark so
    the terminal has something to paint where it has no icons (off by default); a
-   draft shows the PR
-   chip alone and merged-only repos are omitted, since the badge is an actionable
-   indicator), a `row-column`
+   draft shows the PR chip alone (unless it is queued or conflicted, which outrank
+   it) and merged-only repos are omitted, since the badge
+   is an actionable indicator. The PR affordance and state chip are viewer-scoped
+   (`viewerDidAuthor` / `viewerLatestReview` / `viewerLatestReviewRequest`): a PR
+   you authored keeps the arrow and reads an outstanding review as someone else's
+   move (a clock), while a PR you are reviewing takes the plain PR glyph in an
+   info tone and turns a review GitHub still has pending on them (a request on
+   `viewerLatestReviewRequest`, so a dismissed review is not one) into a warn eye,
+   "awaiting your review" -- the request wins even when a review was already
+   submitted, since a re-request asks for a new position, and it ranks above CI and
+   unresolved-comment signals; only a merge conflict, merge-queue membership and a
+   changes-requested state outrank it, so another reviewer's blocker is never
+   hidden. With nothing outstanding, a review you already submitted is labelled as
+   yours ("approved by
+   you")), a `row-column`
    (`{text, tone, tooltip, sort_value?, filter_values?}`, or `{}` to clear -- one deterministic
    words summary of the session's most-urgent PR signal so the list is scannable
    without hovering the badge; a multi-repo workspace collapses to its single
@@ -301,9 +321,12 @@ The pane is one-PR-focused, and reads top to bottom:
 1. **PR selector.** Every PR in the session plus any additional members of its
    GitHub-native stacks, most-actionable first (the same attention ladder the
    session row uses, with merged PRs sinking below every open one). Each row
-   carries `#number`, the title, `branch · author`, and a glyph strip for CI /
-   review / conflicts / merge-queue state and position / unresolved-comment
-   count. Clicking a row fires `github.select_pr { pr }`; the trailing arrow is a
+   carries `#number`, the title, `branch · author`, and a single glyph for the
+   PR's most-urgent state (or the unresolved-comment count), kept to one so a run
+   of rows reads at a glance. The row icon and that glyph follow the viewer's role
+   the same way the session badge does (plain/info + an eye while a review is still
+   requested of you, unless changes were requested). Clicking a row fires
+   `github.select_pr { pr }`; the trailing arrow is a
    separate link to GitHub, so picking a PR never navigates away or changes a
    checkout. The selection is remembered in memory per session, and falls back
    to the top of the list whenever the PR it named is no longer in the snapshot
@@ -416,7 +439,8 @@ status column live for the moment you unsnooze it.
 The `dense_row_badge_glyphs` setting (off by default) turns the row into marks:
 every badge chip gains its own one-character mark (`⇄` open PR, `◌` draft, `⊘`
 conflict, `✓` approved, `◷` partially approved, `✗` changes requested, `↻` pushed
-since review, `❝` commented, `⧗` awaiting review, `✔`/`✘` CI passing/failing, `~`
+since review, `❝` commented, `⧗` awaiting review, `◉` a review requested of you,
+`✔`/`✘` CI passing/failing, `~`
 CI running, `⇨` CI queued, `?` CI unknown, `⇉` merge queue, `✉` unresolved
 comments, `!` error) and the status words are dropped, so a session row reads as
 marks instead of titles. No two chips share a mark, so a lone mark still names its
@@ -498,8 +522,9 @@ export GH_ENTERPRISE_TOKEN=<token>
 
 Enterprise environment tokens are ignored without a matching `GH_HOST`; every
 other server uses its own stored gh credentials. `GH_TOKEN`/`GITHUB_TOKEN` only
-apply to github.com. The gh subprocess does not inherit any of these four token
-variables, so it cannot accidentally reuse a shared token for another server.
+apply to github.com. Stored-token lookup with `gh auth token` does not inherit
+any of these four token variables, so it cannot reuse an environment token for
+another server.
 Tokens resolve on each refresh and never enter persisted snapshots.
 
 Host names are lowercase with a trailing dot removed. HTTPS, scp-style SSH, and

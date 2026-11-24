@@ -67,6 +67,14 @@ fragment PRNode on PullRequest {
     mergeQueue { url }
     baseRefName additions deletions changedFiles
     author { login }
+    # Viewer-scoped, so the pane can tell "my PR" from "a PR I'm reviewing"
+    # without a second query for the viewer's login. ``viewerDidAuthor`` is a
+    # plain boolean; the two review fields are nullable object fields
+    # (``PullRequestReview`` / ``ReviewRequest``), so their presence alone answers
+    # "am I on the hook for this review".
+    viewerDidAuthor
+    viewerLatestReview { state }
+    viewerLatestReviewRequest { id }
     baseRef { branchProtectionRule {
       requiresStatusChecks
       requiredStatusCheckContexts
@@ -906,6 +914,46 @@ def review_summary(people: list[dict[str, str]]) -> str:
     return f"{len(people)} pending"
 
 
+def viewer_role(pr: dict[str, Any]) -> str | None:
+    """``"author"`` when the viewer opened the PR, ``"reviewer"`` when they have
+    reviewed it or been asked to (a direct or team review request both surface
+    here), else ``None``. A dismissed review is not a position -- GitHub removed
+    it and the viewer has no standing on the PR unless asked again -- so it does
+    not make them a reviewer on its own.
+
+    ``None`` when the snapshot carries no viewer information (the no-token REST
+    shape, or a PR the viewer neither wrote nor was asked to review), so callers
+    keep their role-neutral rendering instead of guessing from the author login.
+    """
+    if pr.get("viewerDidAuthor") is True:
+        return "author"
+    if isinstance(pr.get("viewerLatestReviewRequest"), dict):
+        return "reviewer"
+    review = pr.get("viewerLatestReview")
+    if isinstance(review, dict) and str(review.get("state") or "").upper() != "DISMISSED":
+        return "reviewer"
+    return None
+
+
+def viewer_review(pr: dict[str, Any]) -> str | None:
+    """Where the viewer's own review stands: ``approved`` / ``changes-requested``
+    / ``commented`` / ``pending``, or ``None`` when they have not reviewed it.
+    ``pending`` is GitHub's unsubmitted draft review, which is not a position on
+    the PR."""
+    review = pr.get("viewerLatestReview")
+    if not isinstance(review, dict):
+        return None
+    return _REVIEW_NODE_STATE.get(review.get("state") or "", "pending")
+
+
+def viewer_review_requested(pr: dict[str, Any]) -> bool:
+    """True when GitHub is still asking the viewer for a review. A dismissed
+    review leaves ``viewerLatestReview`` as ``DISMISSED`` without asking again, so
+    the request -- not the absence of a submitted position -- is what makes a
+    review outstanding for this viewer."""
+    return isinstance(pr.get("viewerLatestReviewRequest"), dict)
+
+
 def diff_summary(pr: dict[str, Any]) -> dict[str, int] | None:
     """``{"added", "removed", "files"}`` for the PR, or ``None`` when GitHub did
     not report them (the no-token REST shape, or a drifted response)."""
@@ -1030,6 +1078,9 @@ def _normalize_pull(
         "checks": check_summary(pr, required_checks_only=required_checks_only),
         "comments": comment_summary(pr),
         "author": (pr.get("author") or {}).get("login") or "",
+        "viewer_role": viewer_role(pr),
+        "viewer_review": viewer_review(pr),
+        "viewer_review_requested": viewer_review_requested(pr),
         "base": pr.get("baseRefName"),
         "reviewers": people,
         "head_approved": head_approved(pr),

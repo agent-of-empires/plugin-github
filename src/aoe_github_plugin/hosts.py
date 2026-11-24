@@ -104,7 +104,7 @@ def remote_parts(url: str) -> tuple[str, str, str] | None:
         name = canonical_hostname(authority)
     except ValueError:
         return None
-    parts = path.removesuffix(".git").split("/")
+    parts = path.rstrip("/").removesuffix(".git").split("/")
     if name is None or len(parts) != 2 or any(p in (".", "..") or not _REPO_PART.fullmatch(p) for p in parts):
         return None
     return name, parts[0], parts[1]

@@ -551,6 +551,11 @@ def test_build_query_aliases_each_branch_with_variables():
     assert "pageInfo { hasNextPage endCursor }" in q
     assert "mergeQueueEntry { position state }" in q
     assert "mergeQueue { url }" in q
+    # Viewer-scoped role fields ride on the same node, so the UI never needs a
+    # second query for "who am I here".
+    assert "viewerDidAuthor" in q
+    assert "viewerLatestReview { state }" in q
+    assert "viewerLatestReviewRequest" in q
 
 
 def test_build_query_single_alias_is_just_one_branch():
@@ -728,6 +733,53 @@ def test_reviewers_merge_latest_reviews_with_outstanding_requests():
     assert graphql.reviewers(stale) == [{"name": "jules", "state": "changes-pushed"}]
     # Total: a malformed PR yields no reviewers rather than raising.
     assert graphql.reviewers({}) == []
+
+
+def test_viewer_role_tells_my_pr_from_one_im_reviewing():
+    assert graphql.viewer_role({"viewerDidAuthor": True}) == "author"
+    # Authorship wins even after the viewer has also reviewed their own PR.
+    assert graphql.viewer_role({"viewerDidAuthor": True, "viewerLatestReview": {"state": "APPROVED"}}) == "author"
+    # A submitted review or an outstanding request (direct or team) makes a reviewer.
+    assert graphql.viewer_role({"viewerLatestReview": {"state": "CHANGES_REQUESTED"}}) == "reviewer"
+    assert graphql.viewer_role({"viewerLatestReviewRequest": {"id": "r1"}}) == "reviewer"
+    # A dismissed review is not a position: without a fresh request it makes nobody
+    # a reviewer, so the PR keeps its role-neutral glyph instead of "reviewing".
+    assert graphql.viewer_role({"viewerLatestReview": {"state": "DISMISSED"}}) is None
+    assert (
+        graphql.viewer_role({"viewerLatestReview": {"state": "DISMISSED"}, "viewerLatestReviewRequest": {"id": "r1"}})
+        == "reviewer"
+    )
+    # The no-token REST shape (and a PR the viewer has no stake in) stays roleless.
+    assert graphql.viewer_role({}) is None
+    assert graphql.viewer_role({"viewerDidAuthor": False, "viewerLatestReview": None}) is None
+
+
+def test_viewer_review_maps_the_viewers_own_position():
+    assert graphql.viewer_review({"viewerLatestReview": {"state": "APPROVED"}}) == "approved"
+    assert graphql.viewer_review({"viewerLatestReview": {"state": "CHANGES_REQUESTED"}}) == "changes-requested"
+    assert graphql.viewer_review({"viewerLatestReview": {"state": "COMMENTED"}}) == "commented"
+    # An unsubmitted draft review is not a position on the PR.
+    assert graphql.viewer_review({"viewerLatestReview": {"state": "PENDING"}}) == "pending"
+    assert graphql.viewer_review({"viewerLatestReview": None}) is None
+    assert graphql.viewer_review({}) is None
+
+
+def test_viewer_review_requested_needs_an_actual_request():
+    assert graphql.viewer_review_requested({"viewerLatestReviewRequest": {"id": "r1"}}) is True
+    # A dismissed review is no longer a request: the viewer owes nothing here.
+    assert graphql.viewer_review_requested({"viewerLatestReview": {"state": "DISMISSED"}}) is False
+    assert graphql.viewer_review_requested({"viewerLatestReviewRequest": None}) is False
+    assert graphql.viewer_review_requested({}) is False
+
+
+def test_normalize_pull_carries_the_viewer_role():
+    pr = _pr(decision="APPROVED")
+    pr["viewerDidAuthor"] = False
+    pr["viewerLatestReviewRequest"] = {"id": "r1"}
+    out = graphql.normalize_connection(_conn(pr))[0]
+    assert out["viewer_role"] == "reviewer"
+    assert out["viewer_review"] is None
+    assert out["viewer_review_requested"] is True
 
 
 def test_review_summary_reads_the_way_github_does():

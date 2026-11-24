@@ -21,6 +21,7 @@ from aoe_github_plugin.auth import SystemEnvironment
 from aoe_github_plugin.auth import resolve_token
 from aoe_github_plugin.hosts import GitHubHost
 from aoe_github_plugin.hosts import discover_trusted_hosts
+from aoe_github_plugin.utils import gh_cache
 from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import GitHubAuthError
@@ -81,6 +82,9 @@ def github_status(
             remotes = [
                 (owner, repo) for remote_host, owner, repo in remote_owner_repos(path, hosts) if remote_host == host
             ]
+            destination = gh_cache.destination(path, branch) if host.kind == "dotcom" else None
+            if destination is not None:
+                remotes.append(destination)
             repos = lookup.repositories((owner, repo), remotes)
             pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         result["pulls"] = pulls
@@ -123,6 +127,9 @@ def github_open(
             remotes = [
                 (owner, repo) for remote_host, owner, repo in remote_owner_repos(path, hosts) if remote_host == host
             ]
+            destination = gh_cache.destination(path, branch) if host.kind == "dotcom" else None
+            if destination is not None:
+                remotes.append(destination)
             repos = lookup.repositories((owner, repo), remotes)
             pulls = lookup.open_pulls(client, lookup.pull_keys(repos, branch))
         if pulls:

@@ -5,8 +5,12 @@ import sys
 import json
 import subprocess
 
+import httpx
+import pytest
+
 from aoe_github_plugin import main
 from aoe_github_plugin.auth import TokenEnvironment
+from aoe_github_plugin.client import GitHubClient
 
 
 def _run(*lines):
@@ -859,3 +863,87 @@ def test_session_topology_changes_with_worktree_path():
         return main.Runtime._session_topology([{"id": "s1", "project_path": "/ws", "workspace_repos": [repo]}])
 
     assert topology("/ws/a") != topology("/ws/other")
+
+
+@pytest.mark.parametrize("host", ["github.com", "gh.corp"])
+def test_rpc_status_and_open_keep_cli_discovery_on_public_github(tmp_path, monkeypatch, host):
+    subprocess.run(["git", "init", "-q", "-b", "feature", str(tmp_path)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+        check=True,
+    )
+    for name, repo in (("origin", "alice/r"), ("upstream", "upstream/r")):
+        subprocess.run(["git", "-C", str(tmp_path), "remote", "add", name, f"https://{host}/{repo}.git"], check=True)
+
+    class Env(TokenEnvironment):
+        def gh_config_hosts(self):
+            return ["gh.corp"]
+
+        def env_var(self, key):
+            return {"GH_TOKEN": "public-token", "GH_HOST": "gh.corp", "GH_ENTERPRISE_TOKEN": "enterprise-token"}.get(
+                key
+            )
+
+        def gh_available(self):
+            return False
+
+    cli_calls = []
+    monkeypatch.setattr(
+        main.handlers.gh_cache, "gh_pr_repository", lambda path: cli_calls.append(path) or ("supplement", "r")
+    )
+    requests = []
+    destination = "supplement" if host == "github.com" else "upstream"
+    prefix = "" if host == "github.com" else "/api/v3"
+    url = f"https://{host}/{destination}/r/pull/7"
+
+    def respond(request):
+        requests.append(request)
+        assert request.url.host == ("api.github.com" if host == "github.com" else host)
+        assert request.headers["Authorization"] == (
+            "Bearer public-token" if host == "github.com" else "Bearer enterprise-token"
+        )
+        assert request.url.params["head"] == "alice:feature"
+        pulls = [
+            {
+                "number": 7,
+                "html_url": url,
+                "title": "upstream change",
+                "state": "open",
+                "draft": False,
+                "head": {"ref": "feature", "repo": {"name": "r", "owner": {"login": "alice"}}},
+            }
+        ]
+        return httpx.Response(200, json=pulls if request.url.path == f"{prefix}/repos/{destination}/r/pulls" else [])
+
+    def client(**kwargs):
+        return GitHubClient(**{**kwargs, "transport": httpx.MockTransport(respond)})
+
+    monkeypatch.setattr(main.handlers, "GitHubClient", client)
+    sent = []
+    runtime = main.Runtime(send=sent.append, env=Env())
+    for request_id, method in ((10, "github.status"), (11, "github.open")):
+        runtime.handle_inbound(
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": {"args": {"path": str(tmp_path)}}}
+        )
+    replies = {message["id"]: message for message in sent}
+    assert replies[10]["result"]["pulls"], replies
+    assert replies[10]["result"]["pulls"][0]["url"] == url
+    assert replies[10]["result"]["summary"] == f"{destination}/r: PR #7 open for feature"
+    assert replies[10]["result"]["host"] == host
+    assert replies[11]["result"] == {"url": url, "kind": "pull"}
+    assert cli_calls == ([str(tmp_path)] if host == "github.com" else [])
+    if host != "github.com":
+        assert all("/supplement/" not in request.url.path for request in requests)

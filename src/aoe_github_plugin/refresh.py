@@ -57,12 +57,14 @@ from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.auth import SystemEnvironment
 from aoe_github_plugin.hosts import GitHubHost
 from aoe_github_plugin.hosts import discover_trusted_hosts
+from aoe_github_plugin.utils import gh_cache
 from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import GitHubError
 from aoe_github_plugin.errors import NotFoundError
 from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.handlers import _resolve_optional_token
 from aoe_github_plugin.utils.gitctx import parse_owner_repo
+from aoe_github_plugin.utils.gitctx import checkout_environment
 
 _LOG = logging.getLogger(__name__)
 
@@ -291,6 +293,7 @@ def _git(path: str, *args: str) -> str | None:
     try:
         proc = subprocess.run(
             ["git", "-C", path, *args],
+            env=checkout_environment(),
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT,
@@ -1956,8 +1959,18 @@ class _Resolved:
     remotes: list[tuple[str, str]]
 
 
+def _gh_destination(path: str, branch: str, *, host: str, force: bool) -> tuple[str, str] | None:
+    """Share public destination discovery while respecting per-host backoff."""
+    if host != "github.com":
+        return None
+    now = time.monotonic()
+    with _cache_lock:
+        blocked = any(now < _backoff[host][kind]["until"] for kind in _BACKOFF_KINDS)
+    return gh_cache.destination(path, branch, force=force, blocked=blocked)
+
+
 def _resolve_checkouts(
-    sessions: list[dict[str, Any]], settings: SnapshotSettings, trusted: dict[str, GitHubHost]
+    sessions: list[dict[str, Any]], settings: SnapshotSettings, trusted: dict[str, GitHubHost], *, force: bool = False
 ) -> tuple[
     list[tuple[dict[str, Any], list[tuple[str, str | None]]]],
     dict[tuple[str, str | None], tuple[str | None, str | None, CheckoutKey | None]],
@@ -1978,7 +1991,12 @@ def _resolve_checkouts(
         """Identity and remotes for one checkout, read once in the shared pool."""
         (path, branch), checkout = item
         host, repo, key = _identify(checkout, trusted, branch)
-        return _Resolved((path, branch), host, repo, key, _remote_repos(checkout, trusted, host))
+        remotes = _remote_repos(checkout, trusted, host)
+        if branch is None and key is not None:
+            destination = _gh_destination(checkout, key[3], host=key[0], force=force)
+            if destination is not None and destination not in remotes:
+                remotes.append(destination)
+        return _Resolved((path, branch), host, repo, key, remotes)
 
     with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
         per_session = list(zip(sessions, pool.map(_discover, sessions), strict=True))
@@ -2028,7 +2046,7 @@ def build_snapshot(  # noqa: PLR0913 - explicit environment, host, transport and
     """
 
     trusted = trusted if trusted is not None else discover_trusted_hosts(env or SystemEnvironment())
-    per_session, ident, destinations = _resolve_checkouts(sessions, settings, trusted)
+    per_session, ident, destinations = _resolve_checkouts(sessions, settings, trusted, force=force)
     fetched, auth_present = _fetch_all(
         destinations,
         env,
