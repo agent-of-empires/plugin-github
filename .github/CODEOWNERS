@@ -1,0 +1,4 @@
+# Code owners for agent-of-empires/plugin-github. Any member's approval satisfies code
+# owner review. Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+*       @agent-of-empires/maintainers
