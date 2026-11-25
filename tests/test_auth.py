@@ -10,6 +10,7 @@ from aoe_github_plugin import errors
 from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.auth import SystemEnvironment
 from aoe_github_plugin.auth import resolve_token
+from aoe_github_plugin.hosts import GitHubHost
 
 
 class FakeEnv(TokenEnvironment):
@@ -27,7 +28,7 @@ class FakeEnv(TokenEnvironment):
     def gh_available(self):
         return self._gh_available
 
-    def gh_auth_token(self):
+    def gh_auth_token(self, hostname="github.com"):
         if self._gh_result is None:
             raise AssertionError("gh_auth_token consulted unexpectedly")
         if isinstance(self._gh_result, Exception):
@@ -123,3 +124,81 @@ def test_gh_not_authenticated_hint_says_login_not_install():
     assert "gh auth login" in msg
     assert "brew install" not in msg
     assert "install the GitHub CLI" not in msg
+
+
+def test_gh_token_precedes_github_token():
+    assert resolve_token(FakeEnv(github_token="old", gh_token="preferred")) == ("preferred", "env:GH_TOKEN")
+
+
+class MultiHostEnv(TokenEnvironment):
+    def __init__(self, variables=None):
+        self.variables = variables or {}
+        self.lookups = []
+
+    def env_var(self, key):
+        return self.variables.get(key)
+
+    def gh_available(self):
+        return True
+
+    def gh_auth_token(self, hostname="github.com"):
+        self.lookups.append(hostname)
+        return True, f"stored-{hostname}", ""
+
+
+def test_enterprise_env_token_is_bound_to_one_host():
+
+    env = MultiHostEnv({"GH_ENTERPRISE_TOKEN": "only-a", "GH_HOST": "A.Corp.", "GH_TOKEN": "public"})
+    assert resolve_token(env, GitHubHost.enterprise("a.corp")) == ("only-a", "env:GH_ENTERPRISE_TOKEN")
+    assert resolve_token(env, GitHubHost.enterprise("b.corp")) == ("stored-b.corp", "gh-cli")
+    assert resolve_token(env, GitHubHost.dotcom()) == ("public", "env:GH_TOKEN")
+    assert env.lookups == ["b.corp"]
+
+
+def test_unbound_enterprise_env_token_never_broadcasts():
+
+    env = MultiHostEnv({"GH_ENTERPRISE_TOKEN": "unbound"})
+    for name in ("a.corp", "b.corp"):
+        assert resolve_token(env, GitHubHost.enterprise(name)) == (f"stored-{name}", "gh-cli")
+
+
+def test_system_gh_fallback_strips_token_env_and_passes_hostname(monkeypatch):
+    for key in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+        monkeypatch.setenv(key, "secret")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/fixture-config")
+
+    def run(argv, **kwargs):
+        assert argv == ["gh", "auth", "token", "--hostname", "b.corp"]
+        assert not any(
+            k in kwargs["env"] for k in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+        )
+        assert kwargs["env"]["GH_CONFIG_DIR"] == "/fixture-config"
+        return subprocess.CompletedProcess(argv, 0, "stored-b", "")
+
+    monkeypatch.setattr(auth.subprocess, "run", run)
+    assert SystemEnvironment().gh_auth_token("b.corp") == (True, "stored-b", "")
+
+
+@pytest.mark.parametrize(
+    "error", [errors.NoTokenNoGhError, errors.GhNotAuthenticatedError, errors.GhReturnedEmptyTokenError]
+)
+def test_enterprise_auth_hints(error):
+    message = str(error(GitHubHost.enterprise("gh.corp")))
+    assert "gh auth login --hostname gh.corp" in message
+    assert "GH_HOST=gh.corp" in message
+    assert "GH_ENTERPRISE_TOKEN" in message
+
+
+def test_failed_helper_cannot_echo_credentials_into_hints():
+    env = FakeEnv(gh_available=True, gh_result=(False, "", "secret-credential"))
+    with pytest.raises(errors.GhCommandFailedError) as exc:
+        resolve_token(env)
+    assert "secret-credential" not in str(exc.value)
+
+
+def test_unauthorized_hint_replaces_the_higher_priority_token():
+    env = FakeEnv(gh_token="stale", github_token="replacement")
+    assert resolve_token(env) == ("stale", "env:GH_TOKEN")
+    message = str(errors.UnauthorizedError())
+    assert "export GH_TOKEN=<token>" in message
+    assert "overrides GITHUB_TOKEN" in message
