@@ -268,6 +268,11 @@ def _data(envelope: dict[str, Any]) -> dict[str, Any]:
     rate = data.get("rateLimit")
     if isinstance(rate, dict):
         refresh.note_graphql_rate_limit(rate)
+        remaining = rate.get("remaining")
+        # The reserve is shared with session refreshes: below it, stop spending and wait for the reset.
+        if isinstance(remaining, int) and remaining < refresh.RATELIMIT_FLOOR:
+            refresh.arm_backoff("graphql", rate.get("resetAt"))
+            raise RateLimitedError
     return data
 
 

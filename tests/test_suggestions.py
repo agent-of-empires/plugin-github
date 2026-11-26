@@ -1057,6 +1057,27 @@ def test_items_carry_a_lowercased_repo_mapping_key_and_no_project_hint():
     assert "project" not in item
 
 
+def test_a_response_below_the_shared_reserve_arms_the_gate_and_stops_discovery(monkeypatch):
+    armed = []
+    monkeypatch.setattr(refresh, "arm_backoff", lambda api, reset_at=None: armed.append((api, reset_at)))
+    below = {
+        "data": {
+            "rateLimit": {"remaining": refresh.RATELIMIT_FLOOR - 1, "resetAt": "2026-10-30T12:00:00Z"},
+            "search": {"nodes": [_issue()], "pageInfo": {"hasNextPage": True, "endCursor": "next"}},
+        }
+    }
+    calls = []
+
+    def pages(variables):
+        calls.append(variables["after"])
+        return below
+
+    with pytest.raises(RateLimitedError):
+        _discover(FakeClient({"assignee:@me": pages}), {"assigned_issues"})
+    assert calls == [None]  # no continuation page after the reserve is crossed
+    assert armed == [("graphql", "2026-10-30T12:00:00Z")]
+
+
 def test_graphql_rate_limited_envelope_arms_the_gate_with_its_reset(monkeypatch):
     armed = []
     monkeypatch.setattr(
