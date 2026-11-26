@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 import time
 import hashlib
+import logging
 import contextlib
 from typing import Any
 from datetime import datetime
@@ -270,7 +271,8 @@ def _data(envelope: dict[str, Any]) -> dict[str, Any]:
 
 
 def _search(client: GitHubClient, document: str, query: str) -> list[dict[str, Any]]:
-    """A fully paginated search, or a raise; never a partial result."""
+    """Every page of a search up to ``MAX_PAGES``. A bigger result keeps its first pages and
+    logs, so one noisy search cannot take every other source down with it."""
     nodes: list[dict[str, Any]] = []
     cursor: str | None = None
     for _ in range(MAX_PAGES):
@@ -284,7 +286,8 @@ def _search(client: GitHubClient, document: str, query: str) -> list[dict[str, A
         cursor = info.get("endCursor")
         if not isinstance(cursor, str):
             raise TypeError("GitHub returned an invalid search cursor")
-    raise RuntimeError("GitHub search exceeded the complete pagination limit")
+    logging.getLogger(__name__).warning("GitHub search matched more than %d results; keeping the first", len(nodes))
+    return nodes
 
 
 def _search_scoped(

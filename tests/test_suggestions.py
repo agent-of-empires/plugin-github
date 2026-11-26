@@ -668,12 +668,19 @@ def test_a_304_on_the_first_page_still_rereads_the_later_pages():
     assert len(_discover(client, {"mentioned"})) == suggestions.NOTIFICATIONS_PER_PAGE
 
 
-def test_search_pagination_cap_rejects_incomplete_snapshot():
+def test_a_search_past_the_page_cap_keeps_the_first_pages_and_other_sources_still_run(caplog):
+    calls = []
+
     def pages(variables):
+        calls.append(variables["after"])
         return {"data": {"search": {"nodes": [_issue()], "pageInfo": {"hasNextPage": True, "endCursor": "next"}}}}
 
-    with pytest.raises(RuntimeError, match="pagination limit"):
-        _discover(FakeClient({"assignee:@me": pages}), {"assigned_issues"})
+    client = FakeClient({"assignee:@me": pages, "review-requested:@me": [_pr()]})
+    with caplog.at_level("WARNING"):
+        items = _discover(client, {"assigned_issues", "review_requested"})
+    assert len(calls) == suggestions.MAX_PAGES
+    assert {item["criterion"] for item in items} == {"assigned_issues", "review_requested"}
+    assert "keeping the first" in caplog.text
 
 
 def test_graphql_errors_never_yield_a_partial_snapshot():

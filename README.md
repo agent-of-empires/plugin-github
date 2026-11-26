@@ -101,12 +101,12 @@ its parts (`widgets#123` without the owner); with all three off it stays whole.
 A long allowlist is split across several searches, each within GitHub's 256-character query limit.
 
 Discovery runs at startup, on the host's `suggestions.refresh`, and on the
-`ui_refresh_secs` tick. Searches and review histories are fetched to
-completion (10 pages of 50, 10 pages of 100 reviews, review threads and check
-contexts per PR); exceeding a cap, a
-GraphQL error, or a rate limit reports `suggestions.error`, and the host keeps
-its last good snapshot. The notification inbox is read newest first and stops
-after 500 entries. A rate limit arms the plugin's shared backoff gate for the
+`ui_refresh_secs` tick. A search keeps its first 10 pages of 50 results and
+logs when there are more. Review histories (10 pages of 100 reviews), review
+threads and check contexts per PR are fetched to completion; exceeding one of
+those caps, a GraphQL error, or a rate limit reports `suggestions.error`, and
+the host keeps its last good snapshot. The notification inbox is read newest
+first and stops after 500 entries. A rate limit arms the plugin's shared backoff gate for the
 affected budget (GraphQL searches or REST notifications), so the next refresh
 waits for it to reset. Dismissing a `mentioned` item in AoE does not mark the
 GitHub notification read.
