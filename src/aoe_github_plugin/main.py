@@ -706,11 +706,14 @@ class Runtime:
 
     def _project_repos(self) -> set[str]:
         """``owner/repo`` of each registered project, from the host's project
-        list and each checkout's origin. Fail-soft: no host answer, no repos."""
+        list and each checkout's origin. No host answer raises: an unknown project scope
+        must not read as an empty one and drop the last good ``new_issues``."""
         result = self.call_host(PROJECTS_LIST, {})
         projects = result.get("projects") if isinstance(result, dict) else None
+        if not isinstance(projects, list):
+            raise TypeError("The host did not report the registered projects")
         repos: set[str] = set()
-        for project in projects if isinstance(projects, list) else []:
+        for project in projects:
             path = project.get("path") if isinstance(project, dict) else None
             repo = refresh.checkout_repo(path) if isinstance(path, str) and path else None
             if repo:

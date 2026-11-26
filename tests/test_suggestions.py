@@ -682,6 +682,17 @@ def _host(sources=None, projects=None, settings=None, calls=None, set_result=Non
     return call_host
 
 
+def test_a_failed_project_lookup_keeps_the_last_snapshot(monkeypatch):
+    sent = []
+    runtime = main.Runtime(send=sent.append)
+    runtime.call_host = _host(
+        sources={"sources": [{"criterion": "new_issues", "enabled": True}]}, projects=None, settings={}
+    )
+    monkeypatch.setattr(suggestions, "fetch_suggestions", lambda **_kw: pytest.fail("discovery ran"))
+    runtime._refresh_suggestions()
+    assert [m["method"] for m in sent] == ["suggestions.error"]
+
+
 def test_runtime_passes_host_enabled_criteria_and_project_repos(monkeypatch, tmp_path):
     checkout = tmp_path / "widgets"
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
