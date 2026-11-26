@@ -23,7 +23,7 @@ class FakeEnv(TokenEnvironment):
     def gh_available(self):
         return self.gh
 
-    def gh_auth_token(self):
+    def gh_auth_token(self, host):
         state, token = self.gh_token
         return state == "ok", token, "" if state == "ok" else "no oauth token found"
 

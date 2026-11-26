@@ -1004,7 +1004,9 @@ def test_items_carry_a_lowercased_repo_mapping_key_and_no_project_hint():
 
 def test_graphql_rate_limited_envelope_arms_the_gate_with_its_reset(monkeypatch):
     armed = []
-    monkeypatch.setattr(refresh, "_set_backoff", lambda api, reset_at=None: armed.append((api, reset_at)))
+    monkeypatch.setattr(
+        refresh, "_set_backoff", lambda api, reset_at=None, *, host: armed.append((api, reset_at, host))
+    )
 
     def limited(variables):
         return {
@@ -1014,7 +1016,7 @@ def test_graphql_rate_limited_envelope_arms_the_gate_with_its_reset(monkeypatch)
 
     with pytest.raises(RateLimitedError):
         _discover(FakeClient({"assignee:@me": limited}), {"assigned_issues"})
-    assert armed == [("graphql", "2026-10-30T12:00:00Z")]
+    assert armed == [("graphql", "2026-10-30T12:00:00Z", "github.com")]
 
 
 @pytest.mark.parametrize("criterion", suggestions.AUTHORED_CRITERIA)
