@@ -684,11 +684,13 @@ def _authored(
 
 
 def _notifications(client: GitHubClient) -> list[dict[str, Any]]:
-    """Every unread notification, replayed from cache when GitHub answers 304."""
+    """Every unread notification. A 304 validates only page one, so it replays that page and
+    reads the later ones again: reading an older notification does not change page one."""
     params = {"per_page": str(NOTIFICATIONS_PER_PAGE), "page": "1"}
     status, etag, page = client.get_json_conditional("/notifications", params, etag=_notifications_cache["etag"])
     if status == 304:
-        return list(_notifications_cache["items"])
+        etag = _notifications_cache["etag"]
+        page = _notifications_cache["items"][:NOTIFICATIONS_PER_PAGE]
     if not isinstance(page, list):
         raise TypeError("GitHub returned invalid notifications")
     notifications = list(page)

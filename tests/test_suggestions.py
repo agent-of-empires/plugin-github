@@ -644,6 +644,30 @@ def test_search_reports_rate_limit_spend(monkeypatch):
     assert seen == [{"cost": 1, "remaining": 4000}]
 
 
+def test_a_304_on_the_first_page_still_rereads_the_later_pages():
+    def note(number):
+        return _notification(
+            subject={
+                "type": "Issue",
+                "title": f"t{number}",
+                "url": f"https://api.github.com/repos/acme/widgets/issues/{number}",
+            }
+        )
+
+    class Inbox(FakeClient):
+        def get_json(self, path, params=None):
+            if path.startswith("/notifications"):
+                return self.later if params["page"] == "2" else []
+            return super().get_json(path, params)
+
+    client = Inbox(notifications=[note(n) for n in range(1, suggestions.NOTIFICATIONS_PER_PAGE + 1)])
+    client.later = [note(99)]
+    assert len(_discover(client, {"mentioned"})) == suggestions.NOTIFICATIONS_PER_PAGE + 1
+    client.notifications_status = 304
+    client.later = []  # the older notification was read; page one did not change
+    assert len(_discover(client, {"mentioned"})) == suggestions.NOTIFICATIONS_PER_PAGE
+
+
 def test_search_pagination_cap_rejects_incomplete_snapshot():
     def pages(variables):
         return {"data": {"search": {"nodes": [_issue()], "pageInfo": {"hasNextPage": True, "endCursor": "next"}}}}
