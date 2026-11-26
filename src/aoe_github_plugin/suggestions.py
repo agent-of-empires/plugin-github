@@ -741,8 +741,9 @@ def _mentions(
             if latest not in _comment_cache and previews < MAX_MENTION_PREVIEWS:
                 previews += 1
                 entry = ("", "")
-                # A deleted comment must not blank the snapshot; rate limits still propagate.
-                with contextlib.suppress(NotFoundError):
+                # The preview is optional: a deleted or access-restricted comment (a 403 such as SAML
+                # enforcement) must not blank the snapshot; rate limits still propagate.
+                with contextlib.suppress(NotFoundError, InsufficientScopeError):
                     comment = client.get_json(latest)
                     if isinstance(comment, dict):
                         entry = (str(comment.get("body") or ""), str(comment.get("html_url") or ""))

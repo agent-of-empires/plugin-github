@@ -911,6 +911,28 @@ def test_a_token_without_the_notifications_scope_only_loses_mentions(caplog):
     assert "notifications" in caplog.text
 
 
+def test_a_denied_comment_preview_keeps_every_mention():
+    class SamlBlocked(FakeClient):
+        def get_json(self, path, params=None):
+            if "/comments/" in path:
+                raise InsufficientScopeError("saml")
+            return super().get_json(path, params)
+
+    def note(number):
+        return _notification(
+            subject={
+                "type": "Issue",
+                "title": f"t{number}",
+                "url": f"https://api.github.com/repos/acme/widgets/issues/{number}",
+                "latest_comment_url": f"https://api.github.com/repos/acme/widgets/issues/comments/{number}",
+            }
+        )
+
+    items = _discover(SamlBlocked(notifications=[note(1), note(2)]), {"mentioned"})
+    assert len(items) == 2
+    assert all(item["preview"] == "" for item in items)
+
+
 def test_mentions_rate_limit_arms_the_rest_gate_only(monkeypatch):
     armed = []
     monkeypatch.setattr(refresh, "arm_backoff", lambda api, _reset_at=None: armed.append(api))
