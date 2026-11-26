@@ -13,6 +13,7 @@ from aoe_github_plugin import refresh
 from aoe_github_plugin import suggestions
 from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import RateLimitedError
+from aoe_github_plugin.errors import InsufficientScopeError
 
 ALL = set(suggestions.CRITERIA)
 PAGE_DONE = {"hasNextPage": False, "endCursor": None}
@@ -881,6 +882,18 @@ def test_worker_round_trip_queries_only_enabled_sources(monkeypatch, tmp_path):
     assert snapshots[0][0]["source_ref"] == "acme/widgets#7"
     assert queries == ["is:open is:issue assignee:@me repo:acme/widgets"]
     assert not [message for message in sent if message.get("method") == "suggestions.error"]
+
+
+def test_a_token_without_the_notifications_scope_only_loses_mentions(caplog):
+    class NoScope(FakeClient):
+        def get_json_conditional(self, path, params=None, etag=None):
+            raise InsufficientScopeError("notifications")
+
+    client = NoScope({"assignee:@me": [_issue()], "review-requested:@me": [_pr()]})
+    with caplog.at_level("WARNING"):
+        items = _discover(client, {"mentioned", "assigned_issues", "review_requested"})
+    assert {item["criterion"] for item in items} == {"assigned_issues", "review_requested"}
+    assert "notifications" in caplog.text
 
 
 def test_mentions_rate_limit_arms_the_rest_gate_only(monkeypatch):

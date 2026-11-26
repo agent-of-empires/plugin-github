@@ -30,6 +30,7 @@ from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import NotFoundError
 from aoe_github_plugin.errors import GitHubAuthError
 from aoe_github_plugin.errors import RateLimitedError
+from aoe_github_plugin.errors import InsufficientScopeError
 
 MAX_PAGES = 10
 # ponytail: fixed 7-day window for new issues; make it a setting if anyone asks.
@@ -821,6 +822,9 @@ def _discover(  # noqa: PLR0913 - keyword-only scope plumbing
             # /notifications is REST; the searches draw on the separate GraphQL budget.
             refresh.arm_backoff("rest")
             raise RuntimeError(str(exc)) from exc
+        except InsufficientScopeError:
+            # A persistent, source-specific gap: the setup checks report it; the other sources still refresh.
+            logging.getLogger(__name__).warning("the token cannot read notifications; skipping mentions")
     if "assigned_issues" in enabled:
         issues = _search_scoped(client, _ISSUE_QUERY, "is:open is:issue assignee:@me", terms, excludes)
         items += _issue_items("assigned_issues", issues, reason="Assigned to you", verb="Work on")
