@@ -828,6 +828,14 @@ class Runtime:
         if self._next_suggestions is not None and now >= self._next_suggestions:
             self._run_suggestions()
 
+    def _wait_timeout(self) -> float | None:
+        """How long the loop may block on the inbox. A flag raised while an RPC was waiting
+        has no queued message to wake it, so pending work means no wait at all."""
+        if self._suggestions_refresh_due or self._checks_due:
+            return 0.0
+        wakes = [t for t in (self._next_network, self._next_suggestions, self._next_poll) if t is not None]
+        return max(0.0, min(wakes) - time.monotonic()) if wakes else None
+
     def run(self) -> None:
         threading.Thread(target=self._read_stdin, daemon=True).start()
         # Resolve chip-visibility settings before the first push so the startup
@@ -859,10 +867,8 @@ class Runtime:
         self._next_suggestions = now + self._interval + _network_jitter(self._interval) if self._interval > 0 else None
         self._next_poll = now + SESSION_POLL_SECS if self._interval > 0 else None
         while not self.stopped:
-            wakes = [t for t in (self._next_network, self._next_suggestions, self._next_poll) if t is not None]
-            timeout = max(0.0, min(wakes) - time.monotonic()) if wakes else None
             try:
-                item = self.inbox.get(timeout=timeout)
+                item = self.inbox.get(timeout=self._wait_timeout())
             except queue.Empty:
                 item = None
             if item is _EOF:

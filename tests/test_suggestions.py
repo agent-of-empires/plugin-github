@@ -1386,6 +1386,16 @@ def test_a_refresh_arriving_during_the_checks_stays_pending(monkeypatch):
     assert order == ["checks", "suggestions", "checks", "suggestions"]
 
 
+def test_pending_suggestion_work_means_no_wait_before_the_next_loop_turn():
+    runtime = main.Runtime(send=lambda _m: None)
+    assert runtime._wait_timeout() is None  # no timers, nothing pending: block on the inbox
+    runtime._suggestions_refresh_due = True
+    assert runtime._wait_timeout() == 0.0
+    runtime._suggestions_refresh_due = False
+    runtime._checks_due = True
+    assert runtime._wait_timeout() == 0.0
+
+
 def test_network_tick_does_not_republish_checks(monkeypatch):
     runtime = main.Runtime(send=lambda _m: None)
     runtime._next_network = 0.0
