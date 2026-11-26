@@ -4,35 +4,23 @@ All notable changes to the Agent of Empires GitHub plugin will be documented in 
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
-## [Unreleased]
+## [2.6.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.6.0) - 2026-11-26
 
-### Features
 
-- Support GitHub Enterprise Server alongside github.com, using hosts registered
-  in GitHub CLI's `hosts.yml` and isolated credentials, caches and rate limits.
-- **suggestions:** Publish host-managed suggested sessions for nine GitHub criteria (changes requested, review requested, re-review, review thread replies, merge conflicts, failing checks, mentions, assigned issues, new issues). The worker asks the host which criteria are on and makes no GitHub request for a disabled one. Requires AoE 1.24.0+ (SDK API 23).
-- **suggestions:** Add the `suggestion_repositories`, `suggestion_organizations` and `suggestion_limit` settings; `new_issues` falls back to the repositories of your registered projects from `projects.list`. Items carry a `mapping_key` (the lowercased `owner/repo`) and AoE's suggestion mappings (agent-of-empires#4912) choose the project, so there is no plugin-side project setting.
-- **suggestions:** Add the `suggestion_ignore` setting: a comma-separated list of organizations (`acme`) and repositories (`acme/widgets`) that never produce suggestions, for every criterion. Case-insensitive, wins over both allowlists, and also excluded in the GitHub searches with `-org:`/`-repo:` qualifiers where they fit.
-- **suggestions:** Send a short `source_ref` such as `acme/widgets#123` for AoE to show on suggestion rows, with `suggestion_ref_org`, `suggestion_ref_repo` and `suggestion_ref_number` to choose its parts.
-- **suggestions:** Report setup checks to the host (`gh` installed, signed in, repositories readable, notifications scope) at startup, on the host's recheck and on every suggestions refresh, with a one-line fix for each failing check.
 
 ### Bug Fixes
 
-- Rate-limit notifications are isolated per host; one server's active backoff
-  cannot suppress another server's notice.
-- **suggestions:** Follow `hasNextPage` for review threads and status check contexts on authored PRs (up to 10 pages of 100 each) so `review_thread_reply` and `ci_failed` no longer miss matches past the first page; a larger PR reports `suggestions.error` instead of a partial result.
-- **suggestions:** Build each draft prompt from fixed text and lead it with the untrusted-content notice; reviewer logins, check names and commit SHAs stay in `reason` and `variables`, never in the prompt prose.
+- **gitctx:** Accept trailing slash in GitHub remote URLs in [#152](https://github.com/agent-of-empires/plugin-github/pull/152) by [@Seluj78](https://github.com/Seluj78) ([`dd8b842`](https://github.com/agent-of-empires/plugin-github/commit/dd8b84254785a266ce9052f6cde0027ae99315cd))
 
-### Compatibility
 
-- On github.com, `GH_TOKEN` now takes precedence over `GITHUB_TOKEN`, matching
-  GitHub CLI. If both are set, the plugin uses `GH_TOKEN`.
-- Enterprise environment tokens require a matching `GH_HOST` and a server
-  registered in `hosts.yml`. They never apply to other servers.
-- The snapshot cache moves to version 2; the first refresh after upgrading
-  rebuilds the old cache.
+### Features
 
-## [2.5.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.5.0) - 2026-11-13
+- **github:** Add multi-host GitHub Enterprise Server support in [#90](https://github.com/agent-of-empires/plugin-github/pull/90) by [@edwardofclt](https://github.com/edwardofclt) ([`6de85ab`](https://github.com/agent-of-empires/plugin-github/commit/6de85abf21108fd6ec1cad8dad1339c59573c7a7))
+- **suggestions:** Add the GitHub suggestion provider in [#135](https://github.com/agent-of-empires/plugin-github/pull/135) by [@Seluj78](https://github.com/Seluj78) ([`d7243be`](https://github.com/agent-of-empires/plugin-github/commit/d7243be2191edd59555bcdce490f4e4de2a36ba3))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/plugin-github/compare/v2.5.0...v2.6.0
+## [2.5.0](https://github.com/agent-of-empires/plugin-github/releases/tag/v2.5.0) - 2026-11-14
 
 
 
@@ -312,3 +300,6 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - Multi-session multi-repo GitHub UI refresh (+ manifest/worker fixes) in [#6](https://github.com/agent-of-empires/plugin-github/pull/6) by [@Seluj78](https://github.com/Seluj78) ([`352a981`](https://github.com/agent-of-empires/plugin-github/commit/352a981eca8473059dbc4f171f2570d70b28b07d))
 - Dockable pane slot, fresh-on-session-change, and a Refresh button in [#7](https://github.com/agent-of-empires/plugin-github/pull/7) by [@Seluj78](https://github.com/Seluj78) ([`795c6d3`](https://github.com/agent-of-empires/plugin-github/commit/795c6d367f5e81be0bf32aa3aff63c639cff8e27))
 - **pane:** Rich per-PR state (merged/review/CI/comments) via token-gated GraphQL in [#13](https://github.com/agent-of-empires/plugin-github/pull/13) by [@Seluj78](https://github.com/Seluj78) ([`4b66d82`](https://github.com/agent-of-empires/plugin-github/commit/4b66d8212709a4dca18185f35e78db490ea5fc04))
+
+
+
