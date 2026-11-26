@@ -11,6 +11,7 @@ import tomlkit
 from aoe_github_plugin import main
 from aoe_github_plugin import refresh
 from aoe_github_plugin import suggestions
+from aoe_github_plugin.auth import TokenEnvironment
 from aoe_github_plugin.client import GitHubClient
 from aoe_github_plugin.errors import RateLimitedError
 from aoe_github_plugin.errors import InsufficientScopeError
@@ -725,6 +726,20 @@ def test_a_failed_project_lookup_keeps_the_last_snapshot(monkeypatch):
     assert [m["method"] for m in sent] == ["suggestions.error"]
 
 
+def test_suggestion_entry_points_use_the_runtimes_auth_environment(monkeypatch):
+    env = TokenEnvironment()
+    seen = {}
+    runtime = main.Runtime(send=lambda _m: None, env=env)
+    runtime.call_host = _host(
+        sources={"sources": [{"criterion": "mentioned", "enabled": True}]}, projects={"projects": []}, settings={}
+    )
+    monkeypatch.setattr(suggestions, "fetch_suggestions", lambda **kw: seen.setdefault("fetch", kw["env"]) and [])
+    monkeypatch.setattr(main.checks, "run_checks", lambda **kw: seen.setdefault("checks", kw["env"]) and [])
+    runtime._refresh_suggestions()
+    runtime._publish_checks()
+    assert seen == {"fetch": env, "checks": env}
+
+
 def test_runtime_passes_host_enabled_criteria_and_project_repos(monkeypatch, tmp_path):
     checkout = tmp_path / "widgets"
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
@@ -1302,7 +1317,7 @@ def test_publish_checks_passes_sources_and_scope_and_replaces_the_host_list(monk
 
     monkeypatch.setattr(main.checks, "run_checks", run_checks)
     runtime._publish_checks()
-    assert captured == {"mentioned_enabled": True, "repos_raw": "acme/widgets", "orgs_raw": "acme"}
+    assert captured == {"mentioned_enabled": True, "repos_raw": "acme/widgets", "orgs_raw": "acme", "env": runtime.env}
     assert calls[-1] == (main.SUGGESTIONS_CHECKS_SET, {"checks": [{"id": "x", "label": "X", "status": "ok"}]})
 
 

@@ -759,6 +759,7 @@ class Runtime:
                         settings["suggestion_ref_number"],
                     ),
                     project_repos=self._project_repos() if "new_issues" in enabled else set(),
+                    env=self.env,
                 )
         except Exception as exc:  # noqa: BLE001 - report failure, keep the host's last good snapshot
             self._send_suggestions(
@@ -785,6 +786,7 @@ class Runtime:
                 mentioned_enabled=None if enabled is None else "mentioned" in enabled,
                 repos_raw=settings["suggestion_repositories"],
                 orgs_raw=settings["suggestion_organizations"],
+                env=self.env,
             )
         except Exception as exc:  # noqa: BLE001 - a broken check run must still tell the user
             logging.getLogger(__name__).warning("setup checks failed", exc_info=True)
