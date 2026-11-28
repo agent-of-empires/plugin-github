@@ -64,6 +64,8 @@ PROJECTS_LIST = "projects.list"
 SUGGESTION_SETTING_KEYS = (
     "suggestion_repositories",
     "suggestion_organizations",
+    "suggestion_new_issue_repositories",
+    "suggestion_new_issue_organizations",
     "suggestion_ignore",
     "suggestion_limit",
     "suggestion_ref_org",
@@ -751,6 +753,8 @@ class Runtime:
                     enabled=enabled,
                     repos_raw=settings["suggestion_repositories"],
                     orgs_raw=settings["suggestion_organizations"],
+                    new_repos_raw=settings["suggestion_new_issue_repositories"],
+                    new_orgs_raw=settings["suggestion_new_issue_organizations"],
                     ignore_raw=settings["suggestion_ignore"],
                     limit_raw=settings["suggestion_limit"],
                     ref_parts=(

@@ -81,13 +81,22 @@ manifest lists them per criterion, and an authored-PR variable that did not
 match is an empty string.
 
 Scope: `suggestion_repositories` (comma-separated `owner/repo`) and
-`suggestion_organizations` restrict every criterion; empty means everything
-the token can see. `new_issues` needs a repository list: the allowlist or
-organizations when set, else the repositories of your registered AoE projects
-(read from each project's `origin` remote via the host's `projects.list`).
+`suggestion_organizations` restrict the personal criteria, i.e. every criterion
+except `new_issues`; empty means everything the token can see. The two lists are
+a union, and a repository entry never narrows an organization entry, so to scope
+to specific repositories list them in `suggestion_repositories` and leave
+`suggestion_organizations` empty.
+`new_issues` has its own pair, `suggestion_new_issue_repositories` and
+`suggestion_new_issue_organizations` (same grammar, same union), so narrowing it
+does not hide review requests, mentions, or assigned issues elsewhere. It
+resolves its scope in this order: the new-issue pair, then the general pair,
+then the repositories of your registered AoE projects (read from each project's
+`origin` remote via the host's `projects.list`). An empty list never means "no
+new issues": it means the next source in that order.
 `suggestion_ignore` (comma-separated organizations such as `acme` and
 repositories such as `acme/widgets`, case-insensitive) hides those sources from
-every criterion and wins over both allowlists. Searches also carry matching
+every criterion and wins over every allowlist above, the new-issue pair
+included. Searches also carry matching
 `-org:`/`-repo:` qualifiers, as many as fit GitHub's query limit, so ignored
 results do not use up the search budget.
 Each item carries a `mapping_key` (the lowercased `owner/repo`); the project an
@@ -115,9 +124,10 @@ Setup checks: at startup, on the host's `suggestions.checks.run` and on every
 `suggestions.refresh` (so a sources or scope change is never stale), the
 worker reports four checks with `suggestions.checks.set`: `gh` installed (only
 a warning when `GITHUB_TOKEN` or `GH_TOKEN` is set), signed in, the configured
-repositories and organizations visible to the token, and the token able to
-read notifications (ok as not needed while the `mentioned` source is off, a
-warning when the host does not say). Scope entries are checked 40 per GraphQL
+repositories and organizations (the general pair; the new-issue pair is not
+checked) visible to the token, and the token able to read notifications (ok as
+not needed while the `mentioned` source is off, a warning when the host does not
+say). Scope entries are checked 40 per GraphQL
 request, with the sign-in check riding on the first, up to 200 entries (so at
 most five requests; the rest is reported, not checked); an entry that fails the `owner/repo` grammar is ignored and reported. The
 notifications probe is `GET /notifications?per_page=1`. With no token nothing

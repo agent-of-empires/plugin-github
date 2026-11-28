@@ -229,6 +229,17 @@ def _queries(base: str, terms: list[str], excludes: tuple[str, ...] = ()) -> lis
     return queries
 
 
+def _new_issue_allowlists(
+    new_repos: set[str], new_orgs: set[str], repos: set[str], orgs: set[str]
+) -> tuple[set[str], set[str]]:
+    """The allowlists ``new_issues`` uses: its own pair when set, else the general pair.
+
+    The two lists in a pair are a union (a repo entry does not narrow an org entry),
+    and an empty pair leaves the source unrestricted, exactly like the general pair.
+    """
+    return (new_repos, new_orgs) if (new_repos or new_orgs) else (repos, orgs)
+
+
 def _in_scope(repo: str, repos: set[str], orgs: set[str], ignored: set[str] | None = None) -> bool:
     """Allowlisted (or no allowlist) and not ignored; an ignored org or repo always wins."""
     repo = repo.lower()
@@ -816,7 +827,11 @@ def _discover(  # noqa: PLR0913 - keyword-only scope plumbing
     orgs: set[str],
     project_repos: set[str],
     ignored: set[str] | None = None,
+    new_repos: set[str] | None = None,
+    new_orgs: set[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """Every enabled criterion's items. ``repos``/``orgs`` scope the personal
+    criteria; ``new_repos``/``new_orgs`` scope ``new_issues`` alone."""
     terms = _scope_terms(repos, orgs)
     excludes = _exclusion_terms(ignored or set())
     items = _authored(client, enabled, terms, excludes)
@@ -835,7 +850,8 @@ def _discover(  # noqa: PLR0913 - keyword-only scope plumbing
         issues = _search_scoped(client, _ISSUE_QUERY, "is:open is:issue assignee:@me", terms, excludes)
         items += _issue_items("assigned_issues", issues, reason="Assigned to you", verb="Work on")
     if "new_issues" in enabled:
-        new_terms = terms or [
+        # Its own allowlists, else the general pair, else the registered projects.
+        new_terms = _scope_terms(*_new_issue_allowlists(new_repos or set(), new_orgs or set(), repos, orgs)) or [
             f"repo:{repo}"
             for repo in sorted(project_repos)
             if REPO_RE.match(repo) and _in_scope(repo, set(), set(), ignored)
@@ -864,11 +880,16 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
     ref_parts: tuple[Any, Any, Any] = (True, True, True),
     project_repos: set[str] | None = None,
     env: TokenEnvironment | None = None,
+    new_repos_raw: Any = None,
+    new_orgs_raw: Any = None,
 ) -> list[dict[str, Any]]:
     """Fetch the enabled criteria only, ranked in provider order, deduplicated by source.
 
-    ``project_repos`` holds the ``owner/repo`` of the registered projects (from the
-    host's project list); ``new_issues`` searches them when no scope is configured.
+    ``new_repos_raw``/``new_orgs_raw`` scope ``new_issues`` on their own, so narrowing
+    it never hides a review request or a mention elsewhere; unset they fall back to
+    the general ``repos_raw``/``orgs_raw`` pair. ``project_repos`` holds the
+    ``owner/repo`` of the registered projects (from the host's project list);
+    ``new_issues`` searches them when neither allowlist is configured.
     Any rate-limit hit arms the shared backoff gate so the next refresh is skipped
     until the budget refills.
     """
@@ -877,6 +898,9 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
         return []
     repos = parse_csv(repos_raw, REPO_RE)
     orgs = parse_csv(orgs_raw, ORG_RE)
+    new_repos = parse_csv(new_repos_raw, REPO_RE)
+    new_orgs = parse_csv(new_orgs_raw, ORG_RE)
+    issue_repos, issue_orgs = _new_issue_allowlists(new_repos, new_orgs, repos, orgs)
     ignored = parse_csv(ignore_raw, IGNORE_RE)
     limit = (
         limit_raw if isinstance(limit_raw, int) and not isinstance(limit_raw, bool) and 1 <= limit_raw <= 500 else 100
@@ -895,13 +919,26 @@ def fetch_suggestions(  # noqa: PLR0913 - keyword-only settings plumbing
                 orgs=orgs,
                 project_repos=project_repos or set(),
                 ignored=ignored,
+                new_repos=new_repos,
+                new_orgs=new_orgs,
             )
     except RateLimitedError as exc:
         # A GraphQL rate-limit envelope already armed the gate with its exact reset; never shorten it.
         if time.monotonic() >= refresh.backoff_until("graphql"):
             refresh.arm_backoff("graphql")
         raise RuntimeError(str(exc)) from exc
-    items = [item for item in items if _in_scope(item["variables"]["repo"], repos, orgs, ignored)]
+    # ``new_issues`` is filtered by its own scope (the general pair when it has none);
+    # an empty scope means unrestricted, which is also the project-repositories path.
+    items = [
+        item
+        for item in items
+        if _in_scope(
+            item["variables"]["repo"],
+            issue_repos if item["criterion"] == "new_issues" else repos,
+            issue_orgs if item["criterion"] == "new_issues" else orgs,
+            ignored,
+        )
+    ]
     items.sort(key=lambda item: item["variables"]["timestamp"], reverse=True)
     items.sort(key=lambda item: CRITERIA.index(item["criterion"]))
     unique: dict[str, dict[str, Any]] = {}

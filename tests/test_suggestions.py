@@ -563,6 +563,158 @@ def test_new_issues_use_explicit_scope_instead_of_project_repos():
     assert "repo:x/y" not in client.queries[0]
 
 
+# --- the new-issue scope ---------------------------------------------------------
+
+
+def _fetch_items(monkeypatch, client, **kwargs):
+    monkeypatch.setattr(suggestions, "GitHubClient", lambda _token: _Ctx(client))
+    monkeypatch.setattr(suggestions, "resolve_token", lambda _env: ("t", "env"))
+    return suggestions.fetch_suggestions(**kwargs)
+
+
+def test_new_issue_scope_leaves_the_personal_searches_unscoped():
+    client = FakeClient(
+        {
+            "review-requested:@me": [
+                _pr(url="https://github.com/other/repo/pull/1", repository={"nameWithOwner": "other/repo"})
+            ],
+            "created:>=": [_issue(number=9, url="https://github.com/acme/widgets/issues/9")],
+        }
+    )
+    items = suggestions._discover(
+        client,
+        enabled={"review_requested", "new_issues"},
+        repos=set(),
+        orgs=set(),
+        project_repos=set(),
+        new_repos={"acme/widgets"},
+    )
+    review = next(query for query in client.queries if "review-requested:@me" in query)
+    new = next(query for query in client.queries if "created:>=" in query)
+    assert review == "is:open is:pr review-requested:@me"
+    assert new.endswith(" repo:acme/widgets")
+    assert {item["criterion"] for item in items} == {"review_requested", "new_issues"}
+
+
+def test_new_issue_scope_alone_keeps_personal_items_from_other_repos(monkeypatch):
+    client = FakeClient(
+        {
+            "review-requested:@me": [
+                _pr(
+                    url="https://github.com/other/repo/pull/1",
+                    number=1,
+                    repository={"nameWithOwner": "other/repo"},
+                )
+            ],
+            "created:>=": [
+                _issue(number=9, url="https://github.com/acme/widgets/issues/9"),
+                _issue(
+                    number=10,
+                    url="https://github.com/other/repo/issues/10",
+                    repository={"nameWithOwner": "other/repo"},
+                ),
+            ],
+        }
+    )
+    items = _fetch_items(
+        monkeypatch,
+        client,
+        enabled={"review_requested", "new_issues"},
+        repos_raw="",
+        orgs_raw="",
+        new_repos_raw="acme/widgets",
+    )
+    assert [(item["criterion"], item["source_ref"]) for item in items] == [
+        ("review_requested", "other/repo#1"),
+        ("new_issues", "acme/widgets#9"),
+    ]
+
+
+def test_general_scope_still_drives_new_issues_without_a_new_issue_scope(monkeypatch):
+    client = FakeClient(
+        {
+            "created:>=": [
+                _issue(number=9, url="https://github.com/acme/widgets/issues/9"),
+                _issue(
+                    number=10,
+                    url="https://github.com/other/repo/issues/10",
+                    repository={"nameWithOwner": "other/repo"},
+                ),
+            ]
+        }
+    )
+    items = _fetch_items(
+        monkeypatch,
+        client,
+        enabled={"new_issues"},
+        repos_raw="acme/widgets",
+        orgs_raw="",
+        new_repos_raw="",
+        new_orgs_raw="",
+        project_repos={"x/y"},
+    )
+    assert client.queries[0].endswith(" repo:acme/widgets")
+    assert [item["source_ref"] for item in items] == ["acme/widgets#9"]
+
+
+def test_new_issue_and_general_scopes_stay_separate(monkeypatch):
+    client = FakeClient(
+        {
+            "review-requested:@me": [_pr(url="https://github.com/acme/widgets/pull/1")],
+            "assignee:@me": [_issue()],
+            "created:>=": [
+                _issue(
+                    number=9,
+                    url="https://github.com/newco/app/issues/9",
+                    repository={"nameWithOwner": "newco/app"},
+                ),
+                _issue(number=10, url="https://github.com/acme/widgets/issues/10"),
+            ],
+        }
+    )
+    items = _fetch_items(
+        monkeypatch,
+        client,
+        enabled={"review_requested", "assigned_issues", "new_issues"},
+        repos_raw="acme/widgets",
+        orgs_raw="",
+        new_repos_raw="newco/app",
+    )
+    review = next(query for query in client.queries if "review-requested:@me" in query)
+    new = next(query for query in client.queries if "created:>=" in query)
+    assert review.endswith(" repo:acme/widgets")
+    assert new.endswith(" repo:newco/app")
+    # The general pair still hides the non-acme review/issue; the new-issue pair
+    # reaches past it for new issues without widening anything else.
+    assert [(item["criterion"], item["source_ref"]) for item in items] == [
+        ("review_requested", "acme/widgets#42"),
+        ("assigned_issues", "acme/widgets#7"),
+        ("new_issues", "newco/app#9"),
+    ]
+
+
+def test_neither_scope_falls_back_to_project_repos_and_filters_nothing(monkeypatch):
+    client = FakeClient({"created:>=": [_issue(number=9, url="https://github.com/acme/widgets/issues/9")]})
+    items = _fetch_items(
+        monkeypatch,
+        client,
+        enabled={"new_issues"},
+        repos_raw="",
+        orgs_raw="",
+        new_repos_raw="",
+        new_orgs_raw="",
+        project_repos={"acme/widgets"},
+    )
+    assert client.queries[0].endswith(" repo:acme/widgets")
+    assert [item["source_ref"] for item in items] == ["acme/widgets#9"]
+
+
+def test_scope_lists_are_a_union_so_a_repo_does_not_narrow_an_org():
+    assert suggestions._in_scope("acme/widgets", {"acme/widgets"}, {"acme"}) is True
+    assert suggestions._in_scope("acme/other", {"acme/widgets"}, {"acme"}) is True
+    assert suggestions._in_scope("other/repo", {"acme/widgets"}, {"acme"}) is False
+
+
 # --- ranking, dedup, projects, limits ---------------------------------------------
 
 
@@ -753,7 +905,11 @@ def test_runtime_passes_host_enabled_criteria_and_project_repos(monkeypatch, tmp
             "sources": [{"criterion": "mentioned", "enabled": True}, {"criterion": "new_issues", "enabled": True}]
         },
         projects={"projects": [{"name": "widgets", "path": str(checkout)}, {"name": "nogit", "path": str(tmp_path)}]},
-        settings={"suggestion_limit": 5},
+        settings={
+            "suggestion_limit": 5,
+            "suggestion_new_issue_repositories": "acme/tracker",
+            "suggestion_new_issue_organizations": "acme",
+        },
         calls=calls,
     )
     captured = {}
@@ -767,6 +923,8 @@ def test_runtime_passes_host_enabled_criteria_and_project_repos(monkeypatch, tmp
     assert captured["enabled"] == {"mentioned", "new_issues"}
     assert captured["project_repos"] == {"acme/widgets"}
     assert captured["limit_raw"] == 5
+    assert captured["new_repos_raw"] == "acme/tracker"
+    assert captured["new_orgs_raw"] == "acme"
     assert calls[-1] == (main.SUGGESTIONS_SET, {"items": [{"id": "x"}]})
 
 
