@@ -456,5 +456,5 @@ variables = ["repo", "org", "title", "url", "timestamp", "issue_number", "author
 [[suggestions.sources]]
 criterion = "new_issues"
 label = "New issues"
-description = "Issues opened by others in the last 7 days in the new-issue repositories and organizations, else the general allowlists, else your registered projects' repositories."
+description = "Issues opened by others in the last 7 days in the new-issue repositories and organizations, else the general allowlists, else your registered projects' repositories, and only where your permission is admin or maintain."
 variables = ["repo", "org", "title", "url", "timestamp", "issue_number", "author", "labels"]

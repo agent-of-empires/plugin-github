@@ -74,6 +74,9 @@ CRITERIA: tuple[str, ...] = (
     "assigned_issues",
     "new_issues",
 )
+# Repository permissions that make an incoming issue the viewer's to triage. ADMIN covers a repository
+# they own (including their own account), MAINTAIN one they help run.
+NEW_ISSUE_PERMISSIONS = frozenset({"ADMIN", "MAINTAIN"})
 # Criteria served by the single ``author:@me`` PR search, in reason order.
 AUTHORED_CRITERIA: tuple[str, ...] = ("changes_requested", "review_thread_reply", "merge_conflict", "ci_failed")
 
@@ -134,7 +137,7 @@ query($query: String!, $after: String) {{
     nodes {{
       ... on Issue {{
         number title body url createdAt updatedAt
-        repository {{ nameWithOwner }}
+        repository {{ nameWithOwner viewerPermission }}
         author {{ login }}
         labels(first: 20) {{ nodes {{ name }} }}
       }}
@@ -816,6 +819,13 @@ def _issue_items(criterion: str, issues: list[dict[str, Any]], *, reason: str, v
 def _new_issues(client: GitHubClient, terms: list[str], excludes: tuple[str, ...] = ()) -> list[dict[str, Any]]:
     since = (datetime.now(timezone.utc) - timedelta(days=NEW_ISSUES_WINDOW_DAYS)).strftime("%Y-%m-%d")
     issues = _search_scoped(client, _ISSUE_QUERY, f"is:open is:issue -author:@me created:>={since}", terms, excludes)
+    # A suggestion is something to act on, so a new issue only counts in a repository the viewer
+    # administers. The scope filter alone is too coarse: an organization allowlist otherwise admits
+    # every repository in the org, including ones the viewer can only read. GitHub's own
+    # viewerPermission is the authority, one extra field on a query that already names the repository.
+    issues = [
+        issue for issue in issues if (issue.get("repository") or {}).get("viewerPermission") in NEW_ISSUE_PERMISSIONS
+    ]
     return _issue_items(
         "new_issues", issues, reason=f"Opened in the last {NEW_ISSUES_WINDOW_DAYS} days", verb="Investigate"
     )

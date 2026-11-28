@@ -116,7 +116,7 @@ def _issue(number=7, url="https://github.com/acme/widgets/issues/7", **overrides
         "body": "Steps to reproduce",
         "createdAt": "2026-10-21T10:00:00Z",
         "updatedAt": "2026-10-21T11:00:00Z",
-        "repository": {"nameWithOwner": "acme/widgets"},
+        "repository": {"nameWithOwner": "acme/widgets", "viewerPermission": "ADMIN"},
         "author": {"login": "reporter"},
         "labels": {"nodes": [{"name": "bug"}, {"name": "p1"}]},
     }
@@ -556,6 +556,58 @@ def test_every_search_stays_within_github_query_length_for_a_large_allowlist():
         assert terms == {f"repo:{r}" for r in repos} | {f"org:{o}" for o in orgs}
 
 
+def test_new_issues_skip_repositories_the_viewer_does_not_administer():
+    admin = _issue()
+    maintainer = _issue(
+        number=8,
+        url="https://github.com/acme/maintained/issues/8",
+        repository={"nameWithOwner": "acme/maintained", "viewerPermission": "MAINTAIN"},
+    )
+    writer = _issue(
+        number=9,
+        url="https://github.com/acme/elsewhere/issues/9",
+        repository={"nameWithOwner": "acme/elsewhere", "viewerPermission": "WRITE"},
+    )
+    reader = _issue(
+        number=10,
+        url="https://github.com/acme/upstream/issues/10",
+        repository={"nameWithOwner": "acme/upstream", "viewerPermission": "READ"},
+    )
+    client = FakeClient({"created:>=": [admin, maintainer, writer, reader]})
+    items = suggestions._discover(client, enabled={"new_issues"}, repos=set(), orgs={"acme"}, project_repos=set())
+    assert [item["source_ref"] for item in items] == ["acme/widgets#7", "acme/maintained#8"]
+
+
+def test_new_issues_in_a_read_only_repository_are_dropped():
+    reader = _issue(repository={"nameWithOwner": "acme/upstream", "viewerPermission": "READ"})
+    items = suggestions._discover(
+        FakeClient({"created:>=": [reader]}),
+        enabled={"new_issues"},
+        repos={"acme/upstream"},
+        orgs=set(),
+        project_repos=set(),
+    )
+    assert items == []
+
+
+def test_new_issues_drop_an_issue_without_a_permission():
+    unknown = _issue(repository={"nameWithOwner": "acme/widgets"})
+    client = FakeClient({"created:>=": [unknown]})
+    items = suggestions._discover(
+        client, enabled={"new_issues"}, repos={"acme/widgets"}, orgs=set(), project_repos=set()
+    )
+    assert items == []
+    assert client.queries
+
+
+def test_assigned_issues_do_not_need_admin_permission():
+    client = FakeClient(
+        {"assignee:@me": [_issue(repository={"nameWithOwner": "acme/upstream", "viewerPermission": "READ"})]}
+    )
+    items = _discover(client, {"assigned_issues"})
+    assert [item["source_ref"] for item in items] == ["acme/upstream#7"]
+
+
 def test_new_issues_use_explicit_scope_instead_of_project_repos():
     client = FakeClient({"created:>=": [_issue()]})
     suggestions._discover(client, enabled={"new_issues"}, repos={"acme/widgets"}, orgs={"other"}, project_repos={"x/y"})
@@ -666,7 +718,7 @@ def test_new_issue_and_general_scopes_stay_separate(monkeypatch):
                 _issue(
                     number=9,
                     url="https://github.com/newco/app/issues/9",
-                    repository={"nameWithOwner": "newco/app"},
+                    repository={"nameWithOwner": "newco/app", "viewerPermission": "ADMIN"},
                 ),
                 _issue(number=10, url="https://github.com/acme/widgets/issues/10"),
             ],

@@ -70,7 +70,7 @@ nothing.
 | `ci_failed` | Your open PRs whose head commit has failed or errored checks | shares the `author:@me` search |
 | `mentioned` | Unread issue or PR comments that mention you or your team | `GET /notifications` (ETag-cached, so an unchanged inbox is free) |
 | `assigned_issues` | Open issues assigned to you | `is:open is:issue assignee:@me` |
-| `new_issues` | Issues opened by others in the last 7 days | `is:open is:issue -author:@me created:>=<date>` over the repositories below |
+| `new_issues` | Issues opened by others in the last 7 days in repositories you administer | `is:open is:issue -author:@me created:>=<date>` over the repositories below, kept only where your permission is admin or maintain |
 
 The four `author:@me` criteria run one search and publish one item per PR; its
 criterion is the first match in the order above and its reason lists every
@@ -95,6 +95,11 @@ then the repositories of your registered AoE projects (read from each project's
 selects that whole pair rather than merging in the general one, so the general
 pair applies to new issues only while both new-issue fields are empty. An empty
 list never means "no new issues": it means the next source in that order.
+Whichever scope applies, `new_issues` keeps only issues in repositories where
+your own permission is admin or maintain (GitHub's `viewerPermission`): an
+organization entry otherwise covers the whole organization and would offer
+issues from repositories you can only read. The other criteria are personal
+rather than permission-scoped, so the gate never hides them.
 `suggestion_ignore` (comma-separated organizations such as `acme` and
 repositories such as `acme/widgets`, case-insensitive) hides those sources from
 every criterion and wins over every allowlist above, the new-issue pair
