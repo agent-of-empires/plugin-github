@@ -718,7 +718,7 @@ def test_new_issue_and_general_scopes_stay_separate(monkeypatch):
                 _issue(
                     number=9,
                     url="https://github.com/newco/app/issues/9",
-                    repository={"nameWithOwner": "newco/app"},
+                    repository={"nameWithOwner": "newco/app", "viewerPermission": "ADMIN"},
                 ),
                 _issue(number=10, url="https://github.com/acme/widgets/issues/10"),
             ],
