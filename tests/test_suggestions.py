@@ -592,7 +592,12 @@ def test_new_issues_in_a_read_only_repository_are_dropped():
 
 def test_new_issues_drop_an_issue_without_a_permission():
     unknown = _issue(repository={"nameWithOwner": "acme/widgets"})
-    assert _discover(FakeClient({"created:>=": [unknown]}), {"new_issues"}) == []
+    client = FakeClient({"created:>=": [unknown]})
+    items = suggestions._discover(
+        client, enabled={"new_issues"}, repos={"acme/widgets"}, orgs=set(), project_repos=set()
+    )
+    assert items == []
+    assert client.queries
 
 
 def test_assigned_issues_do_not_need_admin_permission():
