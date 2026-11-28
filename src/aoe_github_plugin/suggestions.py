@@ -702,7 +702,7 @@ _AUTHORED_READ = {
 }
 _AUTHORED_DELIVERABLE = {
     "changes_requested": "each point the reviewer raised",
-    "review_thread_reply": "a reply to each unresolved thread and the change it asks for",
+    "review_thread_reply": "the reply each unresolved thread needs, and a code change where it asks for one",
     "merge_conflict": "the conflict with the base branch",
     "ci_failed": "the failing checks",
 }
@@ -715,7 +715,8 @@ def _authored_prompt(url: str, matched: list[tuple[str, str]]) -> str:
     return _draft_prompt(
         f"On {url}, this PR is yours: " + "; ".join(_AUTHORED_PROMPT[criterion] for criterion in criteria) + ".",
         "; ".join(_AUTHORED_READ[criterion] for criterion in criteria),
-        f"write a plan that covers {deliverables}, implement it in the working tree and run this repo's checks",
+        "write a plan that covers "
+        f"{deliverables}, make the changes it calls for in the working tree and run this repo's checks",
         OWN_PR_BOUNDARY,
     )
 

@@ -148,12 +148,13 @@ to read first, the concrete deliverable, the repository's own conventions
 the boundary that stays your call (pushing, submitting a review, commenting,
 resolving threads, opening a PR). Review requests ask for a draft review of
 someone else's PR; changes requested, review-thread replies, conflict and
-failing-check items ask for a plan and a working-tree change on your own PR:
+failing-check items ask for a plan and the working-tree changes it calls for on
+your own PR, and a reply-only thread needs only the reply:
 
 | Criterion | Draft prompt |
 |---|---|
 | `review_requested` | `Review <url> as the requested reviewer: Read the PR description, the diff and the existing review threads. Then write your findings as a draft review that cites the file and line each point concerns, following this repo's conventions (AGENTS.md, CLAUDE.md, CONTRIBUTING.md). Do not submit the review, post comments, approve, or push code; show me the draft review first.` |
-| `changes_requested` | `On <url>, this PR is yours: a reviewer requested changes. Read the review and the diff it refers to. Then write a plan that covers each point the reviewer raised, implement it in the working tree and run this repo's checks, following this repo's conventions (AGENTS.md, CLAUDE.md, CONTRIBUTING.md). Do not push, reply on the PR, or resolve threads; show me the plan and the diff first.` |
+| `changes_requested` | `On <url>, this PR is yours: a reviewer requested changes. Read the review and the diff it refers to. Then write a plan that covers each point the reviewer raised, make the changes it calls for in the working tree and run this repo's checks, following this repo's conventions (AGENTS.md, CLAUDE.md, CONTRIBUTING.md). Do not push, reply on the PR, or resolve threads; show me the plan and the diff first.` |
 | `mentioned` | `On <url> you were mentioned in a thread: Read that thread and the comments around it. Then say what is being asked of you and draft either the reply or the change in the working tree, following this repo's conventions (AGENTS.md, CLAUDE.md, CONTRIBUTING.md). Do not post the reply, resolve threads, or push; show me the draft first.` |
 | `assigned_issues` | `Implement the fix for <url>: Read the issue, the code it points at and a reproduction of the problem. Then write the fix in the working tree and run this repo's checks, following this repo's conventions (AGENTS.md, CLAUDE.md, CONTRIBUTING.md). Do not open a PR, push, or comment on the issue; show me the diff first.` |
 | `new_issues` | `Assess <url>: Read the issue and the code it points at. Then decide whether it is a real, in-scope problem for this repo and write a plan naming the files to change, following this repo's conventions (AGENTS.md, CLAUDE.md, CONTRIBUTING.md). Do not change code, open a PR, or comment on the issue; show me the plan first.` |

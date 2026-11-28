@@ -1203,7 +1203,7 @@ PART_OF_THE_TEMPLATE = {  # criterion: (deliverable, boundary)
     "review_requested": ("draft review", suggestions.REVIEW_BOUNDARY),
     "re_review": ("draft review", suggestions.REVIEW_BOUNDARY),
     "changes_requested": ("each point the reviewer raised", suggestions.OWN_PR_BOUNDARY),
-    "review_thread_reply": ("a reply to each unresolved thread", suggestions.OWN_PR_BOUNDARY),
+    "review_thread_reply": ("the reply each unresolved thread needs", suggestions.OWN_PR_BOUNDARY),
     "merge_conflict": ("the conflict with the base branch", suggestions.OWN_PR_BOUNDARY),
     "ci_failed": ("the failing checks", suggestions.OWN_PR_BOUNDARY),
     "mentioned": ("draft either the reply", "show me the draft first"),
