@@ -65,6 +65,17 @@ def test_status_no_open_pr(monkeypatch):
     assert "no open PR" in result["summary"]
 
 
+def test_status_renders_a_detached_head_as_detached_not_as_a_branch(monkeypatch):
+    monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: (GitHubHost.dotcom(), "o", "r"))
+    monkeypatch.setattr(handlers, "current_branch", lambda _p: "HEAD")
+    result = handlers.github_status(
+        env=_NoTokenEnv(),
+        transport=_transport(lambda _r: httpx.Response(200, json=[])),
+    )
+    assert result["branch"] is None
+    assert result["summary"] == "o/r: no open PR (detached HEAD)"
+
+
 def test_status_not_a_github_remote(monkeypatch):
     monkeypatch.setattr(handlers, "remote_owner_repo", lambda _p, _trusted: None)
     result = handlers.github_status(env=_NoTokenEnv())

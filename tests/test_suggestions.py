@@ -1177,6 +1177,65 @@ def test_re_review_prompt_omits_the_commit_sha():
     assert "oldsha123" not in item["draft"]["prompt"]
 
 
+def _item_per_criterion():
+    """One representative item per criterion, from the same canned GitHub answers."""
+    stale_review = _pr(reviews={"nodes": [_review("me", "COMMENTED", oid="old")], "pageInfo": PAGE_DONE})
+    client = FakeClient(
+        {
+            " author:@me": [_failing_authored_pr()],
+            "reviewed-by:@me": [stale_review],
+            "review-requested:@me": [_pr()],
+            "assignee:@me": [_issue()],
+            "created:>=": [_issue()],
+        },
+        notifications=[_notification()],
+        comments={"https://api.github.com/repos/acme/widgets/issues/comments/9": {"body": "hi", "html_url": "u"}},
+    )
+    items = {}
+    for criterion in suggestions.CRITERIA:
+        [items[criterion]] = suggestions._discover(
+            client, enabled={criterion}, repos={"acme/widgets"}, orgs=set(), project_repos=set()
+        )
+    return items
+
+
+PART_OF_THE_TEMPLATE = {  # criterion: (deliverable, boundary)
+    "review_requested": ("draft review", suggestions.REVIEW_BOUNDARY),
+    "re_review": ("draft review", suggestions.REVIEW_BOUNDARY),
+    "changes_requested": ("each point the reviewer raised", suggestions.OWN_PR_BOUNDARY),
+    "review_thread_reply": ("the reply each unresolved thread needs", suggestions.OWN_PR_BOUNDARY),
+    "merge_conflict": ("the conflict with the base branch", suggestions.OWN_PR_BOUNDARY),
+    "ci_failed": ("the failing checks", suggestions.OWN_PR_BOUNDARY),
+    "mentioned": ("draft either the reply", "show me the draft first"),
+    "assigned_issues": ("write the fix in the working tree", "show me the diff first"),
+    "new_issues": ("write a plan naming the files to change", "show me the plan first"),
+}
+
+
+@pytest.mark.parametrize("criterion", suggestions.CRITERIA)
+def test_every_prompt_names_the_deliverable_the_conventions_and_the_boundary(criterion):
+    item = _item_per_criterion()[criterion]
+    prompt = item["draft"]["prompt"]
+    deliverable, boundary = PART_OF_THE_TEMPLATE[criterion]
+    assert prompt.startswith(suggestions.UNTRUSTED)
+    assert item["source_url"] in prompt
+    assert prompt.count("Read ") == 1, prompt
+    assert deliverable in prompt
+    assert suggestions.CONVENTIONS in prompt
+    assert boundary in prompt
+
+
+def test_reviewing_someone_elses_pr_and_answering_the_review_of_yours_read_differently():
+    items = _item_per_criterion()
+    review = items["review_requested"]["draft"]["prompt"]
+    answer = items["changes_requested"]["draft"]["prompt"]
+    assert review != answer
+    assert "as the requested reviewer" in review
+    assert "this PR is yours" in answer
+    assert "do not submit the review" in review.lower()
+    assert "draft review" not in answer
+
+
 def test_item_variables_match_the_manifest_declaration_for_every_criterion():
     """The host rejects a whole publication when an item's variables differ from its source's."""
     declared = {
@@ -1184,24 +1243,9 @@ def test_item_variables_match_the_manifest_declaration_for_every_criterion():
         for source in tomlkit.parse(main_manifest_text()).unwrap()["suggestions"]["sources"]
     }
     assert set(declared) == set(suggestions.CRITERIA)
-    stale_review = _pr(reviews={"nodes": [_review("me", "COMMENTED", oid="old")], "pageInfo": PAGE_DONE})
-    for criterion in suggestions.CRITERIA:
-        client = FakeClient(
-            {
-                " author:@me": [_failing_authored_pr()],
-                "reviewed-by:@me": [stale_review],
-                "review-requested:@me": [_pr()],
-                "assignee:@me": [_issue()],
-                "created:>=": [_issue()],
-            },
-            notifications=[_notification()],
-            comments={"https://api.github.com/repos/acme/widgets/issues/comments/9": {"body": "hi", "html_url": "u"}},
-        )
-        items = suggestions._discover(
-            client, enabled={criterion}, repos={"acme/widgets"}, orgs=set(), project_repos=set()
-        )
-        assert [item["criterion"] for item in items] == [criterion], criterion
-        assert set(items[0]["variables"]) == declared[criterion], criterion
+    for criterion, item in _item_per_criterion().items():
+        assert item["criterion"] == criterion
+        assert set(item["variables"]) == declared[criterion], criterion
 
 
 def main_manifest_text():
