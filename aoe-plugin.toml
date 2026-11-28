@@ -141,7 +141,7 @@ advanced = true
 [[settings]]
 key = "suggestion_repositories"
 label = "Only these repos"
-description = "Like acme/widgets, comma separated. Applies to your own items (PRs, reviews, mentions, assignments), not new issues. Unioned with the organizations list, so a repo entry never narrows an org entry. Leave both empty for everything the token can see."
+description = "Like acme/widgets, comma separated. Applies to your own items (PRs, reviews, mentions, assignments). Unioned with the organizations list, so a repo entry never narrows an org entry. Also scopes new issues while both new-issue lists below are empty. Leave both empty for everything the token can see."
 type = "string"
 default = ""
 advanced = true
@@ -149,7 +149,7 @@ advanced = true
 [[settings]]
 key = "suggestion_organizations"
 label = "Only these organizations"
-description = "Like acme, comma separated. Unioned with the repositories list, so a repo entry never narrows an org entry. Leave both empty for everything the token can see."
+description = "Like acme, comma separated. Unioned with the repositories list, so a repo entry never narrows an org entry. Also scopes new issues while both new-issue lists below are empty. Leave both empty for everything the token can see."
 type = "string"
 default = ""
 advanced = true
@@ -159,7 +159,7 @@ advanced = true
 [[settings]]
 key = "suggestion_new_issue_repositories"
 label = "New issues: only these repos"
-description = "Like acme/widgets, comma separated. Applies to new issues only. Leave empty to use the repository and organization lists above, then your Projects' repos."
+description = "Like acme/widgets, comma separated. Applies to new issues only. Filling in either new-issue list replaces the general lists above entirely; leave both empty to inherit them, then your Projects' repos."
 type = "string"
 default = ""
 advanced = true
@@ -167,7 +167,7 @@ advanced = true
 [[settings]]
 key = "suggestion_new_issue_organizations"
 label = "New issues: only these organizations"
-description = "Like acme, comma separated, unioned with the new-issue repositories list. Leave empty to use the repository and organization lists above, then your Projects' repos."
+description = "Like acme, comma separated, unioned with the new-issue repositories list. Filling in either new-issue list replaces the general lists above entirely; leave both empty to inherit them, then your Projects' repos."
 type = "string"
 default = ""
 advanced = true

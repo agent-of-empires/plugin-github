@@ -91,8 +91,10 @@ to specific repositories list them in `suggestion_repositories` and leave
 does not hide review requests, mentions, or assigned issues elsewhere. It
 resolves its scope in this order: the new-issue pair, then the general pair,
 then the repositories of your registered AoE projects (read from each project's
-`origin` remote via the host's `projects.list`). An empty list never means "no
-new issues": it means the next source in that order.
+`origin` remote via the host's `projects.list`). Either new-issue field being set
+selects that whole pair rather than merging in the general one, so the general
+pair applies to new issues only while both new-issue fields are empty. An empty
+list never means "no new issues": it means the next source in that order.
 `suggestion_ignore` (comma-separated organizations such as `acme` and
 repositories such as `acme/widgets`, case-insensitive) hides those sources from
 every criterion and wins over every allowlist above, the new-issue pair

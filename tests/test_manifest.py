@@ -26,23 +26,27 @@ SCOPE_COPY = {
     "suggestion_organizations": (
         "Only these organizations",
         "Like acme, comma separated. Unioned with the repositories list, so a repo entry never narrows"
-        " an org entry. Leave both empty for everything the token can see.",
+        " an org entry. Also scopes new issues while both new-issue lists below are empty. Leave both"
+        " empty for everything the token can see.",
     ),
     "suggestion_repositories": (
         "Only these repos",
         "Like acme/widgets, comma separated. Applies to your own items (PRs, reviews, mentions,"
-        " assignments), not new issues. Unioned with the organizations list, so a repo entry never"
-        " narrows an org entry. Leave both empty for everything the token can see.",
+        " assignments). Unioned with the organizations list, so a repo entry never narrows an org"
+        " entry. Also scopes new issues while both new-issue lists below are empty. Leave both empty"
+        " for everything the token can see.",
     ),
     "suggestion_new_issue_organizations": (
         "New issues: only these organizations",
-        "Like acme, comma separated, unioned with the new-issue repositories list. Leave empty to use"
-        " the repository and organization lists above, then your Projects' repos.",
+        "Like acme, comma separated, unioned with the new-issue repositories list. Filling in either"
+        " new-issue list replaces the general lists above entirely; leave both empty to inherit them,"
+        " then your Projects' repos.",
     ),
     "suggestion_new_issue_repositories": (
         "New issues: only these repos",
-        "Like acme/widgets, comma separated. Applies to new issues only. Leave empty to use the"
-        " repository and organization lists above, then your Projects' repos.",
+        "Like acme/widgets, comma separated. Applies to new issues only. Filling in either new-issue"
+        " list replaces the general lists above entirely; leave both empty to inherit them, then your"
+        " Projects' repos.",
     ),
     "suggestion_ignore": ("Never suggest from", "Organizations or repos. Wins over every list above."),
     "suggestion_limit": ("Keep up to", "Suggestions from GitHub at a time."),

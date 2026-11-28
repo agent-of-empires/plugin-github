@@ -232,10 +232,12 @@ def _queries(base: str, terms: list[str], excludes: tuple[str, ...] = ()) -> lis
 def _new_issue_allowlists(
     new_repos: set[str], new_orgs: set[str], repos: set[str], orgs: set[str]
 ) -> tuple[set[str], set[str]]:
-    """The allowlists ``new_issues`` uses: its own pair when set, else the general pair.
+    """The allowlists ``new_issues`` uses: its own pair when either field is set, else the general pair.
 
     The two lists in a pair are a union (a repo entry does not narrow an org entry),
-    and an empty pair leaves the source unrestricted, exactly like the general pair.
+    and one populated field selects the whole pair rather than merging in the other.
+    An empty pair means "no allowlist" for this helper; ``_discover`` then restricts
+    new-issue discovery to the registered project repos, and skips it when there are none.
     """
     return (new_repos, new_orgs) if (new_repos or new_orgs) else (repos, orgs)
 
