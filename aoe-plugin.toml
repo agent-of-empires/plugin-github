@@ -141,7 +141,7 @@ advanced = true
 [[settings]]
 key = "suggestion_repositories"
 label = "Only these repos"
-description = "Like acme/widgets. Leave empty for all."
+description = "Like acme/widgets, comma separated. Applies to your own items (PRs, reviews, mentions, assignments). Unioned with the organizations list, so a repo entry never narrows an org entry. Also scopes new issues while both new-issue lists below are empty. Leave both empty for everything the token can see."
 type = "string"
 default = ""
 advanced = true
@@ -149,7 +149,25 @@ advanced = true
 [[settings]]
 key = "suggestion_organizations"
 label = "Only these organizations"
-description = "Leave empty for your Projects' repos."
+description = "Like acme, comma separated. Unioned with the repositories list, so a repo entry never narrows an org entry. Also scopes new issues while both new-issue lists below are empty. Leave both empty for everything the token can see."
+type = "string"
+default = ""
+advanced = true
+
+# `new_issues` gets its own pair so narrowing it cannot hide review requests or
+# mentions in the repos the general pair leaves out.
+[[settings]]
+key = "suggestion_new_issue_repositories"
+label = "New issues: only these repos"
+description = "Like acme/widgets, comma separated. Applies to new issues only. Filling in either new-issue list replaces the general lists above entirely; leave both empty to inherit them, then your Projects' repos."
+type = "string"
+default = ""
+advanced = true
+
+[[settings]]
+key = "suggestion_new_issue_organizations"
+label = "New issues: only these organizations"
+description = "Like acme, comma separated, unioned with the new-issue repositories list. Filling in either new-issue list replaces the general lists above entirely; leave both empty to inherit them, then your Projects' repos."
 type = "string"
 default = ""
 advanced = true
@@ -157,7 +175,7 @@ advanced = true
 [[settings]]
 key = "suggestion_ignore"
 label = "Never suggest from"
-description = "Organizations or repos. Wins over the two lists above."
+description = "Organizations or repos. Wins over every list above."
 type = "string"
 default = ""
 advanced = true
@@ -438,5 +456,5 @@ variables = ["repo", "org", "title", "url", "timestamp", "issue_number", "author
 [[suggestions.sources]]
 criterion = "new_issues"
 label = "New issues"
-description = "Issues opened by others in the last 7 days in your allowlisted repositories and organizations, or in your registered projects' repositories when neither allowlist is set."
+description = "Issues opened by others in the last 7 days in the new-issue repositories and organizations, else the general allowlists, else your registered projects' repositories."
 variables = ["repo", "org", "title", "url", "timestamp", "issue_number", "author", "labels"]
