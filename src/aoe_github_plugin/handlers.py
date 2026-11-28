@@ -74,7 +74,12 @@ def github_status(
         branch = current_branch(path)
         result["host"] = host.name
         result["repo"] = f"{owner}/{repo}"
-        result["branch"] = branch
+        result["branch"] = None if not branch or branch == "HEAD" else branch
+        # ``HEAD`` is a detached checkout, not a branch: there is no branch to match a PR
+        # against, and the status line says so instead of claiming a PR is "open for HEAD".
+        if not branch or branch == "HEAD":
+            result["summary"] = f"{owner}/{repo}: no open PR (detached HEAD)"
+            return result
         token = _resolve_optional_token(env, host)
         with GitHubClient(host=host, token=token, transport=transport) as client:
             # lookup keys omit host identity, so scope them before using this

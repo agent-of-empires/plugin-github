@@ -138,9 +138,28 @@ is sent to GitHub, and a probe skipped by the rate-limit backoff reports
 
 Suggestion text from GitHub is source material, not trusted instructions. The
 provider proposes a task prompt but never creates sessions. Each draft prompt is
-fixed text that names only the PR or issue URL and starts with an untrusted-content
+fixed text that names the PR or issue URL and starts with an untrusted-content
 notice; GitHub-controlled strings (titles, logins, check names, SHAs) live in
 `reason` and `variables`, never in the prompt prose.
+
+Every prompt names the same four things, so a session knows when it is done: what
+to read first, the concrete deliverable, the repository's own conventions
+(`AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`, pointed at rather than restated), and
+the boundary that stays your call (pushing, submitting a review, commenting,
+resolving threads, opening a PR). Review requests ask for a draft review of
+someone else's PR; changes requested, review-thread replies, conflict and
+failing-check items ask for a plan and a working-tree change on your own PR:
+
+| Criterion | Draft prompt |
+|---|---|
+| `review_requested` | `Review <url> as the requested reviewer: Read the PR description, the diff and the existing review threads. Then write your findings as a draft review that cites the file and line each point concerns, following this repo's conventions (AGENTS.md, CLAUDE.md, CONTRIBUTING.md). Do not submit the review, post comments, approve, or push code; show me the draft review first.` |
+| `changes_requested` | `On <url>, this PR is yours: a reviewer requested changes. Read the review and the diff it refers to. Then write a plan that covers each point the reviewer raised, implement it in the working tree and run this repo's checks, following this repo's conventions (AGENTS.md, CLAUDE.md, CONTRIBUTING.md). Do not push, reply on the PR, or resolve threads; show me the plan and the diff first.` |
+| `mentioned` | `On <url> you were mentioned in a thread: Read that thread and the comments around it. Then say what is being asked of you and draft either the reply or the change in the working tree, following this repo's conventions (AGENTS.md, CLAUDE.md, CONTRIBUTING.md). Do not post the reply, resolve threads, or push; show me the draft first.` |
+| `assigned_issues` | `Implement the fix for <url>: Read the issue, the code it points at and a reproduction of the problem. Then write the fix in the working tree and run this repo's checks, following this repo's conventions (AGENTS.md, CLAUDE.md, CONTRIBUTING.md). Do not open a PR, push, or comment on the issue; show me the diff first.` |
+| `new_issues` | `Assess <url>: Read the issue and the code it points at. Then decide whether it is a real, in-scope problem for this repo and write a plan naming the files to change, following this repo's conventions (AGENTS.md, CLAUDE.md, CONTRIBUTING.md). Do not change code, open a PR, or comment on the issue; show me the plan first.` |
+
+A per-criterion `prompt` template you write in AoE overrides the published text,
+so you can replace any of the above with your own wording.
 
 `open_pr` is the command-palette / shortcut way to open the active session's PR
 (requires a host on api_version 6+). It is a client action, not a worker call:
@@ -210,12 +229,14 @@ session-less `github.refresh` cover every session and prune vanished ones:
    sessions are skipped too by default; turn on `include_snoozed_sessions` to
    keep polling them, since snoozing only sinks the row in the TUI and the host
    keeps serving its badge and status column.
-2. Prefer the host's explicit `workspace_repos` list: each entry supplies a
-   source checkout path and the branch attached to this session. This branch
-   is authoritative even when the source checkout's current branch differs.
-   Metadata paths must name checkout roots (including worktrees and symlink
-   aliases); stale paths and repository subdirectories are skipped. If no
-   metadata entry names a checkout, use shallow discovery under
+2. Prefer the host's explicit `workspace_repos` list. When an entry carries a
+   `worktree_path`, that is the checkout the session works in and its live
+   branch is read from Git (a detached `HEAD` queries no branch); otherwise the
+   entry's `source_path` and the branch stored for the session are used, and
+   that stored branch is authoritative even when the source checkout's current
+   branch differs. Metadata paths must name checkout roots (including
+   worktrees and symlink aliases); stale paths and repository subdirectories
+   are skipped. If no metadata entry names a checkout, use shallow discovery under
    `project_path`: the workspace root and immediate child checkouts. Immediate
    child submodules are skipped by default; turn off `ignore_submodules` to
    include them.
