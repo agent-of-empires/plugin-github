@@ -91,6 +91,30 @@ def test_client_action_points_at_declared_per_session_slot():
         assert (action["slot"], action["id"]) in declared, "action references an undeclared ui slot"
 
 
+_BARE_VERB_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789-_")
+
+
+def _bare_verb(name: str) -> bool:
+    return bool(name) and name[0] != "-" and set(name) <= _BARE_VERB_CHARS
+
+
+def test_commands_nest_under_a_declared_group():
+    # api_version 26: a command's `group` must name a declared [[command_groups]]
+    # entry, and both ids must be one bare lowercase verb the CLI can graft.
+    m = _manifest()
+    groups = {g["id"] for g in m.get("command_groups", [])}
+    assert groups, "the CLI nesting depends on a declared command group"
+    for group in groups:
+        assert _bare_verb(group), f"group id {group!r} is not a bare CLI verb"
+    for c in m.get("commands", []):
+        group = c.get("group")
+        if group is None:
+            continue
+        assert group in groups, f"command {c['id']!r} names undeclared group {group!r}"
+        assert _bare_verb(c["id"]), f"nested command id {c['id']!r} is not a bare CLI verb"
+    assert m["api_version"] >= 26, "command groups need api_version >= 26"
+
+
 def test_client_action_requires_browser_open_capability_and_api_6():
     m = _manifest()
     if any(c.get("action") for c in m.get("commands", [])):

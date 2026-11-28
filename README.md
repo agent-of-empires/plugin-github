@@ -50,9 +50,13 @@ anything is written.
 | UI      | a `row-badge` (`github_pr_badge`), a `row-column` status cell (`github_pr_status`), a `sort-key` (`github_pr_attention`), six `filter-facet`s (`github_ci`, `github_review`, `github_pr`, `github_comments`, `github_conflicts`, `github_queue`), and a `pane` tool-window (`github_pane`) |
 | Worker  | `aoe-github-worker`, ndjson JSON-RPC over stdio                    |
 
+The CLI nests those commands under the manifest's `github` group (SDK API 26):
+`aoe github status`, `aoe github refresh`, `aoe github open`, and
+`aoe github open_pr`.
+
 ### GitHub suggestions
 
-On Agent of Empires 1.24.0+ (SDK API 23), this plugin publishes host-managed
+On Agent of Empires 1.27.0+ (SDK API 26), this plugin publishes host-managed
 suggested sessions, independent of AoE sessions. Each source below is one
 criterion declared in the manifest's `[suggestions]` block. The host owns the
 per-profile on/off switch for every criterion. Before each discovery the worker
